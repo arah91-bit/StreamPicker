@@ -85,5 +85,63 @@ class OverviewTests(unittest.TestCase):
         self.assertIn("<html", page)
 
 
+def _live(**kw):
+    s = {"media_id": "tt1", "label": "Some.Release.2024.mkv", "debrid": "TB+",
+         "res": 1080, "node": "", "avail": 0, "total": None, "consumers": 1,
+         "picker": "slow"}
+    s.update(kw)
+    return s
+
+
+class NowPlayingTests(unittest.TestCase):
+    """The Now Playing section reads proxy.active_stream_details() live; these
+    tests stub that call so they need no event loop or real buffer entries."""
+
+    def setUp(self):
+        self._orig = overview.proxy.active_stream_details
+
+    def tearDown(self):
+        overview.proxy.active_stream_details = self._orig
+
+    def _playing(self, entries):
+        overview.proxy.active_stream_details = lambda: entries
+
+    def test_hidden_when_nothing_is_playing(self):
+        self._playing([])
+        page = overview.render([])
+        self.assertNotIn("Now Playing", page)
+        self.assertNotIn('http-equiv="refresh"', page)   # no pointless reloads
+
+    def test_card_resolves_title_and_shows_progress(self):
+        self._playing([_live(media_id="tt9", res=2160,
+                             node="nexus-190.example.com",
+                             avail=2 * 1024 ** 3, total=8 * 1024 ** 3)])
+        recs = [{"kind": "served", "id": "tt9",
+                 "label": "🎬 Big Movie 2024 2160p", "ts": time.time()}]
+        page = overview.render(recs)
+        self.assertIn("Now Playing", page)
+        self.assertIn("Big Movie 2024", page)            # name, not tt9
+        self.assertIn("2160p</span>", page)              # resolution badge
+        self.assertIn("TB+", page)
+        self.assertIn("nexus-190", page)                 # node shortened...
+        self.assertNotIn("nexus-190.example.com", page)  # ...to first segment
+        self.assertIn("2.00 / 8.00 GB buffered", page)
+        self.assertIn("25%", page)
+        self.assertIn('http-equiv="refresh"', page)      # live → auto-refresh
+
+    def test_unknown_total_shows_buffering_and_viewer_count(self):
+        self._playing([_live(avail=123, total=None, consumers=2)])
+        page = overview.render([])
+        self.assertIn("buffering…", page)
+        self.assertIn("2 viewers", page)
+
+    def test_labels_are_escaped_once(self):
+        self._playing([_live(label='<img src=x onerror=alert(1)> & Co')])
+        page = overview.render([])
+        self.assertNotIn("<img src=x", page)             # no raw HTML injection
+        self.assertIn("&amp; Co", page)                  # escaped exactly once
+        self.assertNotIn("&amp;amp;", page)              # not double-escaped
+
+
 if __name__ == "__main__":
     unittest.main()

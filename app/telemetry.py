@@ -304,6 +304,9 @@ def record(stream: dict, result) -> None:
                            for x in (stream.get("_nzb_indexers") or [])][:12]
         rec["fetch_indexer"] = re.sub(
             r"[^A-Za-z0-9 ._+\-]", "", stream.get("_nzb_indexer") or "")[:60]
+        if stream.get("_nzb_mount_secs") is not None:
+            rec["mount_secs"] = stream.get("_nzb_mount_secs")
+            rec["mount_reused"] = bool(stream.get("_nzb_mount_reused"))
     _append(rec)
 
 

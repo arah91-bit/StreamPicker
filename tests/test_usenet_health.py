@@ -222,6 +222,17 @@ class HealthStoreTests(unittest.TestCase):
                          key=self.store.indexer_score, reverse=True)
         self.assertEqual(["proven", "lucky"], ordered)
 
+    def test_fetch_score_isolates_broken_download_endpoints(self) -> None:
+        # An indexer whose downloads always 403 (seen live: 0 ok / 80 fail)
+        # must rank last for NZB fetching even if its releases play fine.
+        for i in range(30):
+            self.store.record_fetch("deadfetch", False)
+            self.store.record_fetch("goodfetch", True)
+        self.assertLess(self.store.fetch_score("deadfetch"), 0.1)
+        self.assertGreater(self.store.fetch_score("goodfetch"), 0.8)
+        # cold start stays neutral so new indexers aren't punished
+        self.assertEqual(0.5, self.store.fetch_score("brand-new"))
+
     def test_search_and_fetch_evidence_contributes_to_indexer_learning(self) -> None:
         for _ in range(5):
             self.store.record_search("responsive", True, results=20, latency=0.3)

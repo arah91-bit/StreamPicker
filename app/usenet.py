@@ -645,6 +645,7 @@ async def _mount(release: dict, cat: str, delay: float = 0,
     Reuses an existing mount instantly; otherwise NZB-fetch → watch-folder PUT →
     poll for the content dir (nzbdav mounts in ~2s; missing-article releases
     that mount anyway are caught later by the picker's probe)."""
+    t_start = time.monotonic()
     key = release.get("release_key") or ""
     suffix = f"-{key[-8:]}" if key else ""
     job = _slug(release["title"]) + suffix
@@ -652,6 +653,7 @@ async def _mount(release: dict, cat: str, delay: float = 0,
     failure_seen: set[str] = set()
     entries = await _dav_list(dir_path, release, failure_seen)
     directory_seen = entries is not None
+    reused = directory_seen                 # mount already existed in nzbdav
     fetched_from = ""
     if entries is None:
         prior_failure = await _history_failure(job)
@@ -666,10 +668,14 @@ async def _mount(release: dict, cat: str, delay: float = 0,
             await asyncio.sleep(delay)
         # Fetch the NZB, falling through the alternate indexer links for the
         # same release — download endpoints individually 403/503 at times.
+        # Order by download-endpoint reliability specifically: composite score
+        # is play-weighted, so an indexer whose fetches always 403 could still
+        # win the first attempt and cost a wasted round-trip every mount.
         content = None
         offers = sorted(release.get("offers") or [],
-                        key=lambda o: usenet_health.indexer_score(
-                            o.get("indexer", "")), reverse=True)
+                        key=lambda o: (usenet_health.fetch_score(o.get("indexer", "")),
+                                       usenet_health.indexer_score(o.get("indexer", ""))),
+                        reverse=True)
         for offer in offers:
             indexer, link = offer.get("indexer", ""), offer.get("link", "")
             try:
@@ -798,6 +804,10 @@ async def _mount(release: dict, cat: str, delay: float = 0,
         "_nzb_label": release["title"][:180],
         "_nzb_indexer": source,
         "_nzb_indexers": all_indexers,
+        # Mount economics, carried into this release's probe telemetry so the
+        # time-to-streamable distribution (fresh vs reused) is measurable.
+        "_nzb_mount_secs": round(time.monotonic() - t_start, 1),
+        "_nzb_mount_reused": reused,
     }
 
 

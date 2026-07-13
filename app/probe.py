@@ -16,6 +16,7 @@ import logging
 import secrets
 import time
 from dataclasses import dataclass
+from urllib.parse import urljoin
 
 import httpx
 
@@ -58,20 +59,78 @@ def _required_bps(need_bps: float | None) -> float:
     return MIN_SPEED_BPS
 
 
+def _too_slow(got: int, measured: float, required: float) -> bool:
+    """Graduated mid-read bail-out: the further into the measurement window we
+    are, the closer to the requirement the stream must be. A passing stream
+    finishes the whole probe window in ~1-2s (telemetry: OK probes complete
+    sub-second at median), so anything still reading past 3s is already far
+    below need — the ladder only distinguishes hopeless trickles (bail early,
+    they used to sit for the full 8s) from marginal streams (measure longer
+    so TCP ramp-up can't fail a viable source)."""
+    if measured <= 3:
+        return False
+    speed = got / measured
+    if speed < required / 6:
+        return True
+    if measured > 5 and speed < required / 3:
+        return True
+    return measured > 8 and speed < required / 2
+
+
 def _record(stream: dict, result: ProbeResult, attempt_id: str) -> None:
     telemetry.record(stream, result)
     usenet_health.record_probe(stream, result, attempt_id)
 
 
+# HLS streams (custom HTTP addons often serve .m3u8) can't be judged by the
+# byte probe alone: the playlist is a ~1-2 KB text file, so a Range read gets a
+# clean tiny EOF and used to fail as "short body" forever. Instead, descend the
+# playlist to its first real media segment and measure THAT: master playlist →
+# variant playlist → segment, two text hops at most.
+_PLAYLIST_HOPS = 2
+_PLAYLIST_MAX_BYTES = 512 * 1024
+_SEGMENT_JUDGE_BYTES = 512 * 1024   # min sample before speed can fail a segment
+
+
+def _looks_hls(content_type: str, head: bytes) -> bool:
+    return ("mpegurl" in (content_type or "").lower()
+            or head.lstrip()[:7] == b"#EXTM3U")
+
+
+def _looks_text(head: bytes) -> bool:
+    """HTML/JSON error pages (expired tokens, geo blocks) masquerading as
+    streams. No video container starts with '<' or '{'."""
+    return head.lstrip()[:1] in (b"<", b"{")
+
+
+def _hls_first_uri(text: str) -> str:
+    """First URI line of an HLS playlist — the first variant in a master
+    playlist, or the first media segment in a media playlist."""
+    for line in text.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            return line
+    return ""
+
+
 async def probe(url: str, need_bps: float | None, ttfb_max: float) -> ProbeResult:
     """need_bps is the file's real bitrate (size/runtime) or None if unknown."""
-    required = _required_bps(need_bps)
-    t0 = time.monotonic()
+    return await _probe_url(url, _required_bps(need_bps), ttfb_max,
+                            time.monotonic(), hops=0)
+
+
+async def _probe_url(url: str, required: float, ttfb_max: float,
+                     t0: float, hops: int) -> ProbeResult:
+    """One GET of the probe descent. hops>0 means we're past an HLS playlist,
+    probing a media segment: clean EOF short of the 4 MiB window is then a
+    complete segment, not truncation. ttfb is always measured from the original
+    t0, so playlist hops spend the same first-byte allowance as a direct file."""
     # The read timeout must outlast ttfb_max, or a legitimately slow starter
     # (nzbdav assembling its first segments can take 20-35s) dies as ReadTimeout
     # before the TTFB allowance it was promised ever comes into play.
     timeout = httpx.Timeout(connect=10, read=max(20.0, ttfb_max + 5),
                             write=10, pool=10)
+    playlist_url = ""
     try:
         async with _client.stream(
             "GET", url, headers={"Range": f"bytes=0-{PROBE_BYTES - 1}"},
@@ -80,8 +139,12 @@ async def probe(url: str, need_bps: float | None, ttfb_max: float) -> ProbeResul
             if resp.status_code not in (200, 206):
                 return ProbeResult(False, reason=f"HTTP {resp.status_code}")
             ni = telemetry.netinfo(resp)
+            ctype = resp.headers.get("content-type", "")
             got = 0
             t_first = None
+            head = b""
+            is_playlist = False
+            body = bytearray()
             async for chunk in resp.aiter_bytes():
                 now = time.monotonic()
                 if t_first is None:
@@ -91,12 +154,30 @@ async def probe(url: str, need_bps: float | None, ttfb_max: float) -> ProbeResul
                             False, ttfb=t_first - t0, **ni,
                             reason=f"first byte took {t_first - t0:.1f}s",
                         )
+                if not head and chunk:
+                    head = bytes(chunk[:64])
+                    if _looks_hls(ctype, head):
+                        if hops >= _PLAYLIST_HOPS:
+                            return ProbeResult(
+                                False, ttfb=t_first - t0, **ni,
+                                reason="playlist nested too deep")
+                        is_playlist = True
+                    elif _looks_text(head):
+                        return ProbeResult(
+                            False, ttfb=t_first - t0, **ni,
+                            reason="not video (html/json response)")
                 got += len(chunk)
+                if is_playlist:
+                    body += chunk
+                    if len(body) > _PLAYLIST_MAX_BYTES:
+                        return ProbeResult(False, ttfb=t_first - t0, **ni,
+                                           reason="playlist too large")
+                    continue
                 if got >= PROBE_BYTES:
                     break
                 # sustained-throughput bail-out: if we're this far in and
                 # already too slow, don't wait for the full read timeout
-                if now - t_first > 8 and got / (now - t_first) < required / 2:
+                if _too_slow(got, now - t_first, required):
                     return ProbeResult(
                         False, ttfb=t_first - t0, **ni,
                         speed_bps=got / (now - t_first),
@@ -107,24 +188,42 @@ async def probe(url: str, need_bps: float | None, ttfb_max: float) -> ProbeResul
             elapsed = max(time.monotonic() - t_first, 0.05)
             speed = got / elapsed
             ttfb = t_first - t0
-            # A real feature/episode is vastly larger than this range.  A clean
-            # EOF before the requested 4 MiB is therefore evidence of a
-            # truncated/missing-article response, not a successful probe.
-            if got < PROBE_BYTES:
-                return ProbeResult(False, ttfb=ttfb, speed_bps=speed, **ni,
-                                   reason=f"short body ({got} bytes)")
-            if speed < required:
+            if is_playlist:
+                uri = _hls_first_uri(body.decode("utf-8", errors="replace"))
+                if not uri:
+                    return ProbeResult(False, ttfb=ttfb, **ni,
+                                       reason="empty playlist")
+                playlist_url = str(resp.url)   # recurse outside the stream ctx
+            elif got < PROBE_BYTES:
+                # A real feature/episode is vastly larger than this range.  A
+                # clean EOF before the requested 4 MiB is evidence of a
+                # truncated/missing-article response for a direct file — but a
+                # complete HLS media segment when we descended a playlist.
+                if hops == 0 or got == 0:
+                    return ProbeResult(False, ttfb=ttfb, speed_bps=speed, **ni,
+                                       reason=f"short body ({got} bytes)")
+                if got >= _SEGMENT_JUDGE_BYTES and speed < required:
+                    return ProbeResult(
+                        False, ttfb=ttfb, speed_bps=speed, **ni,
+                        reason=f"{speed / 1e6:.1f} MB/s < required "
+                               f"{required / 1e6:.1f} MB/s",
+                    )
+                return ProbeResult(True, ttfb=ttfb, speed_bps=speed, **ni)
+            elif speed < required:
                 return ProbeResult(
                     False, ttfb=ttfb, speed_bps=speed, **ni,
                     reason=f"{speed / 1e6:.1f} MB/s < required {required / 1e6:.1f} MB/s",
                 )
-            return ProbeResult(True, ttfb=ttfb, speed_bps=speed, **ni)
+            else:
+                return ProbeResult(True, ttfb=ttfb, speed_bps=speed, **ni)
     except asyncio.CancelledError:
         raise
     except Exception as e:
         # Exception text from HTTP clients can contain the full credentialed
         # request URL. The class is enough for retry/reputation classification.
         return ProbeResult(False, reason=type(e).__name__)
+    return await _probe_url(urljoin(playlist_url, uri), required, ttfb_max,
+                            t0, hops + 1)
 
 
 async def probe_batch(

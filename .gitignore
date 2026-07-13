@@ -13,6 +13,10 @@
 data/
 
 # ── local tooling & build noise ──────────────────────────────────────────────
+# Rendered-dashboard snapshots saved at the repo root while iterating on page
+# design (e.g. overview.html, stats_new.html). They dump real telemetry —
+# titles watched, node hostnames — so they must never be committed.
+/*.html
 .claude/
 __pycache__/
 *.py[cod]

@@ -454,6 +454,28 @@ class HealthStore:
             except Exception:
                 return 0.5
 
+    def fetch_score(self, name: str) -> float:
+        """0..1 NZB-download reliability, separate from the composite score:
+        an indexer can search fine and its releases can play fine, yet its
+        download endpoint may 403/429 every fetch (observed live: one indexer
+        at 0/80). This orders which offer's link is tried first, so a dead
+        download endpoint stops costing a round-trip per mount."""
+        name = _safe_indexer(name)
+        with self._lock:
+            try:
+                if self._conn is None or not name:
+                    return 0.5
+                row = self._conn.execute(
+                    "SELECT * FROM indexer_health WHERE name=?", (name,)
+                ).fetchone()
+                if row is None:
+                    return 0.5
+                v = self._decay(row, self._now())
+                return round((v["fetch_ok"] + 3) /
+                             (v["fetch_ok"] + v["fetch_fail"] + 6), 6)
+            except Exception:
+                return 0.5
+
     def indexer_samples(self, name: str) -> int:
         name = _safe_indexer(name)
         with self._lock:
@@ -564,6 +586,11 @@ def blocked_listing() -> list[dict]:
 def indexer_score(name: str) -> float:
     store = _store()
     return store.indexer_score(name) if store else 0.5
+
+
+def fetch_score(name: str) -> float:
+    store = _store()
+    return store.fetch_score(name) if store else 0.5
 
 
 def indexer_samples(name: str) -> int:

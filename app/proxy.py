@@ -255,6 +255,15 @@ def _must_wrap(url: str) -> bool:
     return _internal_url(url) or "@" in (urlsplit(url).netloc or "")
 
 
+def _is_hls(url: str) -> bool:
+    """HLS playlists (custom HTTP addons serve these) must reach the player
+    untouched: the byte-range buffer can't cache a playlist meaningfully, and
+    serving one from /proxy/ breaks its relative segment URIs — the player
+    would resolve them against our host and 404 every segment."""
+    path = (urlsplit(url or "").path or "").lower()
+    return path.endswith((".m3u8", ".m3u"))
+
+
 def _cand(s: dict) -> dict:
     ident = telemetry.identity(s)
     lbl = f"{ident['res']}p {ident['src']} {ident['grp']}".strip()
@@ -282,11 +291,18 @@ def wrap(streams: list[dict], media: str, media_id: str, picker: str) -> list[di
         # URLs pass through untouched.
         return [s for s in streams
                 if not (_proxyable(s) and _must_wrap(s["url"]))]
-    tail = [s for s in streams if _proxyable(s)]
+    tail = [s for s in streams if _proxyable(s) and not _is_hls(s["url"])]
     pool = [_cand(x) for x in tail]          # every proxyable candidate, once
     made = 0
     out = []
     for s in streams:
+        if _proxyable(s) and _is_hls(s["url"]):
+            # Playlists pass through raw — unless raw is unsafe (credentials/
+            # internal host), in which case there is no way to serve them at
+            # all: wrapped they 404 every relative segment, raw they leak.
+            if not _must_wrap(s["url"]):
+                out.append(s)
+            continue
         if _proxyable(s) and (made < WRAP_MAX or _must_wrap(s["url"])):
             pos = tail.index(s)
             cands = pool[pos:pos + MAXFAIL]
@@ -858,6 +874,28 @@ def active_streams() -> int:
     """Streams with a reader attached right now (buffered path only) — the
     settings page's 'you'd be cutting someone off' number before a restart."""
     return sum(1 for e in _entries.values() if e.consumers > 0)
+
+
+def active_stream_details() -> list[dict]:
+    """Return rich metadata for every stream with an active reader — used by
+    the overview dashboard's "Now Playing" section.  Pure in-memory read."""
+    out = []
+    for e in _entries.values():
+        if e.consumers <= 0:
+            continue
+        src = e.source or {}
+        out.append({
+            "media_id": e.media_id or "",
+            "label":    src.get("lbl", ""),
+            "debrid":   src.get("dbr", ""),
+            "res":      src.get("res", 0),
+            "node":     e.node or "",
+            "avail":    e.avail,
+            "total":    e.total,
+            "consumers": e.consumers,
+            "picker":   e.picker or "",
+        })
+    return out
 
 
 def _safe_name(sig: str) -> str:

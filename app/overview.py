@@ -18,7 +18,7 @@ import re
 import time
 from collections import defaultdict
 
-from app import adminui, telemetry, usenet_health
+from app import adminui, proxy, telemetry, usenet_health
 
 ADDON_NAME = os.environ.get("ADDON_NAME", "Auto Stream")
 
@@ -108,7 +108,29 @@ td.name{font-family:var(--mono);font-size:12.5px}
 .empty{color:var(--mut);font-size:13px;background:var(--card);border:1px solid var(--line);
 border-radius:12px;padding:18px 16px;text-align:center}
 .sub{color:var(--mut);font-size:13px;margin:0 0 22px}
-@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+
+.np{margin:0 0 28px}
+.np h2{margin:0 0 10px;display:flex;align-items:center;gap:8px}
+.np .dot{width:8px;height:8px;border-radius:50%;background:var(--good);
+ display:inline-block;animation:pulse 1.8s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+.np-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px}
+.np-card{background:var(--card);border:1px solid var(--line);border-radius:12px;
+ padding:16px;position:relative}
+.np-card .title{font-size:15px;font-weight:600;margin-bottom:6px;
+ overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.np-card .meta{font-size:12.5px;color:var(--mut);margin-bottom:10px;
+ display:flex;flex-wrap:wrap;gap:6px 14px}
+.np-card .meta .tag{background:var(--track);padding:2px 7px;border-radius:6px;
+ font-family:var(--mono);font-size:11.5px;white-space:nowrap}
+.np-card .prog{height:6px;border-radius:4px;background:var(--track);overflow:hidden}
+.np-card .prog .bar{height:100%;border-radius:4px;
+ background:linear-gradient(90deg,var(--accent),var(--accent2));transition:width .6s ease}
+.np-card .prog-label{font:11px var(--mono);color:var(--mut);margin-top:5px;
+ display:flex;justify-content:space-between}
+
+@media (prefers-reduced-motion:reduce){*{transition:none!important}
+.np .dot{animation:none}}
 """
 
 
@@ -149,6 +171,62 @@ def _title_map(recs: list[dict]) -> dict[str, str]:
             name = re.sub(r"^[^\w(]+", "", name)          # drop leading emoji
             out[r["id"]] = name[:48] or r["id"]
     return out
+
+
+def _now_playing(playing: list[dict], names: dict[str, str]) -> str:
+    """Render a 'Now Playing' section — one card per active buffered stream.
+    Returns empty string when nothing is playing (no visual footprint)."""
+    if not playing:
+        return ""
+    cards = []
+    for s in playing:
+        mid = s.get("media_id", "")
+        title = _esc(names.get(mid, mid) or "Unknown")
+        lbl = _esc(s.get("label", ""))
+        dbr = s.get("debrid", "")
+        res = s.get("res", 0)
+        node = s.get("node", "")
+        avail = s.get("avail") or 0
+        total = s.get("total")
+        consumers = s.get("consumers", 1)
+
+        # resolution badge
+        res_tag = f"<span class='tag'>{res}p</span>" if res else ""
+
+        # debrid badge
+        dbr_tag = f"<span class='tag'>{_esc(dbr)}</span>" if dbr else ""
+
+        # node — shorten to first segment (e.g. nexus-190)
+        node_short = node.split(".")[0] if node else ""
+        node_tag = f"<span class='tag'>{_esc(node_short)}</span>" if node_short else ""
+
+        # viewers
+        viewers_txt = (f"{consumers} viewer{'s' if consumers != 1 else ''}")
+
+        # progress bar
+        if total and total > 0:
+            pct = min(100.0, 100.0 * avail / total)
+            avail_gb = avail / (1024 ** 3)
+            total_gb = total / (1024 ** 3)
+            prog = (f"<div class='prog'><div class='bar' style='width:{pct:.1f}%'></div></div>"
+                    f"<div class='prog-label'><span>{avail_gb:.2f} / {total_gb:.2f} GB buffered</span>"
+                    f"<span>{pct:.0f}%</span></div>")
+        else:
+            prog = ("<div class='prog'><div class='bar' style='width:0%'></div></div>"
+                    "<div class='prog-label'><span>buffering…</span></div>")
+
+        cards.append(
+            f"<div class='np-card'>"
+            f"<div class='title'>{title}</div>"
+            f"<div class='meta'>"
+            f"<span>{lbl}</span>"
+            f"{res_tag}{dbr_tag}{node_tag}"
+            f"<span>{_esc(viewers_txt)}</span>"
+            f"</div>{prog}</div>")
+
+    return ("<div class='np'>"
+            "<h2><span class='dot'></span> Now Playing</h2>"
+            f"<div class='np-cards'>{''.join(cards)}</div></div>")
 
 
 def _bar(label: str, n: int, total: int, cls: str = "", note: str = "") -> str:
@@ -204,6 +282,10 @@ def render(recs: list[dict]) -> str:
     nzb_fails = [r for r in recs if r.get("kind") == "nzb_failure"]
     buffers = [r for r in recs if r.get("kind") == "buffer"]
     names = _title_map(recs)
+
+    # ── now playing (live from proxy buffer cache) ──
+    playing = proxy.active_stream_details()
+    now_playing_html = _now_playing(playing, names)
 
     total_mb = sum(r.get("mb") or 0 for r in plays)
     total_secs = sum(r.get("secs") or 0 for r in plays)
@@ -398,13 +480,17 @@ def render(recs: list[dict]) -> str:
              "comes alive once streams are watched through the addon (it needs "
              "the proxy — the 'Direct links' stream path records nothing).</div>")
 
+    refresh = ('<meta http-equiv="refresh" content="30">' if playing else '')
+
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="robots" content="noindex">
+{refresh}
 <title>{_esc(ADDON_NAME)} — overview</title>
 <style>{_CSS}{adminui.NAV_CSS}</style></head>
 <body><div class="wrap">
 {adminui.nav('overview', ADDON_NAME)}
+{now_playing_html}
 <p class="eyebrow">Stream ledger</p>
 {hero}
 <p class="sub">{_esc(span_txt)}</p>
