@@ -1,0 +1,178 @@
+import unittest
+from unittest import mock
+
+import httpx
+
+from app import usenet
+from app.usenet_health import classify_reason
+
+
+def _release(*, link: str = "https://indexer.example/get/one") -> dict:
+    return {
+        "release_key": "nzb:" + "a" * 64,
+        "title": "Example.Movie.2024.4K.WEB-DL-GROUP",
+        "size": 18_000_000_000,
+        "offers": [{"indexer": "ExampleIndexer", "link": link}],
+    }
+
+
+class UsenetClassificationTests(unittest.TestCase):
+    def test_bare_4k_is_the_top_resolution_tier(self) -> None:
+        self.assertEqual(3, usenet._quality(_release())[1])
+
+    def test_not_media_is_a_decisive_health_failure(self) -> None:
+        self.assertEqual("hard", classify_reason("not-media"))
+        self.assertEqual("hard", classify_reason("not media"))
+
+    def test_missing_mount_content_has_reachable_distinct_classes(self) -> None:
+        wrong_episode = [("/content/job/Example.S01E03.mkv", 4_000_000_000)]
+        non_video = [("/content/job/readme.txt", 100)]
+
+        self.assertEqual(
+            "wrong-episode",
+            usenet._missing_content_reason(wrong_episode, (1, 2), True),
+        )
+        self.assertEqual(
+            "not-video",
+            usenet._missing_content_reason(non_video, None, True),
+        )
+        self.assertEqual(
+            "never-appeared",
+            usenet._missing_content_reason([], None, False),
+        )
+
+
+class FailureTelemetryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_dav_timeout_is_structured_and_deduped_per_mount(self) -> None:
+        release = _release()
+        timeout = httpx.ReadTimeout(
+            "credentialed URL must not be retained",
+            request=httpx.Request("PROPFIND", "https://user:secret@dav.example/x"),
+        )
+        seen: set[str] = set()
+        with mock.patch.object(
+                usenet._client, "request",
+                new=mock.AsyncMock(side_effect=timeout)), \
+                mock.patch.object(
+                    usenet.telemetry, "record_usenet_failure") as record:
+            self.assertIsNone(await usenet._dav_list("/content/job", release, seen))
+            self.assertIsNone(await usenet._dav_list("/content/job", release, seen))
+
+        record.assert_called_once()
+        fields = record.call_args.kwargs
+        self.assertEqual("nzbdav-dav", fields["stage"])
+        self.assertEqual("timeout", fields["reason"])
+        self.assertEqual("ReadTimeout", fields["detail"])
+        self.assertNotIn("secret", str(fields))
+
+    async def test_fetch_http_failure_retains_status_without_url(self) -> None:
+        link = "https://indexer.example/get/one?apikey=do-not-store"
+        release = _release(link=link)
+        response = httpx.Response(
+            403, request=httpx.Request("GET", link), content=b"forbidden")
+        with mock.patch.object(
+                usenet, "_dav_list", new=mock.AsyncMock(return_value=None)), \
+                mock.patch.object(
+                    usenet, "_history_failure", new=mock.AsyncMock(return_value=None)), \
+                mock.patch.object(
+                    usenet._client, "get", new=mock.AsyncMock(return_value=response)), \
+                mock.patch.object(
+                    usenet.usenet_health, "indexer_score", return_value=0.5), \
+                mock.patch.object(
+                    usenet.usenet_health, "record_fetch") as record_fetch, \
+                mock.patch.object(
+                    usenet.telemetry, "record_usenet_failure") as record:
+            self.assertIsNone(await usenet._mount(release, "movies"))
+
+        record_fetch.assert_called_once_with("ExampleIndexer", False)
+        record.assert_called_once()
+        fields = record.call_args.kwargs
+        self.assertEqual("nzb-fetch", fields["stage"])
+        self.assertEqual("http-403", fields["reason"])
+        self.assertEqual("HTTPStatusError HTTP 403", fields["detail"])
+        self.assertNotIn("do-not-store", str(fields))
+
+    async def test_repeated_put_status_is_one_stable_failure_sample(self) -> None:
+        release = _release()
+        nzb = httpx.Response(
+            200, request=httpx.Request("GET", release["offers"][0]["link"]),
+            content=b"<nzb></nzb>")
+        unavailable = httpx.Response(503)
+        with mock.patch.object(
+                usenet, "_dav_list", new=mock.AsyncMock(return_value=None)), \
+                mock.patch.object(
+                    usenet, "_history_failure", new=mock.AsyncMock(return_value=None)), \
+                mock.patch.object(
+                    usenet._client, "get", new=mock.AsyncMock(return_value=nzb)), \
+                mock.patch.object(
+                    usenet._client, "put",
+                    new=mock.AsyncMock(side_effect=[unavailable, unavailable])), \
+                mock.patch.object(
+                    usenet.asyncio, "sleep", new=mock.AsyncMock()), \
+                mock.patch.object(
+                    usenet.usenet_health, "indexer_score", return_value=0.5), \
+                mock.patch.object(
+                    usenet.usenet_health, "record_fetch"), \
+                mock.patch.object(
+                    usenet.telemetry, "record_usenet_failure") as record:
+            self.assertIsNone(await usenet._mount(release, "movies"))
+
+        record.assert_called_once()
+        fields = record.call_args.kwargs
+        self.assertEqual("nzbdav-put", fields["stage"])
+        self.assertEqual("http-503", fields["reason"])
+        self.assertEqual("HTTP 503", fields["detail"])
+
+    async def test_mounted_non_video_content_records_a_hard_failure(self) -> None:
+        release = _release()
+        entries = [("/content/movies/job/readme.txt", 100)]
+        with mock.patch.object(
+                usenet, "_dav_list", new=mock.AsyncMock(return_value=entries)), \
+                mock.patch.object(usenet, "MOUNT_WAIT", 0), \
+                mock.patch.object(
+                    usenet.usenet_health, "record_failure", return_value=True), \
+                mock.patch.object(
+                    usenet.telemetry, "record_usenet_failure") as record:
+            self.assertIsNone(await usenet._mount(release, "movies"))
+
+        record.assert_called_once()
+        fields = record.call_args.kwargs
+        self.assertEqual("nzbdav-content", fields["stage"])
+        self.assertEqual("hard", fields["decision"])
+        self.assertEqual("not-video", fields["reason"])
+
+    async def test_never_appeared_records_a_transient_mount_timeout(self) -> None:
+        release = _release()
+        nzb = httpx.Response(
+            200, request=httpx.Request("GET", release["offers"][0]["link"]),
+            content=b"<nzb></nzb>")
+        accepted = mock.Mock(return_value=True)
+        with mock.patch.object(
+                usenet, "_dav_list", new=mock.AsyncMock(return_value=None)), \
+                mock.patch.object(
+                    usenet, "_history_failure", new=mock.AsyncMock(return_value=None)), \
+                mock.patch.object(
+                    usenet._client, "get", new=mock.AsyncMock(return_value=nzb)), \
+                mock.patch.object(
+                    usenet._client, "put",
+                    new=mock.AsyncMock(return_value=httpx.Response(201))), \
+                mock.patch.object(usenet, "MOUNT_WAIT", 0), \
+                mock.patch.object(
+                    usenet.usenet_health, "indexer_score", return_value=0.5), \
+                mock.patch.object(usenet.usenet_health, "record_fetch"), \
+                mock.patch.object(
+                    usenet.usenet_health, "record_failure", accepted), \
+                mock.patch.object(
+                    usenet.telemetry, "record_usenet_failure") as record:
+            self.assertIsNone(await usenet._mount(release, "movies"))
+
+        self.assertEqual("never-appeared", accepted.call_args.args[3])
+        record.assert_called_once()
+        fields = record.call_args.kwargs
+        self.assertEqual("nzbdav-mount", fields["stage"])
+        self.assertEqual("transient", fields["decision"])
+        self.assertEqual("never-appeared", fields["reason"])
+
+
+if __name__ == "__main__":
+    unittest.main()

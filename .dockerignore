@@ -1,0 +1,9 @@
+app/__pycache__
+app.bak*
+data
+.dockerignore
+.env
+.env.*
+docker-compose.yml
+README.md
+tools

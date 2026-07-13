@@ -1,0 +1,48 @@
+# Standalone deployment of the stream-picker addon.
+#
+#   cp .env.example .env        # then set ADDON_SECRET (and ADDON_PUBLIC_URL)
+#   docker compose up -d --build
+#
+# First run: open  http://<host>:8011/<ADDON_SECRET>/settings  to connect your
+# APIs and choose how streams are handled. Everything you set there is written
+# to ./data/config.json and applied on the next restart, so the only value this
+# file really needs is ADDON_SECRET.
+
+services:
+  stream-picker:
+    build: .
+    image: stream-picker:latest
+    container_name: stream-picker
+    restart: unless-stopped
+    ports:
+      - "8011:8000"          # host:container — change 8011 if it's already taken
+    environment:
+      # Fail fast with a clear message instead of a crash loop if it's unset.
+      ADDON_SECRET: "${ADDON_SECRET:?Set ADDON_SECRET in .env — generate one with openssl rand -hex 24}"
+    env_file:
+      - .env                 # passes ADDON_PUBLIC_URL and any other seeds through
+    volumes:
+      # Dashboard settings (config.json) + source-health telemetry. Persisting
+      # this is what lets the dashboard remember your setup across rebuilds.
+      - ./data:/data
+    healthcheck:
+      # The slim image has no curl; python3 + urllib is always present.
+      test: ["CMD", "python3", "-c",
+             "import urllib.request;urllib.request.urlopen('http://localhost:8000/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+    # ── connecting to an existing *arr / Jellyfin stack ──────────────────────
+    # If Radarr/Sonarr/Jellyseerr run in another compose project on this host,
+    # join their network so you can point the dashboard at http://radarr:7878
+    # etc. instead of IP:port. Uncomment here and the top-level block below,
+    # and set the name to that project's network (`docker network ls`).
+    #networks:
+    #  - media
+
+#networks:
+#  media:
+#    external: true
+#    name: media-network

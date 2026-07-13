@@ -1,0 +1,23 @@
+# ── secrets & runtime state — never publish these ───────────────────────────
+# Your real environment (API keys, debrid URLs, WebDAV creds).
+.env
+*.env
+# ...but keep the safe templates that ARE meant to be public.
+!.env.example
+!.env.reference
+
+# The data volume: dashboard config (config.json holds saved secrets),
+# playback sessions (sessions.jsonl embeds debrid/WebDAV credentials in stream
+# URLs), telemetry, the usenet-health DB, and the read-ahead buffer cache.
+# Committing any of this would leak keys and your viewing history.
+data/
+
+# ── local tooling & build noise ──────────────────────────────────────────────
+.claude/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+.DS_Store
