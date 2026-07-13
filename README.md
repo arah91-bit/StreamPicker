@@ -10,6 +10,11 @@ flaky sources mid-playback.
 Everything is configured from a browser dashboard, so deploying is: set one
 secret, start the container, open the dashboard, plug in your services.
 
+> **New here / starting from scratch?** Read **[SETUP.md](SETUP.md)** — a
+> from-zero, step-by-step guide (for a human or an AI agent) covering what the
+> external pieces are, a minimal viable path, and how to verify it works. This
+> README is the quick reference once you know the shape of things.
+
 ## Requirements
 
 - Docker with the Compose plugin (`docker compose`).
