@@ -213,7 +213,7 @@ class SecretHygieneTests(unittest.TestCase):
         os.environ["TMDB_API_KEY"] = "tmdb-secret-value-98765"
         os.environ["NZBDAV_PASS"] = "davpass-secret-55555"
         try:
-            page = settings_ui.render("test-secret")
+            page = settings_ui.render()
             self.assertNotIn("tmdb-secret-value-98765", page)
             self.assertNotIn("davpass-secret-55555", page)
             self.assertIn("TMDB_API_KEY", page)   # the key name is shown
@@ -230,7 +230,26 @@ class SecretHygieneTests(unittest.TestCase):
         self.assertNotIn("user:pw", s)
 
 
+class AdminGuardTests(unittest.TestCase):
+    def test_local_client_ips_allowed(self):
+        from app import adminui
+
+        class Req:
+            def __init__(self, xff=None, host="127.0.0.1"):
+                self.headers = {"x-forwarded-for": xff} if xff else {}
+                self.client = type("C", (), {"host": host})()
+        self.assertTrue(adminui.is_local(Req(host="127.0.0.1")))
+        self.assertTrue(adminui.is_local(Req(host="192.168.1.10")))
+        self.assertTrue(adminui.is_local(Req(host="172.17.0.1")))   # docker
+        self.assertTrue(adminui.is_local(Req(xff="10.0.0.5")))
+        self.assertFalse(adminui.is_local(Req(xff="8.8.8.8")))      # public
+        self.assertFalse(adminui.is_local(Req(host="testclient")))  # non-IP
+
+
 class RouteTests(unittest.TestCase):
+    # A local client — the guard admits loopback/LAN, so present as 127.0.0.1.
+    LOCAL = {"x-forwarded-for": "127.0.0.1"}
+
     @classmethod
     def setUpClass(cls):
         _wipe_store()
@@ -238,45 +257,60 @@ class RouteTests(unittest.TestCase):
         from app import main
         cls.client = TestClient(main.app)
 
-    def test_wrong_secret_is_404(self):
-        self.assertEqual(404,
-                         self.client.get("/wrong/settings").status_code)
-        self.assertEqual(404, self.client.post(
-            "/wrong/settings/save", json={"values": {}}).status_code)
+    def test_dashboard_is_clean_local_paths(self):
+        for path in ("/", "/settings", "/stats"):
+            r = self.client.get(path, headers=self.LOCAL)
+            self.assertEqual(200, r.status_code, path)
+        # one site: every admin page carries the shared tab nav
+        self.assertIn("adminnav", self.client.get("/", headers=self.LOCAL).text)
+
+    def test_public_client_is_blocked(self):
+        # a request forwarded from the public internet must not see the dashboard
+        pub = {"x-forwarded-for": "8.8.8.8"}
+        for path in ("/", "/settings", "/stats", "/api/settings/status.json"):
+            self.assertEqual(404, self.client.get(path, headers=pub).status_code,
+                             path)
 
     def test_settings_page_renders(self):
-        r = self.client.get("/test-secret/settings")
+        r = self.client.get("/settings", headers=self.LOCAL)
         self.assertEqual(200, r.status_code)
         self.assertIn("Stream path", r.text)
         self.assertIn("Connections", r.text)
         self.assertIn("Advanced tuning", r.text)
-        self.assertIn("FAST_TIMEOUT", r.text)      # an advanced knob is present
+        self.assertIn("FAST_TIMEOUT", r.text)
 
     def test_export_env_route(self):
-        r = self.client.get("/test-secret/settings/export.env")
+        r = self.client.get("/api/settings/export.env", headers=self.LOCAL)
         self.assertEqual(200, r.status_code)
         self.assertIn("text/plain", r.headers["content-type"])
         self.assertIn("attachment", r.headers.get("content-disposition", ""))
         self.assertIn("ADDON_PUBLIC_URL=", r.text)
 
     def test_save_and_status_roundtrip(self):
-        r = self.client.post("/test-secret/settings/save",
+        r = self.client.post("/api/settings/save", headers=self.LOCAL,
                              json={"values": {"SLOW_MAX_PROBES": "24"}})
         self.assertEqual(200, r.status_code)
         self.assertIn("SLOW_MAX_PROBES", r.json()["changed"])
-        st = self.client.get("/test-secret/settings/status.json").json()
+        st = self.client.get("/api/settings/status.json",
+                             headers=self.LOCAL).json()
         self.assertTrue(st["restart_pending"])
         self.assertIsInstance(st["playing"], int)
 
     def test_bad_save_is_400_not_500(self):
-        r = self.client.post("/test-secret/settings/save",
+        r = self.client.post("/api/settings/save", headers=self.LOCAL,
                              json={"values": {"PATH": "/evil"}})
         self.assertEqual(400, r.status_code)
 
     def test_unknown_test_service_is_400(self):
-        r = self.client.post("/test-secret/settings/test/nope",
+        r = self.client.post("/api/settings/test/nope", headers=self.LOCAL,
                              json={"values": {}})
         self.assertEqual(400, r.status_code)
+
+    def test_addon_endpoints_still_secret_gated(self):
+        self.assertEqual(200, self.client.get(
+            "/test-secret/manifest.json").status_code)
+        self.assertEqual(404, self.client.get(
+            "/wrong-secret/manifest.json").status_code)
 
 
 if __name__ == "__main__":

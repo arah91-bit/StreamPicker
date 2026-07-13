@@ -18,8 +18,10 @@ slow picker gets it for free.
 """
 
 import asyncio
+import json
 import logging
 import os
+import re
 import time
 
 import httpx
@@ -57,6 +59,70 @@ _REQ_TIMEOUT = {
     # search all indexers + fetch/PUT/mount top NZBs; normally ~8-15s
     NZB: float(os.environ.get("NZB_TIMEOUT", "45")),
 }
+
+# ── user-added player addons ─────────────────────────────────────────────────
+# Any addon that serves /stream/{type}/{id}.json — AIOStreams, a usenet addon,
+# a debrid catalog — can be plugged in from the dashboard. Each becomes a
+# first-class online source keyed `x:<slug>`: it joins the same shared search,
+# and its streams flow through the identical filter + playback-probe pipeline,
+# so only *verified* results reach the player. Stored as a JSON list of
+# {name, url} in EXTRA_ADDONS (managed by the settings dashboard).
+EXTRA_TIMEOUT = float(os.environ.get("EXTRA_ADDON_TIMEOUT", "30"))
+BUILTIN_ONLINE = [FAST, STREMTHRU, MEDIAFUSION]
+EXTRAS: list[str] = []          # extra source keys, in configured order
+EXTRA_META: list[dict] = []     # [{key, name, url}] for the dashboard
+
+
+def _slug(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "addon"
+
+
+def _base_of(url: str) -> str:
+    url = (url or "").strip().rstrip("/")
+    if url.endswith("/manifest.json"):
+        url = url[:-len("/manifest.json")].rstrip("/")
+    return url
+
+
+def _load_extras() -> None:
+    raw = (os.environ.get("EXTRA_ADDONS") or "").strip()
+    if not raw:
+        return
+    try:
+        items = json.loads(raw)
+    except ValueError:
+        logger.warning("EXTRA_ADDONS: invalid JSON — ignoring custom addons")
+        return
+    used: set[str] = set()
+    for it in items if isinstance(items, list) else []:
+        if not isinstance(it, dict):
+            continue
+        base = _base_of(str(it.get("url", "")))
+        if not base.startswith(("http://", "https://")):
+            continue
+        name = str(it.get("name", "")).strip() or base
+        slug, key, i = _slug(name), "", 2
+        key = f"x:{slug}"
+        while key in used:
+            key = f"x:{slug}-{i}"
+            i += 1
+        used.add(key)
+        _BASES[key] = base
+        _REQ_TIMEOUT[key] = EXTRA_TIMEOUT
+        EXTRAS.append(key)
+        EXTRA_META.append({"key": key, "name": name, "url": base})
+    if EXTRAS:
+        logger.info(f"custom addons enabled: {', '.join(m['name'] for m in EXTRA_META)}")
+
+
+_load_extras()
+
+
+def search_all() -> list[str]:
+    """Every source to search for a title, built-ins + user addons, that is
+    actually configured. NZB stays last (it's the slow direct lane)."""
+    return [k for k in [*BUILTIN_ONLINE, *EXTRAS, NZB] if has(k)]
+
 
 # Successful (non-empty) searches are reused for RAW_TTL. Empty results —
 # usually a transient upstream hiccup rather than "this title truly has no

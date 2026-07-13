@@ -110,7 +110,13 @@ UNKNOWN_NEED_480 = float(os.environ.get("UNKNOWN_NEED_480", "500000"))
 SLOW_TOTAL_DEADLINE = float(os.environ.get("SLOW_TOTAL_DEADLINE", "55"))
 # Time held back from the source wait so there's always room to probe.
 SLOW_PROBE_RESERVE = float(os.environ.get("SLOW_PROBE_RESERVE", "18"))
-SLOW_TTFB_MAX = float(os.environ.get("SLOW_TTFB_MAX", "35"))
+# Foreground first-byte patience. Bumped high on purpose: the foreground pass is
+# already capped by min(this, remaining budget), so a big value just means "spend
+# the whole SLOW_TOTAL_DEADLINE gate letting a high-quality but slow-to-unlock
+# source (uncached RD, a usenet mount) prove it plays, rather than abandoning it
+# at an arbitrary 35s." The gate still returns whatever verified so far — it never
+# hangs past the deadline. Pure-quality ranking then puts the best survivor #1.
+SLOW_TTFB_MAX = float(os.environ.get("SLOW_TTFB_MAX", "120"))
 # The slow picker doesn't need to probe every link — it only needs the single
 # best-quality one that *works* at #1, plus a few backups. So it probes the top
 # SLOW_MAX_PROBES *by quality*, all at once (the household has no simultaneous-
@@ -129,6 +135,13 @@ SLOW_NZB_PROBES = max(0, int(os.environ.get("SLOW_NZB_PROBES", "2")))
 # the foreground slice) and refines the cached best-quality answer for the retry.
 SLOW_FINISH_MAX_PROBES = int(os.environ.get("SLOW_FINISH_MAX_PROBES", "24"))
 SLOW_FINISH_DEADLINE = float(os.environ.get("SLOW_FINISH_DEADLINE", "240"))
+# Off Nuvio's clock, the finisher can be truly patient with first byte: a big
+# remux behind an uncached debrid unlock, or a usenet mount still assembling its
+# opening articles, may take a minute-plus to hand over byte 0 yet stream fine
+# after. This is what lets a high-quality slow source survive verification and,
+# on the retry, take #1 by quality — the payoff of the 55s-gate/120s-patience
+# split. Bounded by SLOW_FINISH_DEADLINE so it still can't run forever.
+SLOW_FINISH_TTFB_MAX = float(os.environ.get("SLOW_FINISH_TTFB_MAX", "120"))
 # Direct nzbdav probes honor a longer TTFB in the slow/background picker because
 # assembling the opening segments can be slow even when sustained playback is
 # excellent. Fast never waits beyond its seven-second response ceiling.
@@ -1072,18 +1085,19 @@ async def _finish_in_background(cache_key: str, media: str, media_id: str,
                                 extra: list[dict]) -> None:
     """Finish every source/probe off-request and refresh the fast cache."""
     try:
-        fast, stremthru, mediafusion, nzb = await asyncio.gather(
+        fast, stremthru, mediafusion, nzb, extras = await asyncio.gather(
             sources.get(sources.FAST, media, media_id, wait=15),
             sources.get(sources.STREMTHRU, media, media_id, wait=45),
             sources.get(sources.MEDIAFUSION, media, media_id, wait=60),
             sources.get(sources.NZB, media, media_id, wait=USENET_FINISH_WAIT),
+            _gather_extras(media, media_id, wait=60),
         )
         complete_nzb = await nzb_lane.wait_complete(
             media, media_id, USENET_FINISH_WAIT)
         if complete_nzb is not None:
             nzb = complete_nzb
         ok, _ = _merge_rank(list(extra) + list(fast), stremthru,
-                            mediafusion, nzb, profile, runtime)
+                            mediafusion, nzb, profile, runtime, extras=extras)
         inherited = _take_fast_verified(cache_key, profile, runtime)
         inherited_urls = {s.get("url") for s, _ in inherited}
         probed = await _probe_bounded(
@@ -1135,9 +1149,7 @@ async def _race_fast(media: str, media_id: str, profile: dict, runtime: float,
     material and as the unverified fallback list. The underlying searches are
     shielded in app.sources, so bailing early never cancels them — they finish
     into the shared cache for the background finisher and the slow picker."""
-    srcs = [s for s in (sources.FAST, sources.STREMTHRU, sources.MEDIAFUSION,
-                        sources.NZB)
-            if sources.has(s)]
+    srcs = sources.search_all()          # built-ins + user-added addons
     if not srcs:
         return [], []
 
@@ -1312,8 +1324,7 @@ async def _pick_online(media: str, media_id: str,
     # (and so a sibling slow-picker request can join these instead of starting
     # its own). We never cancel them: whoever bails early just detaches, and
     # the search finishes into the shared cache for the next joiner.
-    for src in (sources.FAST, sources.STREMTHRU, sources.MEDIAFUSION,
-                sources.NZB):
+    for src in sources.search_all():
         sources.start(src, media, media_id)
 
     # Runtime and language metadata resolve while upstream searches are already
@@ -1365,13 +1376,31 @@ async def _pick_online(media: str, media_id: str,
 
 # ── slow / best-quality picker ──────────────────────────────────────────────
 
+async def _gather_extras(media: str, media_id: str, wait: float) -> list[dict]:
+    """Collect streams from every user-added addon (app.sources.EXTRAS). Each is
+    joined like any built-in source; failures/timeouts yield nothing and never
+    break the pick."""
+    if not sources.EXTRAS:
+        return []
+    results = await asyncio.gather(
+        *(sources.get(k, media, media_id, wait=wait) for k in sources.EXTRAS),
+        return_exceptions=True)
+    out: list[dict] = []
+    for r in results:
+        if isinstance(r, list):
+            out.extend(r)
+    return out
+
+
 def _merge_rank(fast: list[dict], stremthru: list[dict],
                 mediafusion: list[dict], nzb: list[dict], profile: dict,
-                runtime: float) -> tuple[list[dict], dict | None]:
+                runtime: float,
+                extras: list[dict] | None = None) -> tuple[list[dict], dict | None]:
     """Merge every source into one URL-deduped, quality-ranked candidate list
-    (best first)."""
+    (best first). `extras` carries streams from user-added addons."""
     everything = [_ingested_stream(s) for s in (
-        list(fast) + list(stremthru) + list(mediafusion) + list(nzb))]
+        list(fast) + list(stremthru) + list(mediafusion) + list(nzb)
+        + list(extras or []))]
     _annotate_quality(everything, runtime)
     seen: set[str] = set()
     merged: list[dict] = []
@@ -1453,25 +1482,27 @@ async def _finish_slow(cache_key: str, media: str, media_id: str,
     """Let every source run fully to completion (usenet is the long one), then
     do the deep merge/probe and cache the best-quality result for the retry."""
     try:
-        fast, stremthru, mediafusion, nzb = await asyncio.gather(
+        fast, stremthru, mediafusion, nzb, extras = await asyncio.gather(
             sources.get(sources.FAST, media, media_id, wait=15),
             sources.get(sources.STREMTHRU, media, media_id, wait=45),
             sources.get(sources.MEDIAFUSION, media, media_id, wait=60),
             sources.get(sources.NZB, media, media_id, wait=60),
+            _gather_extras(media, media_id, wait=60),
         )
         complete_nzb = await nzb_lane.wait_complete(
             media, media_id, USENET_FINISH_WAIT)
         if complete_nzb is not None:
             nzb = complete_nzb
         ok, fallback = _merge_rank(fast, stremthru, mediafusion, nzb,
-                                   profile, runtime)
+                                   profile, runtime, extras=extras)
         fast_verified = _take_fast_verified(cache_key[len("slow:"):], profile, runtime)
         fast_urls = {s.get("url") for s, _ in fast_verified}
-        # Off Nuvio's clock, so dig a little deeper by quality than the foreground
-        # slice before settling on the best-quality answer for the retry cache.
+        # Off Nuvio's clock, so dig deeper by quality than the foreground slice
+        # AND wait patiently (SLOW_FINISH_TTFB_MAX) for slow-to-start high-quality
+        # sources, so they survive verification and can take #1 on the retry.
         verified = await _probe_bounded(
             [s for s in ok if s.get("url") not in fast_urls],
-            runtime, USENET_TTFB_MAX, SLOW_FINISH_MAX_PROBES,
+            runtime, SLOW_FINISH_TTFB_MAX, SLOW_FINISH_MAX_PROBES,
             time.monotonic() + SLOW_FINISH_DEADLINE)
         lib = await library.streams(media, media_id) if library.enabled() else []
         if lib:
@@ -1585,8 +1616,7 @@ async def pick_slow(media: str, media_id: str,
     # Join the fast picker's shared searches (or start them if the slow addon
     # was opened first). Either way, one search per title — no parallel
     # duplicate that would rate-limit the upstream APIs.
-    for src in (sources.FAST, sources.STREMTHRU, sources.MEDIAFUSION,
-                sources.NZB):
+    for src in sources.search_all():
         sources.start(src, media, media_id)
 
     runtime = await _runtime_seconds(media, media_id)
@@ -1595,11 +1625,12 @@ async def pick_slow(media: str, media_id: str,
     # Wait for every source to run its course, holding back SLOW_PROBE_RESERVE
     # so there's room to probe deeply before the deadline.
     src_wait = max(left() - SLOW_PROBE_RESERVE, 1)
-    fast, stremthru, mediafusion, nzb = await asyncio.gather(
+    fast, stremthru, mediafusion, nzb, extras = await asyncio.gather(
         sources.get(sources.FAST, media, media_id, wait=src_wait),
         sources.get(sources.STREMTHRU, media, media_id, wait=src_wait),
         sources.get(sources.MEDIAFUSION, media, media_id, wait=src_wait),
         sources.get(sources.NZB, media, media_id, wait=src_wait),
+        _gather_extras(media, media_id, wait=src_wait),
     )
 
     # The direct lane is progressive: its source call can return empty or with
@@ -1615,7 +1646,7 @@ async def pick_slow(media: str, media_id: str,
                 nzb = newer
 
     ok, fallback = _merge_rank(fast, stremthru, mediafusion, nzb,
-                               profile, runtime)
+                               profile, runtime, extras=extras)
     # Anything the fast picker already probed OK for this title is verified truth
     # — fold it straight in, and don't waste the probe budget re-checking it.
     fast_verified = _take_fast_verified(cache_key[len("slow:"):], profile, runtime)

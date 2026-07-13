@@ -13,8 +13,11 @@ values — is set in monospace; human copy is in the system sans.
 """
 
 import html
+import os
 
-from app import config, knobs
+from app import adminui, config, knobs
+
+ADDON_NAME = os.environ.get("ADDON_NAME", "Auto Stream")
 
 _CSS = """
 :root{color-scheme:light dark;--bg:#fbfbfa;--card:#fff;--fg:#1a1a18;--mut:#6b6b66;
@@ -145,6 +148,19 @@ color:var(--mut);margin:0 2px 8px;font-weight:600}
 .unit{font:12px var(--mono);color:var(--mut);min-width:26px}
 .adv-row[hidden]{display:none}
 .nomatch{color:var(--mut);font-size:13px;padding:8px 2px}
+.addonrow{display:flex;align-items:center;gap:10px;padding:11px 0;
+border-bottom:1px solid var(--line)}
+.addonrow:last-of-type{border-bottom:0}
+.addoninfo{flex:1;min-width:0}
+.addonname{font-weight:600;font-size:14px}
+.addonurl{display:block;font:11.5px var(--mono);color:var(--mut);overflow-wrap:anywhere}
+.addon-del{background:none;border:0;color:var(--mut);font-size:21px;line-height:1;
+cursor:pointer;padding:0 4px}
+.addon-del:hover{color:var(--bad)}
+.addonadd{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:12px;
+padding-top:14px;border-top:1px solid var(--line)}
+.addonadd input{flex:1;min-width:150px}
+.addonempty{color:var(--mut);font-size:13px;padding:2px 0 4px}
 
 :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
@@ -218,7 +234,7 @@ $('#savebtn').addEventListener('click',async()=>{
  const values={};dirtyControls().forEach(el=>values[el.dataset.key]=ctlValue(el));
  $('#savebtn').disabled=true;
  try{
-  const res=await post('settings/save',{values});
+  const res=await post('/api/settings/save',{values});
   dirtyControls().forEach(el=>{
    if(el.dataset.secret){el.dataset.init='';el.placeholder='kept · just saved';el.value='';}
    else el.dataset.init=ctlValue(el);});
@@ -229,13 +245,13 @@ $('#savebtn').addEventListener('click',async()=>{
 
 $('#restartbtn').addEventListener('click',async()=>{
  let playing=0;
- try{playing=(await(await fetch('settings/status.json')).json()).playing}catch(e){}
+ try{playing=(await(await fetch('/api/settings/status.json')).json()).playing}catch(e){}
  const q=playing>0
   ?`${playing} stream${playing>1?'s':''} playing right now will be cut off. Restart anyway?`
   :'Restart the addon now? It comes back in a few seconds.';
  if(!confirm(q))return;
  $('#restartbtn').disabled=true;$('#barmsg').textContent='Restarting…';
- try{await post('settings/restart')}catch(e){}
+ try{await post('/api/settings/restart')}catch(e){}
  const t0=Date.now();
  (async function poll(){
   if(Date.now()-t0>45000){$('#barmsg').textContent=
@@ -253,7 +269,7 @@ $$('.test').forEach(btn=>btn.addEventListener('click',async()=>{
   if(el.dataset.secret&&el.value==='')return;values[el.dataset.key]=el.value;});
  dot.className='dot run';res.className='tres';res.textContent='testing…';
  btn.disabled=true;
- try{const r=await post('settings/test/'+svc,{values});
+ try{const r=await post('/api/settings/test/'+svc,{values});
   dot.className='dot '+(r.ok?'ok':'bad');
   res.className='tres '+(r.ok?'ok':'bad');
   res.textContent=`${r.ms} ms · ${r.detail}`;
@@ -261,6 +277,52 @@ $$('.test').forEach(btn=>btn.addEventListener('click',async()=>{
   res.textContent=e.message;}
  btn.disabled=false;
 }));
+
+/* custom addons: a small editable list writing one hidden EXTRA_ADDONS field */
+const addonval=$('#addonval');
+function hesc(s){return (s||'').replace(/[&<>"']/g,c=>(
+ {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+let ADDONS=[];try{ADDONS=JSON.parse(addonval.value||'[]')||[]}catch(e){ADDONS=[]}
+function renderAddons(){
+ const list=$('#addonlist');
+ if(!ADDONS.length){list.innerHTML=
+   "<div class='addonempty'>No custom addons yet — add one below.</div>";return;}
+ list.innerHTML=ADDONS.map((a,i)=>
+  `<div class='addonrow' data-i='${i}'><div class='addoninfo'>`+
+  `<span class='addonname'>${hesc(a.name)}</span>`+
+  `<span class='addonurl'>${hesc(a.url)}</span></div>`+
+  `<span class='dot'></span>`+
+  `<button type='button' class='btn ghost addon-test' data-i='${i}'>Test</button>`+
+  `<button type='button' class='addon-del' data-i='${i}' title='Remove'>×</button>`+
+  `<span class='tres'></span></div>`).join('');
+}
+function addonsSync(){
+ addonval.value=JSON.stringify(ADDONS);
+ addonval.dispatchEvent(new Event('input',{bubbles:true}));
+ renderAddons();
+}
+$('#addon_add').addEventListener('click',()=>{
+ const name=$('#addon_name').value.trim(),url=$('#addon_url').value.trim();
+ if(!url)return;
+ ADDONS.push({name:name||url,url});
+ $('#addon_name').value='';$('#addon_url').value='';addonsSync();
+});
+$('#addon_url').addEventListener('keydown',e=>{if(e.key==='Enter')$('#addon_add').click();});
+$('#addonlist').addEventListener('click',async e=>{
+ const del=e.target.closest('.addon-del');
+ if(del){ADDONS.splice(+del.dataset.i,1);addonsSync();return;}
+ const t=e.target.closest('.addon-test');
+ if(!t)return;
+ const row=t.closest('.addonrow'),dot=row.querySelector('.dot'),
+   res=row.querySelector('.tres');
+ dot.className='dot run';res.className='tres';res.textContent='testing…';t.disabled=true;
+ try{const r=await post('/api/settings/test/addon',{values:{url:ADDONS[+t.dataset.i].url}});
+  dot.className='dot '+(r.ok?'ok':'bad');res.className='tres '+(r.ok?'ok':'bad');
+  res.textContent=`${r.ms} ms · ${r.detail}`;
+ }catch(err){dot.className='dot bad';res.className='tres bad';res.textContent=err.message;}
+ t.disabled=false;
+});
+renderAddons();
 
 const advsearch=$('#advsearch');
 if(advsearch)advsearch.addEventListener('input',()=>{
@@ -386,7 +448,30 @@ def _adv_row(spec: dict) -> str:
             f"<div class='ctl'>{ctl}</div></div>")
 
 
-def _advanced_section(secret: str) -> str:
+def _custom_addons() -> str:
+    val = config.pending("EXTRA_ADDONS")     # JSON string, or ""
+    return (
+        "<h2>Custom addons <span class='advhint'>AIOStreams, a usenet addon, "
+        "any player stream source</span></h2>"
+        "<p class='blurb'>Paste any player addon's manifest URL. Its results "
+        "join the same search, run through the same playback verification, and "
+        "only streams that actually play reach you — everything is ranked "
+        "together by quality, so order doesn't matter.</p>"
+        "<div class='card' style='padding:14px 16px'>"
+        "<div id='addonlist'></div>"
+        "<div class='addonadd'>"
+        "<input id='addon_name' type='text' autocomplete='off' "
+        "placeholder='Name (e.g. AIOStreams)'>"
+        "<input id='addon_url' type='text' spellcheck='false' autocomplete='off' "
+        "placeholder='https://…/manifest.json'>"
+        "<button type='button' class='btn ghost' id='addon_add'>Add</button>"
+        "</div>"
+        f"<input type='hidden' data-key='EXTRA_ADDONS' data-init='{_esc(val)}' "
+        f"value='{_esc(val)}' id='addonval'>"
+        "</div>")
+
+
+def _advanced_section() -> str:
     groups = []
     for gid, title in knobs.GROUPS:
         rows = [_adv_row(s) for s in knobs.by_group(gid)]
@@ -403,7 +488,7 @@ def _advanced_section(secret: str) -> str:
         "<div class='advtools'>"
         "<input id='advsearch' type='search' "
         "placeholder='Filter by name or description…' aria-label='Filter knobs'>"
-        f"<a class='navlink' href='/{secret}/settings/export.env'>"
+        "<a class='navlink' href='/api/settings/export.env'>"
         "Download current .env</a></div>"
         f"{''.join(groups)}"
         "<div class='nomatch' id='advnomatch' hidden>No knob matches that.</div>"
@@ -444,7 +529,7 @@ def _conn_card(conn: dict) -> str:
             f"<span class='tres'></span></div></div>")
 
 
-def render(secret: str) -> str:
+def render() -> str:
     restart = "1" if config.restart_pending() else "0"
     sections = _stream_mode()
     for gid, title, blurb in config.GROUPS:
@@ -455,21 +540,22 @@ def render(secret: str) -> str:
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="robots" content="noindex">
-<title>Stream picker — settings</title><style>{_CSS}</style></head>
+<title>{_esc(ADDON_NAME)} — settings</title>
+<style>{_CSS}{adminui.NAV_CSS}</style></head>
 <body><div class="wrap">
-<div class="top"><div><h1>Settings</h1>
+{adminui.nav('settings', ADDON_NAME)}
+<h1>Settings</h1>
 <p class="sub">Connect your services and choose how streams are handled.
 Saved to <code>/data/config.json</code> on the addon's data volume; changes
-apply on restart. Anyone deploying their own instance starts here.</p></div>
-<nav><a class="navlink" href="/{secret}/overview">Overview →</a>
-<a class="navlink" href="/{secret}/stats">Source health →</a></nav></div>
+apply on restart. Anyone deploying their own instance starts here.</p>
 {sections}
 <h2>Connections</h2>
 <p class="blurb">Every upstream service this instance uses. Test verifies the
 values in the form — including keys you haven't saved yet. Leave a masked
 field blank to keep the stored key.</p>
 <div class="cards">{cards}</div>
-{_advanced_section(secret)}
+{_custom_addons()}
+{_advanced_section()}
 </div>
 <div class="savebar" id="savebar" hidden data-restart="{restart}">
 <span class="msg" id="barmsg"></span><span class="err" id="barerr"></span>

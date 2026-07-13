@@ -1,7 +1,7 @@
-# Auto Stream — a self-hosted Stremio stream picker
+# Auto Stream — a self-hosted stream picker for your player
 
 Races several debrid and direct-usenet sources for a title, verifies that the
-top result actually plays, and hands Stremio a high-quality, correct-audio
+top result actually plays, and hands your player a high-quality, correct-audio
 stream first. Ships two addons from one container — a **fast** picker (answers
 in a couple of seconds) and a **best-quality** picker (waits for everything and
 ranks harder) — plus an optional on-disk read-ahead buffer that smooths over
@@ -27,20 +27,28 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
-Then open the dashboard and connect your services:
+Then open the dashboard in a browser — no secret in the URL, just the port,
+like any other self-hosted service's web UI:
 
 ```
-http://<host>:8011/<ADDON_SECRET>/settings
+http://<host>:8011/
 ```
 
-Each service has a **Test** button that checks your URL/key before you save.
-Hit **Save**, then **Restart addon** to apply. Settings live in
-`./data/config.json` and survive rebuilds.
+It's one site with three tabs you click between — **Overview**, **Settings**,
+**Source health**. On Settings, each service has a **Test** button that checks
+your URL/key before you save; hit **Save**, then **Restart addon** to apply.
+Settings live in `./data/config.json` and survive rebuilds.
 
-## Install in Stremio
+The dashboard is **local-only by default** — it answers to loopback/LAN/Docker
+clients but not to requests coming through a public reverse proxy, so keep the
+port on your LAN (like Radarr/Sonarr). To lift that (only behind your own auth),
+set `DASHBOARD_LOCAL_ONLY=0`.
 
-Once at least one source is connected, add these URLs in Stremio → Addons
-(swap in your public base and secret):
+## Install in your player
+
+The *addon* (unlike the dashboard) is meant to be reached publicly, so it keeps
+an unguessable secret in its URL. Once at least one source is connected, add
+these in your player → Addons (swap in your public base and `ADDON_SECRET`):
 
 | What | URL |
 |------|-----|
@@ -50,21 +58,14 @@ Once at least one source is connected, add these URLs in Stremio → Addons
 | Best quality, phone/tablet | `https://your-domain/<secret>/slow/mobile/manifest.json` |
 
 Install the fast and best-quality addons side by side — they share one search,
-so it won't double your API calls. Two more pages, same secret:
-
-- **Overview** — `https://your-domain/<secret>/overview` (the fun ledger:
-  gigabytes and hours streamed, resolution/HDR/debrid mix, the direct-usenet
-  strike rate and why links fail, and your records)
-- **Settings** — `https://your-domain/<secret>/settings`
-- **Source health** — `https://your-domain/<secret>/stats` (per-source delivery
-  stats and the auto-blocklist, filled in as you watch)
+so it won't double your API calls.
 
 ## Configuring: dashboard or files
 
 There are two equivalent ways to set everything up — use whichever you prefer,
 or mix them.
 
-**From the dashboard** (`/<secret>/settings`) — the whole configuration is
+**From the dashboard** (`http://<host>:8011/settings`) — the whole configuration is
 here. Connect each upstream (with a live **Test** button), pick how streams are
 handled, and open **Advanced tuning** for the full set of timeouts, budgets,
 and thresholds (searchable). **Save**, then **Restart addon** to apply. It all
@@ -79,6 +80,16 @@ the ones you want into `.env` and `docker compose up -d`. You can also
 
 Values in `.env` and values saved in the dashboard both feed the same settings;
 dashboard edits (in `config.json`) win, and both apply on restart.
+
+### Custom addons
+
+Beyond the built-in sources, the Settings page has a **Custom addons** panel:
+paste any player addon's manifest URL — AIOStreams, a usenet addon, a debrid
+catalog, anything that serves `/stream` — and it joins the same search. Its
+results are folded into one quality-ranked list with every other source, run
+through the **same playback verification**, and only streams that actually play
+reach the player. Each addon has a **Test** button that checks the manifest and
+confirms it serves streams. (Stored as JSON in `EXTRA_ADDONS`.)
 
 ## Choosing how streams are handled
 

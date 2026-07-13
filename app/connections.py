@@ -65,6 +65,35 @@ async def _manifest(key: str, overrides: dict) -> dict:
         return _fail(t0, e)
 
 
+async def _addon(overrides: dict) -> dict:
+    """Verify an arbitrary player addon by its manifest, and confirm it can
+    actually serve streams. The URL comes straight from the form (overrides),
+    since custom addons aren't a fixed config key."""
+    base = ((overrides or {}).get("url") or "").strip().rstrip("/")
+    if base.endswith("/manifest.json"):
+        base = base[:-len("/manifest.json")].rstrip("/")
+    t0 = time.monotonic()
+    if not base:
+        return _fail(t0, "no URL")
+    if not base.startswith(("http://", "https://")):
+        return _fail(t0, "URL must start with http:// or https://")
+    try:
+        r = await _client.get(f"{base}/manifest.json")
+        r.raise_for_status()
+        j = r.json()
+        name = j.get("name") or j.get("id") or "unnamed"
+        res = j.get("resources") or []
+        serves_streams = any(
+            x == "stream" or (isinstance(x, dict) and x.get("name") == "stream")
+            for x in res)
+        if not serves_streams:
+            return _fail(t0, f"'{name}' has no stream resource — it won't "
+                             "return playable streams")
+        return _ok(t0, f"{name} — serves streams")
+    except Exception as e:
+        return _fail(t0, e)
+
+
 async def _tmdb(overrides: dict) -> dict:
     key = _val("TMDB_API_KEY", overrides)
     t0 = time.monotonic()
@@ -198,6 +227,7 @@ _TESTS = {
     "stremthru": lambda o: _manifest("STREMTHRU_BASE_URL", o),
     "mediafusion": lambda o: _manifest("MEDIAFUSION_BASE_URL", o),
     "jellio": lambda o: _manifest("JELLIO_URL", o),
+    "addon": _addon,
     "tmdb": _tmdb,
     "tvdb": _tvdb,
     "jellyseerr": _jellyseerr,

@@ -16,9 +16,9 @@ from app import config
 # also why edits there only land on restart. See app/config.py.
 _CONFIG_APPLIED = config.apply_env()
 
-from app import (connections, dashboard, envref, overview,  # noqa: E402
-                 picker, proxy, reputation, settings_ui, telemetry,
-                 usenet_health)
+from app import (adminui, connections, dashboard, envref,  # noqa: E402
+                 overview, picker, proxy, reputation, settings_ui,
+                 telemetry, usenet_health)
 
 NOTICE_FILE = pathlib.Path(__file__).parent / "static" / "notice.mp4"
 NOTICE_THEATRICAL_FILE = (pathlib.Path(__file__).parent / "static"
@@ -86,6 +86,16 @@ SLOW_MANIFEST = {
 
 def _check(secret: str) -> None:
     if not secrets.compare_digest(secret, SECRET):
+        raise HTTPException(status_code=404)
+
+
+def _admin(request: Request) -> None:
+    """Gate the local admin dashboard. On by default: only loopback/LAN/Docker
+    clients may reach it, never the public reverse proxy. DASHBOARD_LOCAL_ONLY=0
+    lifts it (do that only behind your own auth)."""
+    local_only = os.environ.get("DASHBOARD_LOCAL_ONLY", "1") not in (
+        "0", "false", "no", "off", "")
+    if local_only and not adminui.is_local(request):
         raise HTTPException(status_code=404)
 
 
@@ -185,9 +195,29 @@ async def stream_slow_mobile(secret: str, media: str, media_id: str):
     return await _streams(media, media_id, "mobile", slow=True)
 
 
-@app.get("/{secret}/stats.json")
-async def stats_json(secret: str, min_n: int = 3):
-    _check(secret)
+# ── local admin dashboard (clean paths, no secret; see _admin guard) ─────────
+@app.get("/")
+async def dash_home(request: Request):
+    _admin(request)
+    return HTMLResponse(overview.render(telemetry.load()))
+
+
+@app.get("/settings")
+async def settings_page(request: Request):
+    _admin(request)
+    return HTMLResponse(settings_ui.render())
+
+
+@app.get("/stats")
+async def stats(request: Request, min_n: int = 3):
+    _admin(request)
+    blocks = reputation.listing() + usenet_health.blocked_listing()
+    return HTMLResponse(dashboard.render(telemetry.load(), blocks, min_n=min_n))
+
+
+@app.get("/api/stats.json")
+async def stats_json(request: Request, min_n: int = 3):
+    _admin(request)
     recs = telemetry.load()
     return {
         "records": len(recs),
@@ -200,46 +230,26 @@ async def stats_json(secret: str, min_n: int = 3):
     }
 
 
-@app.get("/{secret}/stats")
-async def stats(secret: str, min_n: int = 3):
-    _check(secret)
-    blocks = reputation.listing() + usenet_health.blocked_listing()
-    return HTMLResponse(dashboard.render(telemetry.load(), blocks, secret,
-                                         min_n=min_n))
-
-
-@app.get("/{secret}/overview")
-async def overview_page(secret: str):
-    _check(secret)
-    return HTMLResponse(overview.render(telemetry.load(), secret))
-
-
-@app.get("/{secret}/unblock")
-async def unblock(secret: str, sig: str):
-    _check(secret)
+@app.get("/api/unblock")
+async def unblock(request: Request, sig: str):
+    _admin(request)
     if sig.startswith("nzb:"):
         usenet_health.unblock(sig)
     else:
         reputation.unblock(sig)
-    return RedirectResponse(url=f"/{secret}/stats", status_code=303)
+    return RedirectResponse(url="/stats", status_code=303)
 
 
-@app.get("/{secret}/settings")
-async def settings_page(secret: str):
-    _check(secret)
-    return HTMLResponse(settings_ui.render(secret))
-
-
-@app.get("/{secret}/settings/status.json")
-async def settings_status(secret: str):
-    _check(secret)
+@app.get("/api/settings/status.json")
+async def settings_status(request: Request):
+    _admin(request)
     return {"playing": proxy.active_streams(),
             "restart_pending": config.restart_pending()}
 
 
-@app.post("/{secret}/settings/save")
-async def settings_save(secret: str, request: Request):
-    _check(secret)
+@app.post("/api/settings/save")
+async def settings_save(request: Request):
+    _admin(request)
     body = await request.json()
     try:
         return config.save(dict(body.get("values") or {}))
@@ -247,9 +257,9 @@ async def settings_save(secret: str, request: Request):
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.post("/{secret}/settings/test/{service}")
-async def settings_test(secret: str, service: str, request: Request):
-    _check(secret)
+@app.post("/api/settings/test/{service}")
+async def settings_test(service: str, request: Request):
+    _admin(request)
     body = await request.json()
     try:
         return await connections.test(service, dict(body.get("values") or {}))
@@ -257,21 +267,21 @@ async def settings_test(secret: str, service: str, request: Request):
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.get("/{secret}/settings/export.env")
-async def settings_export(secret: str):
+@app.get("/api/settings/export.env")
+async def settings_export(request: Request):
     # The current effective config as a ready-to-edit .env (secrets redacted).
-    _check(secret)
+    _admin(request)
     return PlainTextResponse(
         envref.current_dotenv(),
         headers={"Content-Disposition":
                  "attachment; filename=stream-picker.env"})
 
 
-@app.post("/{secret}/settings/restart")
-async def settings_restart(secret: str):
+@app.post("/api/settings/restart")
+async def settings_restart(request: Request):
     # Clean exit; the container's restart policy brings the process back up
     # with the saved config applied. The delay lets this response flush.
-    _check(secret)
+    _admin(request)
     logger.info("settings: restart requested — exiting to apply saved config")
     asyncio.get_running_loop().call_later(0.6, os._exit, 0)
     return {"ok": True}

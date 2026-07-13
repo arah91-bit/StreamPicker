@@ -24,13 +24,13 @@ def _play(mb, secs, **kw):
 
 class OverviewTests(unittest.TestCase):
     def test_empty_state(self):
-        page = overview.render([], "test-secret")
+        page = overview.render([])
         self.assertIn("Nothing streamed", page)
         self.assertNotIn("undefined", page)
 
     def test_totals_are_real(self):
         recs = [_play(5000, 3600, id="tt1"), _play(3000, 1800, id="tt2")]
-        page = overview.render(recs, "test-secret")
+        page = overview.render(recs)
         self.assertIn("8.0", page)          # 8000 MB → 8.0 GB
         self.assertIn("GB", page)
         self.assertIn("1.5", page)          # 5400 s → 1.5 hours
@@ -38,14 +38,14 @@ class OverviewTests(unittest.TestCase):
 
     def test_terabyte_scaling(self):
         recs = [_play(1_500_000, 3600)]     # 1500 GB → 1.50 TB
-        page = overview.render(recs, "test-secret")
+        page = overview.render(recs)
         self.assertIn("1.50", page)
         self.assertIn("TB", page)
 
     def test_failover_saves_counted(self):
         recs = [_play(100, 60, switched=True), _play(100, 60, switched=False),
                 _play(100, 60, switched=True)]
-        page = overview.render(recs, "test-secret")
+        page = overview.render(recs)
         self.assertIn("failover saves", page)
 
     def test_usenet_report_card(self):
@@ -59,7 +59,7 @@ class OverviewTests(unittest.TestCase):
             {"kind": "nzb_failure", "reason": "wrong-episode",
              "ts": time.time()},
         ]
-        page = overview.render(recs, "test-secret")
+        page = overview.render(recs)
         self.assertIn("Usenet strike rate", page)
         self.assertIn("50%", page)                       # 1 of 2 worked
         self.assertIn("nzbgeek", page)
@@ -72,7 +72,7 @@ class OverviewTests(unittest.TestCase):
             _play(9000, 7200, id="tt9"),
             _play(100, 60, id="tt1"),
         ]
-        page = overview.render(recs, "test-secret")
+        page = overview.render(recs)
         self.assertIn("Biggest single stream", page)
         self.assertIn("Big Movie 2024", page)            # name, not tt9
         self.assertNotIn("🎬", page)                     # leading emoji stripped
@@ -81,7 +81,7 @@ class OverviewTests(unittest.TestCase):
         # records missing optional fields must not raise
         recs = [{"kind": "play"}, {"kind": "probe", "lane": "nzb"},
                 {"kind": "nzb_failure"}, {"kind": "buffer", "event": "twin"}]
-        page = overview.render(recs, "test-secret")
+        page = overview.render(recs)
         self.assertIn("<html", page)
 
 

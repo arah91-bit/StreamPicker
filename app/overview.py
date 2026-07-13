@@ -18,7 +18,7 @@ import re
 import time
 from collections import defaultdict
 
-from app import telemetry, usenet_health
+from app import adminui, telemetry, usenet_health
 
 ADDON_NAME = os.environ.get("ADDON_NAME", "Auto Stream")
 
@@ -197,7 +197,7 @@ def _reason_label(code: str) -> str:
     return code.replace("-", " ").capitalize() if code else "Unknown"
 
 
-def render(recs: list[dict], secret: str) -> str:
+def render(recs: list[dict]) -> str:
     plays = [r for r in recs if r.get("kind") == "play"]
     probes = [r for r in recs if r.get("kind") == "probe"]
     nzb_probes = [r for r in probes if r.get("lane") == "nzb"]
@@ -401,11 +401,11 @@ def render(recs: list[dict], secret: str) -> str:
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="robots" content="noindex">
-<title>{_esc(ADDON_NAME)} — overview</title><style>{_CSS}</style></head>
+<title>{_esc(ADDON_NAME)} — overview</title>
+<style>{_CSS}{adminui.NAV_CSS}</style></head>
 <body><div class="wrap">
-<div class="top"><div><p class="eyebrow">Stream ledger</p></div>
-<nav class="nav"><a class="navlink" href="/{secret}/stats">Source health →</a>
-<a class="navlink" href="/{secret}/settings">Settings →</a></nav></div>
+{adminui.nav('overview', ADDON_NAME)}
+<p class="eyebrow">Stream ledger</p>
 {hero}
 <p class="sub">{_esc(span_txt)}</p>
 {empty}

@@ -3,10 +3,10 @@
 #   cp .env.example .env        # then set ADDON_SECRET (and ADDON_PUBLIC_URL)
 #   docker compose up -d --build
 #
-# First run: open  http://<host>:8011/<ADDON_SECRET>/settings  to connect your
-# APIs and choose how streams are handled. Everything you set there is written
-# to ./data/config.json and applied on the next restart, so the only value this
-# file really needs is ADDON_SECRET.
+# First run: open  http://<host>:8011/  in a browser (LAN only, no secret) to
+# connect your APIs and choose how streams are handled. Everything you set there
+# is written to ./data/config.json and applied on the next restart, so the only
+# value this file really needs is ADDON_SECRET.
 
 services:
   stream-picker:

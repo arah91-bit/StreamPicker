@@ -1,4 +1,4 @@
-"""Local library source via Jellio (a Jellyfin -> Stremio addon).
+"""Local library source via Jellio (a Jellyfin -> player addon).
 
 A title already in the Jellyfin library is the best possible source: local, no
 debrid, instant first byte and rock-solid playback. So both pickers query this

@@ -83,14 +83,20 @@ CATALOG = [
      "ffprobe timeout when measuring true video bitrate."),
     ("GOOD_TTFB", "fast", "num", "4.0", _S,
      "First-byte time target; above it a source counts as a slow start."),
+    ("EXTRA_ADDON_TIMEOUT", "fast", "num", "30", _S,
+     "Search timeout for each user-added custom addon."),
 
     # ── best-quality (slow) picker ───────────────────────────────────────────
     ("SLOW_TOTAL_DEADLINE", "slow", "num", "55", _S,
      "Ceiling before the slow picker answers with its best so far."),
     ("SLOW_PROBE_RESERVE", "slow", "num", "18", _S,
      "Time held back from the deadline to guarantee probing happens."),
-    ("SLOW_TTFB_MAX", "slow", "num", "35", _S,
-     "Max first-byte wait for a slow-picker probe."),
+    ("SLOW_TTFB_MAX", "slow", "num", "120", _S,
+     "Foreground first-byte patience (capped by the response deadline). High "
+     "= give slow high-quality sources the whole gate to prove they play."),
+    ("SLOW_FINISH_TTFB_MAX", "slow", "num", "120", _S,
+     "Background finisher first-byte patience — how long a slow-to-unlock "
+     "high-quality source may take to hand over byte 0 and still be cached #1."),
     ("SLOW_CONCURRENCY", "slow", "num", "16", "",
      "How many streams the slow picker probes in parallel."),
     ("SLOW_NZB_PROBES", "slow", "num", "2", "",

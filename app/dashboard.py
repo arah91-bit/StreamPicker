@@ -11,7 +11,9 @@ of 'X buffered last night' can be checked against what we auto-picked for it.
 import html
 import os
 
-from app import reputation, telemetry, usenet_health
+from app import adminui, reputation, telemetry, usenet_health
+
+ADDON_NAME = os.environ.get("ADDON_NAME", "Auto Stream")
 
 # Match the picker's soft gate so 'slow start' means the same thing everywhere.
 GOOD_TTFB = float(os.environ.get("GOOD_TTFB", "4.0"))
@@ -196,7 +198,7 @@ def _play_table(recs: list[dict], key: str, title: str, keyname: str,
         f"<tbody>{''.join(body)}</tbody></table></div>")
 
 
-def _blocklist_table(blocklist: list[dict], secret: str) -> str:
+def _blocklist_table(blocklist: list[dict]) -> str:
     if not blocklist:
         return ("<h2>Auto-blocked releases</h2><div class='note'>None yet. "
                 "Debrid releases require repeated bad plays; direct NZB releases "
@@ -208,7 +210,7 @@ def _blocklist_table(blocklist: list[dict], secret: str) -> str:
                  else "<span class='warn'>watching</span>")
         if b.get("kind") == "nzb":
             state += " <span class='pill'>NZB</span>"
-        link = f"/{secret}/unblock?sig={_esc(b['sig'])}"
+        link = f"/api/unblock?sig={_esc(b['sig'])}"
         body.append(
             f"<tr class='{'bad' if b['blocked'] else ''}'>"
             f"<td class='k1'>{_esc(b['label'])}</td>"
@@ -271,7 +273,7 @@ def _nzb_failure_table(recs: list[dict]) -> str:
         f"<tbody>{''.join(body)}</tbody></table></div>")
 
 
-def render(recs: list[dict], blocklist: list[dict], secret: str,
+def render(recs: list[dict], blocklist: list[dict],
            min_n: int = 3) -> str:
     probes = [r for r in recs if r.get("kind") == "probe"]
     served = [r for r in recs if r.get("kind") == "served"]
@@ -300,15 +302,15 @@ def render(recs: list[dict], blocklist: list[dict], secret: str,
                 f"{_dt.datetime.fromtimestamp(t1):%b %d %H:%M}")
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Stream picker — source health</title><style>{_CSS}</style></head>
+<title>{_esc(ADDON_NAME)} — source health</title>
+<style>{_CSS}{adminui.NAV_CSS}</style></head>
 <body><div class="wrap">
-<div class="top"><div><h1>Source health</h1>
+{adminui.nav('stats', ADDON_NAME)}
+<h1>Source health</h1>
 <p class="sub">{_esc(span)} · playback numbers are ground truth (bytes reaching the
-device via the proxy); probe numbers are our server's estimate. Worst first.</p></div>
-<nav><a class="navlink" href="/{secret}/overview">Overview →</a>
-<a class="navlink" href="/{secret}/settings">Settings →</a></nav></div>
+device via the proxy); probe numbers are our server's estimate. Worst first.</p>
 <div class="tiles">{tile_html}</div>
-{_blocklist_table(blocklist, secret)}
+{_blocklist_table(blocklist)}
 {_nzb_indexer_table()}
 {_nzb_failure_table(recs)}
 {_play_table(recs, 'src', 'Real playback delivery — by source (indexer)', 'source', min_n)}

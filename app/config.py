@@ -34,7 +34,7 @@ GROUPS = [
     ("acquire", "When nothing plays",
      "Fallback for titles no source can stream yet."),
     ("identity", "Addon identity",
-     "How this instance announces itself to Stremio clients."),
+     "How this instance announces itself to player clients."),
 ]
 
 # type: bool | number | choice | text. Defaults mirror the code's own defaults
@@ -106,11 +106,19 @@ SETTINGS = [
 
     dict(key="ADDON_NAME", group="identity", type="text",
          default="Auto Stream", label="Addon name",
-         desc="Shown in Stremio's addon list and on every stream row."),
+         desc="Shown in your player's addon list and on every stream row."),
     dict(key="ADDON_PUBLIC_URL", group="identity", type="text",
          default="http://localhost:8011", label="Public base URL",
          desc="Where players reach this addon from outside — used to build "
               "proxy and notice URLs. Must be https and publicly routable."),
+    dict(key="DASHBOARD_LOCAL_ONLY", group="identity", type="bool",
+         default="1", label="Restrict this dashboard to local/LAN",
+         desc="Serve the dashboard only to loopback/LAN/Docker clients, never "
+              "through the public reverse proxy. The addon's stream URLs are "
+              "unaffected. Turn off only if you put your own auth in front."),
+    # Managed by the "Custom addons" panel, not a generic row (hence hidden).
+    dict(key="EXTRA_ADDONS", group="identity", type="addons", default="",
+         hidden=True, label="Custom addons"),
 ]
 
 # field kind: url | text | secret | multiline. Secrets render masked and an
@@ -318,6 +326,27 @@ def _normalize(spec: dict, raw: str):
         parts = [p.strip() for chunk in raw.split("\n")
                  for p in chunk.split(";")]
         return ";".join(p for p in parts if p)
+    if typ == "addons":
+        if raw == "":
+            return ""
+        try:
+            items = json.loads(raw)
+        except ValueError:
+            raise ValueError("custom addons: not valid JSON") from None
+        out = []
+        for it in items if isinstance(items, list) else []:
+            if not isinstance(it, dict):
+                continue
+            url = str(it.get("url", "")).strip().rstrip("/")
+            if url.endswith("/manifest.json"):
+                url = url[:-len("/manifest.json")].rstrip("/")
+            if not url:
+                continue
+            if not url.startswith(("http://", "https://")):
+                raise ValueError(f"custom addon URL must be http(s): {url[:40]}")
+            name = str(it.get("name", "")).strip()[:60] or url
+            out.append({"name": name, "url": url})
+        return json.dumps(out, separators=(",", ":")) if out else ""
     return raw
 
 
