@@ -1,17 +1,24 @@
-# Standalone deployment of the stream-picker addon.
+# Standalone deployment of the stream-picker addon — this file plus a .env is
+# the entire install; the image is prebuilt and pulled from GitHub's registry.
 #
-#   cp .env.example .env        # then set ADDON_SECRET (and ADDON_PUBLIC_URL)
-#   docker compose up -d --build
+#   mkdir stream-picker && cd stream-picker
+#   curl -O  https://raw.githubusercontent.com/arah91-bit/StreamPicker/main/docker-compose.yml
+#   curl -o .env https://raw.githubusercontent.com/arah91-bit/StreamPicker/main/.env.example
+#   # edit .env: set ADDON_SECRET (openssl rand -hex 24) and ADDON_PUBLIC_URL
+#   docker compose up -d
 #
 # First run: open  http://<host>:8011/  in a browser (LAN only, no secret) to
 # connect your APIs and choose how streams are handled. Everything you set there
 # is written to ./data/config.json and applied on the next restart, so the only
 # value this file really needs is ADDON_SECRET.
+#
+# Update later with:  docker compose pull && docker compose up -d
 
 services:
   stream-picker:
-    build: .
-    image: stream-picker:latest
+    image: ghcr.io/arah91-bit/streampicker:latest
+    # Building from a clone of the repo instead? Swap the image line for:
+    #   build: .
     container_name: stream-picker
     restart: unless-stopped
     ports:

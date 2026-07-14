@@ -73,16 +73,18 @@ domain — is additive and can wait.
   addon's URL). You can start the app without them, but it won't return streams
   until at least one source is connected.
 
-### Step 1 — get the code
+### Step 1 — get the two files
+No clone or build needed — the image is prebuilt. Make a directory and grab
+the compose file and the env template:
 ```bash
-git clone https://github.com/arah91-bit/StreamPicker.git
-cd StreamPicker
+mkdir stream-picker && cd stream-picker
+curl -O https://raw.githubusercontent.com/arah91-bit/StreamPicker/main/docker-compose.yml
+curl -o .env https://raw.githubusercontent.com/arah91-bit/StreamPicker/main/.env.example
 ```
+(Working from a clone of the repo instead? `cp .env.example .env` and swap the
+compose file's `image:` line for `build: .`.)
 
-### Step 2 — create your `.env`
-```bash
-cp .env.example .env
-```
+### Step 2 — fill in your `.env`
 Edit `.env` and set the only two values that matter up front:
 - `ADDON_SECRET` — an unguessable string; generate with `openssl rand -hex 24`.
   It gates the addon URLs (treat it like a password).
@@ -92,7 +94,7 @@ Edit `.env` and set the only two values that matter up front:
 
 ### Step 3 — start it
 ```bash
-docker compose up -d --build
+docker compose up -d
 ```
 Check it's healthy: `docker compose ps` (should say `healthy` after ~15s).
 

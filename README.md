@@ -25,12 +25,21 @@ secret, start the container, open the dashboard, plug in your services.
 
 ## Quick start
 
+Two files are the whole install — no clone, no build; the image is pulled
+prebuilt from GitHub's registry (amd64 + arm64):
+
 ```bash
-cp .env.example .env
+mkdir stream-picker && cd stream-picker
+curl -O https://raw.githubusercontent.com/arah91-bit/StreamPicker/main/docker-compose.yml
+curl -o .env https://raw.githubusercontent.com/arah91-bit/StreamPicker/main/.env.example
+
 # edit .env: set ADDON_SECRET (run: openssl rand -hex 24)
 #            set ADDON_PUBLIC_URL to how your devices reach this host
-docker compose up -d --build
+docker compose up -d
 ```
+
+(Prefer building from source? Clone the repo, swap the compose file's `image:`
+line for `build: .`, and run `docker compose up -d --build`.)
 
 Then open the dashboard in a browser — no secret in the URL, just the port,
 like any other self-hosted service's web UI:
@@ -118,11 +127,14 @@ a slider on the same page.
 ## Updating
 
 ```bash
-git pull        # or drop in a new copy of the folder
-docker compose up -d --build
+docker compose pull
+docker compose up -d
 ```
 
-Your `.env` and `./data` are untouched.
+Your `.env` and `./data` are untouched. (Building from source instead:
+`git pull && docker compose up -d --build`.) To pin a version, use an
+immutable tag — every commit on `main` is published as
+`ghcr.io/arah91-bit/streampicker:<commit-sha>`.
 
 ## Connecting to an existing *arr / Jellyfin stack
 
