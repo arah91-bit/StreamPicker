@@ -652,6 +652,53 @@ async def _open_twin(entry, cand, cur, end, tried):
     return None
 
 
+# ── player-rejected detection ────────────────────────────────────────────────
+# A stream the server verified (real video bytes, plenty of speed) can still be
+# undecodable for the household's player — e.g. an MKV whose audio codec the
+# player lacks (seen live: a 5×FLAC multi-audio fansub remux; H.264+DTS from
+# the same player played fine). The player reports nothing: it just pulls the
+# file header a few times at cache speed, gives up silently, and the viewer
+# stares at a spinner. That consumption shape is unmistakable — several
+# short-lived connections with header-sized reads and never a sustained play.
+# After PLAYER_REJECT_STARTS such false starts the release is cooled (the very
+# next open serves the next candidate) and a reputation session is recorded, so
+# a repeat offender is eventually blocked for good. Server-side and
+# player-agnostic: no codec guessing, pure observed behavior.
+PLAYER_REJECT_STARTS = int(os.environ.get("PLAYER_REJECT_STARTS", "3"))
+_REAL_PLAY_SECS = 20.0                   # a connection this long = actual playback
+_REAL_PLAY_BYTES = 256 * 1024 * 1024     # pulling this much = playing/buffering
+
+
+def _note_consumer_close(state: dict, *, sig: str, label: str, node: str,
+                         token: str, picker: str, media_id: str,
+                         served: int, dur: float) -> None:
+    """Feed one closed player connection into the player-rejected detector.
+    `state` is a mutable per-release dict living on the cache entry (buffered
+    path) or the playback session (legacy path); real playback latches it open
+    so seek storms and header probes around a working stream never count."""
+    if not PLAYER_REJECT_STARTS or not sig:
+        return
+    if dur >= _REAL_PLAY_SECS or served >= _REAL_PLAY_BYTES:
+        state["real_play"] = True
+        return
+    if state.get("real_play") or state.get("rejected"):
+        return
+    state["false_starts"] = state.get("false_starts", 0) + 1
+    if state["false_starts"] < PLAYER_REJECT_STARTS:
+        return
+    state["rejected"] = True
+    logger.info(f"proxy: player rejected {label!r} — {state['false_starts']} "
+                f"short connections, no sustained play (codec/container the "
+                f"player can't open?); cooling release, next open serves the "
+                f"next source")
+    reputation.observe(sig, token, "player-rejected", label, node=node)
+    reputation.cooldown(sig)
+    telemetry.record_buffer("player_rejected", sig=sig, picker=picker,
+                            media_id=media_id, source=label, node=node,
+                            reason=f"{state['false_starts']} false starts, "
+                                   f"no sustained play")
+
+
 async def _body(entry, idx, cand, resp, it, prebuf, offset, end, ttfb, token, net):
     t0 = time.monotonic()
     served = sum(len(c) for c in prebuf)
@@ -802,6 +849,12 @@ async def _body(entry, idx, cand, resp, it, prebuf, offset, end, ttfb, token, ne
                               dur=time.monotonic() - t0, ttfb=ttfb,
                               reconnects=reconnects, reason=reason,
                               net=net, session=token, up_mbps=up_mbps, slow=slow)
+        _note_consumer_close(
+            entry.setdefault("_playfail", {}).setdefault(cand.get("sig") or "", {}),
+            sig=cand.get("sig") or "", label=cand.get("lbl", ""),
+            node=net.get("node", ""), token=token,
+            picker=entry.get("picker", ""), media_id=entry.get("id", ""),
+            served=served, dur=time.monotonic() - t0)
 
 
 # ── server-side read-ahead buffer (producer/consumer cache on NVMe) ──────────
@@ -842,10 +895,11 @@ PREFETCH_NEXT = os.environ.get("PREFETCH_NEXT", "1") not in ("0", "false", "")
 class _Entry:
     __slots__ = ("sig", "path", "total", "avail", "complete", "failed", "source",
                  "cands", "producer", "consumers", "head", "last", "cond",
-                 "content_type", "picker", "media_id", "node")
+                 "content_type", "picker", "media_id", "node", "playfail")
 
     def __init__(self, sig, path, cands, source, content_type, total, picker, media_id):
         self.sig = sig
+        self.playfail: dict = {}      # player-rejected detector state (_note_consumer_close)
         self.path = path
         self.total = total            # full byte length (Content-Range), or None
         self.avail = 0                # contiguous bytes present from 0 (write head)
@@ -1192,6 +1246,8 @@ async def _get_or_start_entry(token: str, session: dict, cands: list) -> _Entry 
                 if session.get("bufsig") == sig:
                     session.pop("bufsig", None)
                 continue
+            if existing.playfail.get("rejected"):
+                continue        # player can't open it — pick a different release
             reuse = existing
             session["bufsig"] = sig
             break
@@ -1338,6 +1394,11 @@ async def _consume(e: _Entry, offset: int, end: int | None, token: str):
                                   dur=time.monotonic() - t0, ttfb=0.0, reconnects=0,
                                   reason=reason, session=token,
                                   net={"node": e.node})
+            _note_consumer_close(
+                e.playfail, sig=e.sig, label=(e.source or {}).get("lbl", ""),
+                node=e.node, token=token, picker=e.picker,
+                media_id=e.media_id, served=served,
+                dur=time.monotonic() - t0)
         except Exception:
             pass
 
@@ -1385,6 +1446,11 @@ async def _serve_buffered(token: str, session: dict, cands: list, offset: int,
                           end: int | None, had_range: bool, request) -> Response:
     sig = session.get("bufsig")
     e = _entries.get(sig) if sig else None
+    if e is not None and offset == 0 and e.playfail.get("rejected"):
+        # The player provably can't open this release (see _note_consumer_close)
+        # — a fresh open must select a different one, not re-serve the cache.
+        session.pop("bufsig", None)
+        e = None
     if (e is None or e.failed) and offset == 0:         # opening/retry starts a clean fill
         e = await _get_or_start_entry(token, session, cands)
     if e is None:                                       # seek-first, or no source at all
