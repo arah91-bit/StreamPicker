@@ -63,6 +63,9 @@ CATALOG = [
      "Verified 1080p streams that make the fast picker stop early."),
     ("FAST_PROBE_BATCH", "fast", "num", "3", "",
      "How many candidates the fast picker probes at once per wave."),
+    ("PROBE_HOST_BENCH", "fast", "num", "3", "",
+     "Probe failures (with no pass) before a host is skipped for the rest of "
+     "that pick. 0 disables."),
     ("TOTAL_DEADLINE", "fast", "num", "55", _S,
      "Absolute ceiling on a fast request, including probing."),
     ("PROBE_TTFB_MAX", "fast", "num", "12", _S,

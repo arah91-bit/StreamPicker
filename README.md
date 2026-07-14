@@ -108,6 +108,12 @@ through the **same playback verification**, and only streams that actually play
 reach the player. Each addon has a **Test** button that checks the manifest and
 confirms it serves streams. (Stored as JSON in `EXTRA_ADDONS`.)
 
+Stack as many as you like: addons that mirror each other's catalogs are
+recognized — the picker identifies the same file across addons (filename,
+exact size, or listing text) and verifies each release once, so extra addons
+widen coverage instead of multiplying probe work. Duplicate copies are kept
+as instant failover targets.
+
 ## Choosing how streams are handled
 
 The dashboard's **Stream path** switch is the main decision:

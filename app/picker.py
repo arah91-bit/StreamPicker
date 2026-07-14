@@ -33,12 +33,14 @@ segments, so by the time the user presses play the slow first byte is paid for.
 """
 
 import asyncio
+import hashlib
 import logging
 import math
 import os
 import re
 import time
 from contextvars import ContextVar
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -80,6 +82,11 @@ GOOD_TTFB = float(os.environ.get("GOOD_TTFB", "4.0"))
 QUALITY_BAND = float(os.environ.get("QUALITY_BAND", "0.15"))
 VERIFIED_WANT = int(os.environ.get("VERIFIED_WANT", "2"))
 MAX_PROBES = int(os.environ.get("MAX_PROBES", "6"))
+# A host that keeps failing probes within one pick (a scraper addon's dead
+# mirror domain, a trickling free CDN) is benched for the rest of that pick
+# after this many failures with zero passes — its remaining copies are skipped
+# so the probe budget goes to other hosts. Per-request only; 0 disables.
+PROBE_HOST_BENCH = int(os.environ.get("PROBE_HOST_BENCH", "3"))
 # ── fast-race sufficiency bar ────────────────────────────────────────────────
 # The fast picker does not privilege any one source. It fires every source at
 # once, probes candidates best-quality-first as each source lands, and returns
@@ -311,6 +318,49 @@ def _size_bytes(s: dict) -> int | None:
         mult = 1e9 if m.group(2).upper() == "GB" else 1e6
         return int(float(m.group(1)) * mult)
     return None
+
+
+# ── duplicate-release identity (what "the same thing" means when probing) ────
+# Scraper addons share upstream catalogs, so one file arrives many times with
+# different URLs (mirrors, wrappers) and often no filename hint — URL dedup and
+# the filename signature both miss it. Probe selection collapses those copies
+# via the strongest evidence available per stream. Output lists are NOT deduped:
+# every copy is kept as failover/twin material; only probing skips duplicates.
+_SIZE_IDENT_MIN = 256 * 1024 * 1024   # sizes below this aren't identifying
+_TEXT_IDENT_MIN = 24                  # nor are very short display texts
+
+
+def _release_ident(s: dict) -> str:
+    """Best-effort identity of the underlying *file*, comparable across addons
+    within one title's candidate pool. Strongest first: the normalised-filename
+    signature; the exact byte size (observed byte-identical — or off by one —
+    for the same rip across scraper addons; rounded to absorb that); the
+    normalised display text (catches one addon listing the same file twice).
+    Empty = no evidence; two such streams are never treated as the same."""
+    sig = telemetry.signature(s)
+    if sig:
+        return sig
+    size = (s.get("behaviorHints") or {}).get("videoSize")
+    if size and size >= _SIZE_IDENT_MIN:
+        return f"size:{round(size / 4096)}"
+    text = " ".join(filter(None, (s.get("name"), s.get("title"),
+                                  s.get("description"))))
+    norm = re.sub(r"[^a-z0-9]+", "", text.lower())
+    if len(norm) >= _TEXT_IDENT_MIN:
+        return "text:" + hashlib.sha256(norm.encode()).hexdigest()
+    return ""
+
+
+def _probe_host(s: dict) -> str:
+    """Hostname a probe of this stream would hit, for the per-pick host bench.
+    Direct-usenet mounts are exempt: they all sit behind the one nzbdav host,
+    and their health is already managed per-indexer by usenet_health."""
+    if _is_direct_nzb(s):
+        return ""
+    try:
+        return (urlsplit(s.get("url") or "").hostname or "").lower()
+    except ValueError:
+        return ""
 
 
 # ── TRaSH-guides quality scoring (https://trash-guides.info) ─────────────────
@@ -1100,9 +1150,13 @@ async def _finish_in_background(cache_key: str, media: str, media_id: str,
                             mediafusion, nzb, profile, runtime, extras=extras)
         inherited = _take_fast_verified(cache_key, profile, runtime)
         inherited_urls = {s.get("url") for s, _ in inherited}
-        probed = await _probe_bounded(
+        inherited_idents = {i for i in (_release_ident(s) for s, _ in inherited)
+                            if i}
+        finish_slice = _slow_probe_slice(
             [s for s in ok if s.get("url") not in inherited_urls],
-            runtime, USENET_TTFB_MAX, SLOW_FINISH_MAX_PROBES,
+            SLOW_FINISH_MAX_PROBES, skip_idents=inherited_idents)
+        probed = await _probe_bounded(
+            finish_slice, runtime, USENET_TTFB_MAX, len(finish_slice),
             time.monotonic() + SLOW_FINISH_DEADLINE)
         lib = await library.streams(media, media_id) if library.enabled() else []
         if lib:
@@ -1165,6 +1219,10 @@ async def _race_fast(media: str, media_id: str, profile: dict, runtime: float,
     pool: list[dict] = []
     pool_urls: set[str] = set()
     probed: set[str] = set()
+    ident_ok: set[str] = set()         # releases with a verified copy already
+    ident_inflight: set[str] = set()   # releases with a probe running right now
+    host_fails: dict[str, int] = {}    # per-pick probe failures by host
+    host_ok: set[str] = set()          # hosts that have passed at least once
     verified: list[tuple[dict, probe.ProbeResult | None]] = []
     deadline = min(t0 + FAST_RACE_DEADLINE, t0 + TOTAL_DEADLINE)
 
@@ -1219,10 +1277,26 @@ async def _race_fast(media: str, media_id: str, profile: dict, runtime: float,
             # Keep probe slots full in current quality order, but let source and
             # probe completions share one event loop. A hanging early candidate
             # can no longer hide a good source that arrived a moment later.
+            # Duplicate copies of one release (several addons scraping the same
+            # upstream) get at most one probe at a time and none once any copy
+            # has verified; a host that keeps failing is benched for this pick.
             for stream in (s for s in pool if s.get("url") not in probed):
                 if len(running_probes) >= PROBE_BATCH:
                     break
+                ident = _release_ident(stream)
+                if ident and ident in ident_ok:
+                    probed.add(stream["url"])     # a copy already verified
+                    continue
+                if ident and ident in ident_inflight:
+                    continue                      # same release being probed now
+                host = _probe_host(stream)
+                if (PROBE_HOST_BENCH and host and host not in host_ok
+                        and host_fails.get(host, 0) >= PROBE_HOST_BENCH):
+                    probed.add(stream["url"])     # benched host: skip this pick
+                    continue
                 probed.add(stream["url"])
+                if ident:
+                    ident_inflight.add(ident)
                 task = asyncio.create_task(probe.probe_race(
                     [stream], need_bps, PROBE_TTFB_MAX, want=1,
                     concurrency=1, deadline=deadline))
@@ -1247,11 +1321,26 @@ async def _race_fast(media: str, media_id: str, profile: dict, runtime: float,
                 _ingest_library(pending_library)
                 pending_library = None
             for task in done & set(running_probes):
-                running_probes.pop(task, None)
+                stream = running_probes.pop(task, None) or {}
+                ident = _release_ident(stream)
+                ident_inflight.discard(ident)
                 try:
-                    verified.extend(task.result() or [])
+                    passed = task.result() or []
                 except Exception:
-                    pass
+                    passed = []
+                host = _probe_host(stream)
+                if passed:
+                    verified.extend(passed)
+                    if ident:
+                        ident_ok.add(ident)
+                    if host:
+                        host_ok.add(host)
+                elif host:
+                    host_fails[host] = host_fails.get(host, 0) + 1
+                    if (PROBE_HOST_BENCH and host not in host_ok
+                            and host_fails[host] == PROBE_HOST_BENCH):
+                        logger.info(f"probe: benching host {host} for this pick"
+                                    f" ({PROBE_HOST_BENCH} failures, no passes)")
     finally:
         for tk in pending_sources:         # shielded searches keep running below
             tk.cancel()
@@ -1420,8 +1509,18 @@ def _is_direct_nzb(s: dict) -> bool:
 
 
 def _slow_probe_slice(ok: list[dict], max_probes: int,
-                      nzb_want: int = SLOW_NZB_PROBES) -> list[dict]:
-    """Quality-ordered foreground slice with a small direct-Usenet quota.
+                      nzb_want: int = SLOW_NZB_PROBES,
+                      skip_idents: set | frozenset = frozenset()) -> list[dict]:
+    """Quality-ordered probe wave — one probe per *distinct release* — with a
+    small direct-Usenet quota.
+
+    Several addons often carry the same file (scrapers sharing an upstream), so
+    the wave takes the best copy of each release (_release_ident) first, which
+    lets it cover max_probes *different* releases instead of burning slots
+    re-checking one. Only when the pool runs out of distinct releases do
+    duplicate copies fill the remaining slots (a twin on another host doubles as
+    failover evidence). `skip_idents` = releases already verified elsewhere
+    (e.g. by the fast picker); their copies need no probe at all.
 
     The quota only decides what gets *tested*. Final verified results are still
     sorted by ``_verified_quality_key``, so admitting a lower-quality NZB to the
@@ -1430,11 +1529,33 @@ def _slow_probe_slice(ok: list[dict], max_probes: int,
     limit = max(0, max_probes)
     if not ok or not limit:
         return []
-    selected = list(ok[:limit])
+    seen_idents = {i for i in skip_idents if i}
+    selected: list[dict] = []
+    selected_urls: set[str] = set()
+    for s in ok:                       # pass 1: distinct releases, best copy each
+        if len(selected) >= limit:
+            break
+        ident = _release_ident(s)
+        if ident and ident in seen_idents:
+            continue
+        if ident:
+            seen_idents.add(ident)
+        selected.append(s)
+        selected_urls.add(s.get("url"))
+    if len(selected) < limit:          # pass 2: top up with best duplicate copies
+        for s in ok:
+            if len(selected) >= limit:
+                break
+            if s.get("url") in selected_urls:
+                continue
+            ident = _release_ident(s)
+            if ident and ident in skip_idents:
+                continue               # verified elsewhere — a probe proves nothing
+            selected.append(s)
+            selected_urls.add(s.get("url"))
     direct = [s for s in ok if _is_direct_nzb(s)]
     target = min(max(0, nzb_want), limit, len(direct))
     have = sum(_is_direct_nzb(s) for s in selected)
-    selected_urls = {s.get("url") for s in selected}
 
     for stream in direct:
         if have >= target:
@@ -1497,12 +1618,15 @@ async def _finish_slow(cache_key: str, media: str, media_id: str,
                                    profile, runtime, extras=extras)
         fast_verified = _take_fast_verified(cache_key[len("slow:"):], profile, runtime)
         fast_urls = {s.get("url") for s, _ in fast_verified}
+        fast_idents = {i for i in (_release_ident(s) for s, _ in fast_verified) if i}
         # Off Nuvio's clock, so dig deeper by quality than the foreground slice
         # AND wait patiently (SLOW_FINISH_TTFB_MAX) for slow-to-start high-quality
         # sources, so they survive verification and can take #1 on the retry.
-        verified = await _probe_bounded(
+        finish_slice = _slow_probe_slice(
             [s for s in ok if s.get("url") not in fast_urls],
-            runtime, SLOW_FINISH_TTFB_MAX, SLOW_FINISH_MAX_PROBES,
+            SLOW_FINISH_MAX_PROBES, skip_idents=fast_idents)
+        verified = await _probe_bounded(
+            finish_slice, runtime, SLOW_FINISH_TTFB_MAX, len(finish_slice),
             time.monotonic() + SLOW_FINISH_DEADLINE)
         lib = await library.streams(media, media_id) if library.enabled() else []
         if lib:
@@ -1651,11 +1775,12 @@ async def pick_slow(media: str, media_id: str,
     # — fold it straight in, and don't waste the probe budget re-checking it.
     fast_verified = _take_fast_verified(cache_key[len("slow:"):], profile, runtime)
     fast_urls = {s.get("url") for s, _ in fast_verified}
+    fast_idents = {i for i in (_release_ident(s) for s, _ in fast_verified) if i}
     unprobed = [s for s in ok if s.get("url") not in fast_urls]
     inherited_nzb = sum(_is_direct_nzb(s) for s, _ in fast_verified)
     probe_slice = _slow_probe_slice(
         unprobed, SLOW_MAX_PROBES,
-        max(SLOW_NZB_PROBES - inherited_nzb, 0))
+        max(SLOW_NZB_PROBES - inherited_nzb, 0), skip_idents=fast_idents)
     verified = await _probe_bounded(
         probe_slice,
         runtime, min(SLOW_TTFB_MAX, max(left(), 5)),
@@ -1672,10 +1797,11 @@ async def pick_slow(media: str, media_id: str,
             lib = []
     if lib:
         lib = _eligible_library(lib, profile, runtime)
+    distinct = len({_release_ident(s) or s.get("url") for s in ok})
     logger.info(f"{cache_key}: merged fast {len(fast)} / stremthru {len(stremthru)} /"
-                f" mf {len(mediafusion)} / nzb {len(nzb)}"
-                f" -> {len(ok)} usable, {len(verified)} verified"
-                f" (+{len(fast_verified)} fast),"
+                f" mf {len(mediafusion)} / nzb {len(nzb)} / extras {len(extras)}"
+                f" -> {len(ok)} usable ({distinct} distinct releases),"
+                f" {len(verified)} verified (+{len(fast_verified)} fast),"
                 f" {len(lib)} library in {time.monotonic() - t0:.1f}s")
 
     # Slow picker earns its name here: for the top few candidates, measure the
