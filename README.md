@@ -1,5 +1,8 @@
 # Auto Stream — a self-hosted stream picker for your player
 
+[![Test & publish image](https://github.com/arah91-bit/StreamPicker/actions/workflows/publish.yml/badge.svg)](https://github.com/arah91-bit/StreamPicker/actions/workflows/publish.yml)
+[![Image](https://img.shields.io/badge/ghcr.io-arah91--bit%2Fstreampicker-blue)](https://github.com/arah91-bit/StreamPicker/pkgs/container/streampicker)
+
 Races several debrid and direct-usenet sources for a title, verifies that the
 top result actually plays, and hands your player a high-quality, correct-audio
 stream first. Ships two addons from one container — a **fast** picker (answers
