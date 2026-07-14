@@ -13,6 +13,7 @@ through remuxes that will stall.
 
 import asyncio
 import logging
+import re
 import secrets
 import time
 from dataclasses import dataclass
@@ -44,6 +45,13 @@ class ProbeResult:
     node: str = ""           # final delivery host + CDN/cache signal (see telemetry.netinfo)
     via: str = ""
     cache: str = ""
+    # What the stream declared about its own content, when the probe descended
+    # an HLS master playlist: the chosen variant's EXT-X-STREAM-INF attributes.
+    # Free HTTP addons label anything "4K"; the playlist can't lie about the
+    # bandwidth it will actually serve, so the picker re-ranks on this.
+    media_bps: float = 0.0   # declared BANDWIDTH (bits/s), 0 = unknown
+    media_height: int = 0    # declared RESOLUTION height, 0 = unknown
+    media_codecs: str = ""   # declared CODECS string, "" = unknown
 
 
 def _required_bps(need_bps: float | None) -> float:
@@ -113,6 +121,38 @@ def _hls_first_uri(text: str) -> str:
     return ""
 
 
+_BANDWIDTH_RE = re.compile(r"\bBANDWIDTH=(\d+)")
+_RESOLUTION_RE = re.compile(r"\bRESOLUTION=\d+x(\d+)")
+_CODECS_RE = re.compile(r'\bCODECS="([^"]*)"')
+
+
+def _hls_variant_info(text: str) -> dict:
+    """Declared quality of the variant the probe will descend into: the
+    EXT-X-STREAM-INF attributes directly above the first URI of a master
+    playlist, keyed to match ProbeResult's media_* fields. Empty for media
+    playlists — segments declare nothing."""
+    last_inf = ""
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("#EXT-X-STREAM-INF:"):
+            last_inf = line
+        elif line and not line.startswith("#"):
+            break
+    if not last_inf:
+        return {}
+    info: dict = {}
+    m = _BANDWIDTH_RE.search(last_inf)
+    if m:
+        info["media_bps"] = float(m.group(1))
+    m = _RESOLUTION_RE.search(last_inf)
+    if m:
+        info["media_height"] = int(m.group(1))
+    m = _CODECS_RE.search(last_inf)
+    if m:
+        info["media_codecs"] = m.group(1)[:60]
+    return info
+
+
 async def probe(url: str, need_bps: float | None, ttfb_max: float) -> ProbeResult:
     """need_bps is the file's real bitrate (size/runtime) or None if unknown."""
     return await _probe_url(url, _required_bps(need_bps), ttfb_max,
@@ -120,11 +160,14 @@ async def probe(url: str, need_bps: float | None, ttfb_max: float) -> ProbeResul
 
 
 async def _probe_url(url: str, required: float, ttfb_max: float,
-                     t0: float, hops: int) -> ProbeResult:
+                     t0: float, hops: int,
+                     media: dict | None = None) -> ProbeResult:
     """One GET of the probe descent. hops>0 means we're past an HLS playlist,
     probing a media segment: clean EOF short of the 4 MiB window is then a
     complete segment, not truncation. ttfb is always measured from the original
-    t0, so playlist hops spend the same first-byte allowance as a direct file."""
+    t0, so playlist hops spend the same first-byte allowance as a direct file.
+    `media` carries the master playlist's declared variant quality down the
+    descent so the final (segment-judged) result can report it."""
     # The read timeout must outlast ttfb_max, or a legitimately slow starter
     # (nzbdav assembling its first segments can take 20-35s) dies as ReadTimeout
     # before the TTFB allowance it was promised ever comes into play.
@@ -189,10 +232,12 @@ async def _probe_url(url: str, required: float, ttfb_max: float,
             speed = got / elapsed
             ttfb = t_first - t0
             if is_playlist:
-                uri = _hls_first_uri(body.decode("utf-8", errors="replace"))
+                text = body.decode("utf-8", errors="replace")
+                uri = _hls_first_uri(text)
                 if not uri:
                     return ProbeResult(False, ttfb=ttfb, **ni,
                                        reason="empty playlist")
+                media = media or _hls_variant_info(text)
                 playlist_url = str(resp.url)   # recurse outside the stream ctx
             elif got < PROBE_BYTES:
                 # A real feature/episode is vastly larger than this range.  A
@@ -208,14 +253,16 @@ async def _probe_url(url: str, required: float, ttfb_max: float,
                         reason=f"{speed / 1e6:.1f} MB/s < required "
                                f"{required / 1e6:.1f} MB/s",
                     )
-                return ProbeResult(True, ttfb=ttfb, speed_bps=speed, **ni)
+                return ProbeResult(True, ttfb=ttfb, speed_bps=speed, **ni,
+                                   **(media or {}))
             elif speed < required:
                 return ProbeResult(
                     False, ttfb=ttfb, speed_bps=speed, **ni,
                     reason=f"{speed / 1e6:.1f} MB/s < required {required / 1e6:.1f} MB/s",
                 )
             else:
-                return ProbeResult(True, ttfb=ttfb, speed_bps=speed, **ni)
+                return ProbeResult(True, ttfb=ttfb, speed_bps=speed, **ni,
+                                   **(media or {}))
     except asyncio.CancelledError:
         raise
     except Exception as e:
@@ -223,7 +270,7 @@ async def _probe_url(url: str, required: float, ttfb_max: float,
         # request URL. The class is enough for retry/reputation classification.
         return ProbeResult(False, reason=type(e).__name__)
     return await _probe_url(urljoin(playlist_url, uri), required, ttfb_max,
-                            t0, hops + 1)
+                            t0, hops + 1, media=media)
 
 
 async def probe_batch(

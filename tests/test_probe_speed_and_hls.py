@@ -61,6 +61,30 @@ class HlsHelperTests(unittest.TestCase):
         self.assertEqual("seg-000.ts", probe._hls_first_uri(media))
         self.assertEqual("", probe._hls_first_uri("#EXTM3U\n# only comments\n"))
 
+    def test_variant_info_parses_declared_quality(self):
+        master = ('#EXTM3U\n'
+                  '#EXT-X-STREAM-INF:BANDWIDTH=15840000,'
+                  'RESOLUTION=3840x2160,CODECS="hvc1.2.4.L153.B0,mp4a.40.2"\n'
+                  'v0.m3u8\n')
+        info = probe._hls_variant_info(master)
+        self.assertEqual(15_840_000.0, info["media_bps"])
+        self.assertEqual(2160, info["media_height"])
+        self.assertIn("hvc1", info["media_codecs"])
+
+    def test_variant_info_reads_the_first_uri_not_the_best(self):
+        master = ('#EXTM3U\n'
+                  '#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720\n'
+                  'low.m3u8\n'
+                  '#EXT-X-STREAM-INF:BANDWIDTH=16000000,RESOLUTION=3840x2160\n'
+                  'high.m3u8\n')
+        info = probe._hls_variant_info(master)
+        self.assertEqual(2_500_000.0, info["media_bps"])
+        self.assertEqual(720, info["media_height"])
+
+    def test_media_playlist_declares_nothing(self):
+        media = "#EXTM3U\n#EXTINF:6.0,\nseg-000.ts\n"
+        self.assertEqual({}, probe._hls_variant_info(media))
+
 
 class _FakeResponse:
     def __init__(self, status: int, headers: dict, chunks: list[bytes], url: str):
@@ -124,6 +148,28 @@ class HlsProbeDescentTests(unittest.TestCase):
         r = self._run(probe.probe(base, None, ttfb_max=10))
         self.assertTrue(r.ok, r.reason)
         self.assertEqual([base, variant, segment], client.fetched)
+
+    def test_master_declaration_rides_down_to_the_result(self):
+        base = "https://cdn.example/live/master.m3u8"
+        variant = "https://cdn.example/live/720p.m3u8"
+        segment = "https://cdn.example/live/seg-000.ts"
+        client = _FakeClient({
+            base: _FakeResponse(200, {}, [
+                b"#EXTM3U\n"
+                b'#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720,'
+                b'CODECS="avc1.640028,mp4a.40.2"\n'
+                b"720p.m3u8\n"], base),
+            variant: _FakeResponse(200, {}, [b"#EXTM3U\n#EXTINF:6.0,\nseg-000.ts\n"],
+                                   variant),
+            segment: _FakeResponse(200, {"content-type": "video/mp2t"},
+                                   [b"G" + b"\x00" * (2 * 1024 * 1024)], segment),
+        })
+        probe._client = client
+        r = self._run(probe.probe(base, None, ttfb_max=10))
+        self.assertTrue(r.ok, r.reason)
+        self.assertEqual(2_500_000.0, r.media_bps)
+        self.assertEqual(720, r.media_height)
+        self.assertIn("avc1", r.media_codecs)
 
     def test_relative_uris_resolve_against_playlist_url(self):
         base = "https://cdn.example/a/b/list.m3u8"

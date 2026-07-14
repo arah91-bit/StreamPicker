@@ -124,6 +124,9 @@ CATALOG = [
      "Minimum real bitrate to accept a stream as genuine 1080p."),
     ("MIN_BPS_720", "bitrate", "num", "1200000", "bps",
      "Minimum real bitrate to accept a stream as genuine 720p."),
+    ("UNPROVEN_MAX_RES", "bitrate", "num", "1080", "",
+     "Highest resolution a stream with no bitrate evidence (no size, no "
+     "measurement) may rank as, whatever its label claims."),
     ("UNKNOWN_NEED_2160", "bitrate", "num", "8000000", "bps",
      "Assumed bitrate floor for an untagged release treated as 4K."),
     ("UNKNOWN_NEED_1080", "bitrate", "num", "2500000", "bps",

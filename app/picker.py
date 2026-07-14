@@ -492,6 +492,13 @@ _RES_MIN_BPS = [
     (480,  0.0),
 ]
 
+# A resolution *claim* with no bitrate evidence at all (free HTTP addons often
+# ship no size, no filename, nothing measurable) ranks no higher than this
+# until something measures it — an HLS playlist declaration, ffprobe, or a
+# size. Debrid/NZB candidates always carry sizes, so this only holds back the
+# unverifiable "trust me it's 4K" labels the scraper addons are full of.
+UNPROVEN_MAX_RES = int(os.environ.get("UNPROVEN_MAX_RES", "1080"))
+
 
 def _codec_factor(text: str) -> float:
     """How many AVC bits one of this file's bits is 'worth' — HEVC/AV1 look the
@@ -519,15 +526,32 @@ def _video_bps(s: dict, runtime: float) -> float | None:
     return size * 8 / runtime
 
 
+def _height_tier(height: int) -> int:
+    """Resolution tier a measured pixel height belongs to (conservative)."""
+    if height >= 2000:
+        return 2160
+    if height >= 1000:
+        return 1080
+    if height >= 700:
+        return 720
+    return 480
+
+
 def _effective_resolution(s: dict, runtime: float) -> int:
     """Resolution to *rank* by: the claimed resolution capped at the highest one
-    the file's (codec-adjusted) video bitrate can actually justify. Unknown
-    bitrate -> trust the claim."""
+    the file's (codec-adjusted) video bitrate can actually justify. A measured
+    pixel height (an HLS variant's declared RESOLUTION, `_vheight`) caps the
+    claim outright. Unknown bitrate -> the claim counts only up to
+    UNPROVEN_MAX_RES: a bare "4K" label is not evidence of 4K."""
     claimed = _resolution(s)
+    height = s.get("_vheight")
+    if height:
+        claimed = min(claimed, _height_tier(int(height)))
     vbps = _video_bps(s, runtime)
     if vbps is None:
-        return claimed
-    avc_equiv = vbps * _codec_factor(_stream_text(s))
+        return min(claimed, UNPROVEN_MAX_RES)
+    avc_equiv = vbps * _codec_factor(
+        " ".join(filter(None, (_stream_text(s), s.get("_vcodec")))))
     for res, min_bps in _RES_MIN_BPS:
         if avc_equiv >= min_bps:
             return min(claimed, res)
@@ -542,6 +566,32 @@ def _annotate_quality(streams: list[dict], runtime: float) -> None:
     for s in streams:
         s["_qbps"] = _video_bps(s, runtime) or 0
         s["_effres"] = _effective_resolution(s, runtime)
+
+
+def _apply_probe_quality(s: dict, r, runtime: float) -> None:
+    """Fold what the probe learned about the *content* — an HLS master
+    playlist's declared variant bandwidth/resolution/codecs — into the ranking
+    annotations, then re-rank. This is what turns a labels-only "4K" into the
+    720p its own playlist admits to, and conversely lets a genuine high-bitrate
+    HLS 4K keep its tier despite having no size. No-op for direct files: the
+    byte probe learns nothing about their encoding."""
+    bps = getattr(r, "media_bps", 0)
+    height = getattr(r, "media_height", 0)
+    codecs = (getattr(r, "media_codecs", "") or "").lower()
+    if not bps and not height:
+        return
+    if bps:
+        # Declared BANDWIDTH is *peak* video+audio — biased high, so it only
+        # demotes clear fakes, never a marginal honest encode.
+        s["_vbitrate"] = float(bps)
+    if height:
+        s["_vheight"] = int(height)
+    if any(c in codecs for c in ("hvc1", "hev1", "hevc")):
+        s["_vcodec"] = "hevc"
+    elif "av01" in codecs:
+        s["_vcodec"] = "av1"
+    s["_qbps"] = _video_bps(s, runtime) or 0
+    s["_effres"] = _effective_resolution(s, runtime)
 
 
 # Slow picker only: how many of the current best candidates to ffprobe for their
@@ -587,8 +637,8 @@ _NOTICE_STATE_KEY = "_picker_notice"
 # an upstream addon's JSON response.  Raw streams are still scrubbed at every
 # ingestion boundary so even a same-named private field cannot linger.
 _VERIFIED_SENTINEL = object()
-_INTERNAL_KEYS = ("_effres", "_vbitrate", "_qbps", "_speed", "_ttfb",
-                  _VERIFIED_STATE_KEY, _NOTICE_STATE_KEY)
+_INTERNAL_KEYS = ("_effres", "_vbitrate", "_vheight", "_vcodec", "_qbps",
+                  "_speed", "_ttfb", _VERIFIED_STATE_KEY, _NOTICE_STATE_KEY)
 
 
 def _ingested_stream(s: dict) -> dict:
@@ -1165,6 +1215,10 @@ async def _finish_in_background(cache_key: str, media: str, media_id: str,
         if verified:
             if probed:
                 _publish_fast_verified(cache_key, probed)
+            # Off-clock, so measure true video bitrate of the leaders too: the
+            # cached answer a retry gets should be compression-honest, not
+            # label-trusting (matters most for size-less free-addon streams).
+            await _refine_video_bitrate(probed, runtime, 45)
             vurls = {s.get("url") for s, _ in verified}
             streams = _assemble(
                 verified, [s for s in ok if s.get("url") not in vurls], None,
@@ -1330,6 +1384,8 @@ async def _race_fast(media: str, media_id: str, profile: dict, runtime: float,
                     passed = []
                 host = _probe_host(stream)
                 if passed:
+                    for vs, vr in passed:
+                        _apply_probe_quality(vs, vr, runtime)
                     verified.extend(passed)
                     if ident:
                         ident_ok.add(ident)
@@ -1592,10 +1648,13 @@ async def _probe_bounded(ok: list[dict], runtime: float, ttfb_max: float,
     # probe_race owns this deadline and returns every success accumulated before
     # it.  Wrapping it in another timer at the exact same instant can cancel it
     # during cleanup and throw those already-verified successes away.
-    return await probe.probe_race(
+    results = await probe.probe_race(
         cands, _need_bps_fn(runtime), ttfb_max,
         want=len(cands),               # collect all that pass, no early bail
         concurrency=SLOW_CONCURRENCY, deadline=hard_deadline)
+    for s, r in results:               # fold in HLS-declared quality evidence
+        _apply_probe_quality(s, r, runtime)
+    return results
 
 
 async def _finish_slow(cache_key: str, media: str, media_id: str,
