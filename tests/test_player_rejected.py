@@ -96,7 +96,7 @@ class StrikeCountingTests(unittest.TestCase):
         self.assertTrue(state["rejected"])
         observe.assert_called_once()
         self.assertEqual("player-rejected", observe.call_args.args[2])
-        cooldown.assert_called_once_with("file:abc")
+        cooldown.assert_called_once_with("file:abc", proxy.REJECT_COOLDOWN)
 
     def test_fires_only_once(self):
         state = {}
@@ -150,7 +150,7 @@ class SilenceTimerTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.2)
         self.assertTrue(e.playfail.get("rejected"))
         observe.assert_called_once()
-        cooldown.assert_called_once_with("file:quiet")
+        cooldown.assert_called_once_with("file:quiet", proxy.REJECT_COOLDOWN)
 
     async def test_reattached_reader_cancels_silence_rejection(self):
         e = _entry("file:busy")

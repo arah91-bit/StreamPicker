@@ -86,6 +86,9 @@ CATALOG = [
      "ffprobe timeout when measuring true video bitrate."),
     ("GOOD_TTFB", "fast", "num", "4.0", _S,
      "First-byte time target; above it a source counts as a slow start."),
+    ("PROBE_CODEC_SNIFF", "fast", "bool", "1", "",
+     "ffprobe the bytes each passing probe already pulled to learn real "
+     "codecs, feeding the decode-compatibility demotion."),
     ("EXTRA_ADDON_TIMEOUT", "fast", "num", "30", _S,
      "Search timeout for each user-added custom addon."),
 
@@ -145,6 +148,15 @@ CATALOG = [
      "Failed fresh opens (sub-5s reads from byte 0) before 15s of player "
      "silence rejects a release as undecodable and the next open serves "
      "another. 0 disables."),
+    ("PLAYER_REJECT_COOLDOWN_HOURS", "proxy", "num", "24", "",
+     "How long a player-rejected release is skipped — long, because decode "
+     "failure is deterministic, not a node lottery."),
+    ("DECODE_BAD_REJECTS", "proxy", "num", "2", "",
+     "Player rejections (with zero successful plays) before a codec counts "
+     "as undecodable and matching releases rank below clean ones."),
+    ("DECODE_TTL_DAYS", "proxy", "num", "90", "",
+     "Learned codec verdicts expire after this — an upgraded player gets a "
+     "clean slate."),
     ("PROXY_SESSION_TTL", "proxy", "num", "86400", _S,
      "How long a playback token stays valid."),
     ("PROXY_SESSION_MAX_BYTES", "proxy", "num", "20971520", _B,

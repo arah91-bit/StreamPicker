@@ -104,3 +104,53 @@ async def video_bitrates(
     if not enabled() or not url_overall:
         return [None] * len(url_overall)
     return await asyncio.gather(*[_one(u, o) for u, o in url_overall])
+
+
+# ── codec identification (decode-compatibility learning) ────────────────────
+
+def _norm_codec(name: str) -> str:
+    """Normalize ffprobe codec names into stable attribute names: every
+    pcm_s24le/pcm_f32be variant is 'pcm' for compatibility purposes."""
+    n = (name or "").lower()
+    return "pcm" if n.startswith("pcm") else n
+
+
+async def codecs_of(target: str | bytes,
+                    timeout: float = 5.0) -> tuple[list[str], str]:
+    """(audio codec names, video codec name) of a media file. `target` is a
+    filesystem path or the first couple MB of the file as bytes — containers
+    keep their track table near the head, so a partial prefix parses fine for
+    MKV and faststart MP4. ([], \"\") when ffprobe is missing or can't tell."""
+    if not enabled():
+        return [], ""
+    args = [FFPROBE, "-v", "error", "-of", "json",
+            "-show_entries", "stream=codec_type,codec_name"]
+    stdin = None
+    if isinstance(target, bytes):
+        args.append("pipe:0")
+        stdin = asyncio.subprocess.PIPE
+    else:
+        args.append(target)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args, stdin=stdin, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL)
+        out, _ = await asyncio.wait_for(
+            proc.communicate(input=target if stdin else None), timeout=timeout)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return [], ""
+    except Exception:
+        return [], ""
+    try:
+        streams = json.loads(out).get("streams", [])
+    except Exception:
+        return [], ""
+    audio = [_norm_codec(s.get("codec_name", ""))
+             for s in streams if s.get("codec_type") == "audio"]
+    video = next((_norm_codec(s.get("codec_name", "")) for s in streams
+                  if s.get("codec_type") == "video"), "")
+    return [a for a in audio if a], video

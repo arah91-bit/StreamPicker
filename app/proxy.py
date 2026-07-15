@@ -37,7 +37,7 @@ from urllib.parse import urlsplit
 import httpx
 from starlette.responses import Response, StreamingResponse
 
-from app import reputation, telemetry, usenet_health
+from app import decode_health, reputation, telemetry, usenet_health, vprobe
 
 logger = logging.getLogger("stream-picker")
 
@@ -665,6 +665,10 @@ async def _open_twin(entry, cand, cur, end, tried):
 # a repeat offender is eventually blocked for good. Server-side and
 # player-agnostic: no codec guessing, pure observed behavior.
 PLAYER_REJECT_STARTS = int(os.environ.get("PLAYER_REJECT_STARTS", "2"))
+# Rejection is deterministic for a given player+file (unlike a flaky node), so
+# the cooldown is much longer than the generic 15-minute one — long enough that
+# the same cached pick can't re-serve the file tomorrow night either.
+REJECT_COOLDOWN = float(os.environ.get("PLAYER_REJECT_COOLDOWN_HOURS", "24")) * 3600
 _REAL_PLAY_SECS = 20.0                   # a connection this long = actual playback
 _REAL_PLAY_BYTES = 256 * 1024 * 1024     # pulling this much = playing/buffering
 # What counts as one false start. Live data: a decode-rejecting player dies in
@@ -717,10 +721,13 @@ def _mark_rejected(state: dict, *, sig: str, label: str, node: str, token: str,
                 f"the player can't open?); cooling release, next open serves "
                 f"the next source")
     reputation.observe(sig, token, "player-rejected", label, node=node)
-    reputation.cooldown(sig)
+    reputation.cooldown(sig, REJECT_COOLDOWN)
     telemetry.record_buffer("player_rejected", sig=sig, picker=picker,
                             media_id=media_id, source=label, node=node,
                             reason=detail)
+    sess = _lookup(token)
+    if sess is not None:     # lets the first real play log a recovery_ok event
+        sess["rejected_at"] = time.time()
 
 
 # Players that reject a file usually go quiet, then re-request the same URL on
@@ -753,12 +760,57 @@ def _arm_reject_timer(e: "_Entry", token: str) -> None:
                            token=token, picker=e.picker, media_id=e.media_id,
                            detail=f"{state.get('false_starts', 0)} false starts"
                                   f" then {_REJECT_SILENCE_SECS:.0f}s silence")
+            _spawn_learn(e, played=False)
         finally:
             state["timer_armed"] = False
 
     t = asyncio.create_task(_fire())
     _bg_tasks.add(t)
     t.add_done_callback(_bg_tasks.discard)
+
+
+def _spawn_learn(e: "_Entry", played: bool) -> None:
+    """Learn the *class* of file from this entry, off the serving path."""
+    if not vprobe.enabled():
+        return
+    t = asyncio.create_task(_learn_codecs(e, played))
+    _bg_tasks.add(t)
+    t.add_done_callback(_bg_tasks.discard)
+
+
+async def _learn_codecs(e: "_Entry", played: bool) -> None:
+    """ffprobe the entry's cached bytes and feed decode_health: a rejection
+    strikes the file's codec attributes, real playback credits them. This is
+    what turns one FLAC spinner into 'FLAC stops ranking first' instead of
+    re-learning the same lesson release by release."""
+    try:
+        ac, vc = await vprobe.codecs_of(e.path)
+    except Exception:
+        return
+    if not ac and not vc:
+        return
+    lbl = (e.source or {}).get("lbl", "")
+    if played:
+        decode_health.record_play(ac, vc)
+    else:
+        logger.info(f"decode-health: rejected file {lbl!r} carries "
+                    f"audio={list(ac)} video={vc!r}")
+        decode_health.record_reject(ac, vc, label=lbl)
+
+
+def _note_recovery(e: "_Entry", token: str) -> None:
+    """A session that had a player-rejected release just reached real playback
+    on another one — the automatic swap worked. One durable event, so the
+    dashboard can count auto-recoveries instead of inferring them from logs."""
+    sess = _lookup(token)
+    if sess is None or sess.pop("rejected_at", None) is None:
+        return
+    logger.info(f"proxy: auto-recovery — {(e.source or {}).get('lbl', '')!r} "
+                f"plays after a rejected release on the same token")
+    telemetry.record_buffer("recovery_ok", sig=e.sig, picker=e.picker,
+                            media_id=e.media_id,
+                            source=(e.source or {}).get("lbl", ""), node=e.node,
+                            reason="played after player-rejected swap")
 
 
 async def _body(entry, idx, cand, resp, it, prebuf, offset, end, ttfb, token, net):
@@ -1463,6 +1515,10 @@ async def _consume(e: _Entry, offset: int, end: int | None, token: str):
                 media_id=e.media_id, served=served,
                 dur=time.monotonic() - t0, offset=offset)
             _arm_reject_timer(e, token)
+            if e.playfail.get("real_play") and not e.playfail.get("learned"):
+                e.playfail["learned"] = True
+                _spawn_learn(e, played=True)
+                _note_recovery(e, token)
         except Exception:
             pass
 

@@ -293,6 +293,8 @@ def render(recs: list[dict]) -> str:
     n_switch = sum(1 for r in plays if r.get("switched"))
     n_recon = sum(r.get("reconnects") or 0 for r in plays)
     n_twin = sum(1 for r in buffers if r.get("event") == "twin")
+    n_reject = sum(1 for r in buffers if r.get("event") == "player_rejected")
+    n_recover = sum(1 for r in buffers if r.get("event") == "recovery_ok")
     avg_mbps = (total_mb * 8 / total_secs) if total_secs else 0
 
     dv, du = _data(total_mb)
@@ -326,6 +328,10 @@ def render(recs: list[dict]) -> str:
         if n_twin:
             tiles.append(("twin splices", _num(n_twin),
                           "jumped to an identical copy on another debrid"))
+        if n_reject:
+            tiles.append(("spinners auto-fixed", _num(n_recover),
+                          f"of {_num(n_reject)} files your player couldn't "
+                          f"open, caught and swapped"))
     tile_html = "".join(
         f"<div class='tile'><div class='v'>{v}</div><div class='k'>{_esc(k)}</div>"
         + (f"<div class='sub'>{_esc(s)}</div>" if s else "") + "</div>"

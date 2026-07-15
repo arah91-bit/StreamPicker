@@ -40,7 +40,11 @@ _MAX_ENTRIES = int(os.environ.get("REPUTATION_MAX_ENTRIES", "100000"))
 COOLDOWN = float(os.environ.get("COOLDOWN_MINUTES", "15")) * 60
 
 _store: dict[str, dict] = {}
+# sig -> monotonic-free expiry timestamp (time.time()). Persisted: a cooldown
+# set moments before a restart (e.g. a player-rejected release) must survive it.
 _cooldowns: dict[str, float] = {}
+_CD_FILE = os.path.join(os.environ.get("TELEMETRY_DIR", "/data"),
+                        "cooldowns.json")
 _lock = threading.Lock()
 
 
@@ -129,22 +133,51 @@ def blocked(sig: str) -> bool:
                and len(e.get("sessions", {})) >= MIN_BLOCK_SESSIONS)
 
 
-def cooldown(sig: str) -> None:
-    """Avoid this release on the next open for COOLDOWN seconds (short-term)."""
+def _load_cooldowns() -> None:
+    global _cooldowns
+    try:
+        with open(_CD_FILE) as f:
+            loaded = json.load(f)
+        now = time.time()
+        _cooldowns = {k: float(v) for k, v in loaded.items()
+                      if isinstance(v, (int, float)) and float(v) > now}
+    except Exception:
+        _cooldowns = {}
+
+
+_load_cooldowns()
+
+
+def _save_cooldowns() -> None:
+    try:
+        tmp = _CD_FILE + ".tmp"
+        os.makedirs(os.path.dirname(_CD_FILE), exist_ok=True)
+        with open(tmp, "w") as f:
+            json.dump(_cooldowns, f)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, _CD_FILE)
+    except Exception:
+        logger.debug("cooldown save failed", exc_info=True)
+
+
+def cooldown(sig: str, secs: float | None = None) -> None:
+    """Avoid this release on the next open (short-term). Default COOLDOWN for
+    node-lottery failures that self-heal; callers pass a longer `secs` when the
+    failure is deterministic (a player-rejected file stays rejected)."""
     if not sig:
         return
     now = time.time()
-    _cooldowns[sig] = now
+    _cooldowns[sig] = now + (secs if secs is not None else COOLDOWN)
     if len(_cooldowns) > 2000:                       # opportunistic prune
-        for k in [k for k, t in _cooldowns.items() if now - t > COOLDOWN]:
+        for k in [k for k, t in _cooldowns.items() if t <= now]:
             _cooldowns.pop(k, None)
+    _save_cooldowns()
 
 
 def cooled(sig: str) -> bool:
     if not ENABLED or not sig:
         return False
-    t = _cooldowns.get(sig)
-    return bool(t and time.time() - t < COOLDOWN)
+    return time.time() < _cooldowns.get(sig, 0)
 
 
 def unblock(sig: str) -> None:

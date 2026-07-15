@@ -44,8 +44,8 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from app import (acquire, library, meta, probe, reputation, sources, telemetry,
-                 usenet as nzb_lane, vprobe)
+from app import (acquire, decode_health, library, meta, probe, reputation,
+                 sources, telemetry, usenet as nzb_lane, vprobe)
 
 logger = logging.getLogger("stream-picker")
 
@@ -569,16 +569,17 @@ def _annotate_quality(streams: list[dict], runtime: float) -> None:
 
 
 def _apply_probe_quality(s: dict, r, runtime: float) -> None:
-    """Fold what the probe learned about the *content* — an HLS master
-    playlist's declared variant bandwidth/resolution/codecs — into the ranking
-    annotations, then re-rank. This is what turns a labels-only "4K" into the
-    720p its own playlist admits to, and conversely lets a genuine high-bitrate
-    HLS 4K keep its tier despite having no size. No-op for direct files: the
-    byte probe learns nothing about their encoding."""
+    """Fold what the probe learned about the *content* into the ranking
+    annotations, then re-rank: an HLS master playlist's declared variant
+    bandwidth/resolution/codecs (turns a labels-only "4K" into the 720p its
+    own playlist admits to), and the real codecs ffprobe'd from the probe's
+    bytes for direct files (feeds the learned decode-compatibility demotion)."""
     bps = getattr(r, "media_bps", 0)
     height = getattr(r, "media_height", 0)
     codecs = (getattr(r, "media_codecs", "") or "").lower()
-    if not bps and not height:
+    acodecs = getattr(r, "acodecs", ()) or ()
+    vcodec = (getattr(r, "vcodec", "") or "").lower()
+    if not bps and not height and not acodecs and not vcodec:
         return
     if bps:
         # Declared BANDWIDTH is *peak* video+audio — biased high, so it only
@@ -586,10 +587,14 @@ def _apply_probe_quality(s: dict, r, runtime: float) -> None:
         s["_vbitrate"] = float(bps)
     if height:
         s["_vheight"] = int(height)
-    if any(c in codecs for c in ("hvc1", "hev1", "hevc")):
+    if any(c in codecs for c in ("hvc1", "hev1", "hevc")) or vcodec == "hevc":
         s["_vcodec"] = "hevc"
-    elif "av01" in codecs:
+    elif "av01" in codecs or vcodec == "av1":
         s["_vcodec"] = "av1"
+    if acodecs:
+        s["_acodecs"] = list(acodecs)
+    if vcodec:
+        s["_vcodec_real"] = vcodec
     s["_qbps"] = _video_bps(s, runtime) or 0
     s["_effres"] = _effective_resolution(s, runtime)
 
@@ -637,8 +642,9 @@ _NOTICE_STATE_KEY = "_picker_notice"
 # an upstream addon's JSON response.  Raw streams are still scrubbed at every
 # ingestion boundary so even a same-named private field cannot linger.
 _VERIFIED_SENTINEL = object()
-_INTERNAL_KEYS = ("_effres", "_vbitrate", "_vheight", "_vcodec", "_qbps",
-                  "_speed", "_ttfb", _VERIFIED_STATE_KEY, _NOTICE_STATE_KEY)
+_INTERNAL_KEYS = ("_effres", "_vbitrate", "_vheight", "_vcodec", "_vcodec_real",
+                  "_acodecs", "_qbps", "_speed", "_ttfb",
+                  _VERIFIED_STATE_KEY, _NOTICE_STATE_KEY)
 
 
 def _ingested_stream(s: dict) -> dict:
@@ -806,13 +812,26 @@ async def _resolve_accept_langs(media: str, media_id: str) -> None:
     _accept_langs.set(frozenset({"en", orig}) if orig else None)
 
 
+def _decode_ok(s: dict) -> int:
+    """0 when the stream carries a codec attribute the household's players have
+    provably rejected (learned in app.decode_health from player-rejected events
+    — probe-sniffed codecs when available, else explicit name declarations).
+    Demoted below every clean candidate, never removed: another player may
+    handle it, and it still surfaces as a last resort."""
+    return 0 if decode_health.suspect(_stream_text(s),
+                                      s.get("_acodecs") or (),
+                                      s.get("_vcodec_real") or "") else 1
+
+
 def _quality_key(s: dict):
-    # Order: clean-first, then effective resolution, then bitrate, then source
-    # tier, then custom-format score, then size. Three deliberate departures from
-    # Radarr's resolution→source→size order, all from the household's feedback:
-    #  * clean-vs-hardsub is the TOP key, so every release with burned-in foreign
-    #    subtitles (_hardsub) sorts below every clean one regardless of resolution
-    #    — a hardsub 4K loses to a clean 1080p; it only surfaces as a last resort;
+    # Order: decode-ok, clean-first, then effective resolution, then bitrate,
+    # then source tier, then custom-format score, then size. Deliberate
+    # departures from Radarr's resolution→source→size order, all from the
+    # household's feedback:
+    #  * decodability and clean-vs-hardsub are the TOP keys, so a release the
+    #    player provably can't open (_decode_ok) or with burned-in foreign
+    #    subtitles (_hardsub) sorts below every clean one regardless of
+    #    resolution — it only surfaces as a last resort;
     #  * resolution is the bitrate-*capped* effective one (_effective_resolution),
     #    so a starved fake/upscaled 4K can't win on nominal pixels; and
     #  * bitrate (_qbps: true video bitrate when known, else overall) outranks the
@@ -828,8 +847,8 @@ def _quality_key(s: dict):
     # audio_ok is the very top key: a wrong-language dub (no English, no original)
     # sorts below everything acceptable, whatever its resolution — you can't watch
     # a 4K you don't understand.
-    return (_audio_ok(s), clean, res, qbps, _source_rank(s), _cf_score(s),
-            _size_bytes(s) or 0)
+    return (_audio_ok(s), _decode_ok(s), clean, res, qbps, _source_rank(s),
+            _cf_score(s), _size_bytes(s) or 0)
 
 
 # ── delivery-aware ranking of *verified* streams ─────────────────────────────
@@ -864,10 +883,10 @@ def _delivery_key(qkey: tuple, ttfb: float, speed: float):
     tie, then source tier and custom-format score) and only then fall to
     throughput, so 'when quality is similar, pick the faster-streaming one'.
     Exact bitrate and size are last, purely deterministic tie-breaks."""
-    audio, clean, res, qbps, srank, cf, size = qkey
+    audio, decode, clean, res, qbps, srank, cf, size = qkey
     good_start = 1 if ttfb <= GOOD_TTFB else 0
-    return (audio, clean, good_start, res, _qbps_bucket(qbps), srank, cf, speed,
-            qbps, size)
+    return (audio, decode, clean, good_start, res, _qbps_bucket(qbps), srank,
+            cf, speed, qbps, size)
 
 
 def _verified_key(vr: tuple):

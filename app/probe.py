@@ -13,21 +13,28 @@ through remuxes that will stall.
 
 import asyncio
 import logging
+import os
 import re
 import secrets
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from urllib.parse import urljoin
 
 import httpx
 
-from app import telemetry, usenet_health
+from app import telemetry, usenet_health, vprobe
 
 logger = logging.getLogger("stream-picker")
 
 PROBE_BYTES = 4 * 1024 * 1024  # how much of the file to actually pull
 SAFETY_FACTOR = 1.5            # required headroom over the file's bitrate
 MIN_SPEED_BPS = 2_500_000      # floor when the file size is unknown
+# Identify a passing stream's real codecs from the bytes the probe already
+# pulled (ffprobe on the file head) — feeds the learned decode-compatibility
+# demotion (app.decode_health) so files a player provably can't open stop
+# ranking first. ~50ms per *passed* probe; skipped when ffprobe is absent.
+CODEC_SNIFF = os.environ.get("PROBE_CODEC_SNIFF", "1") not in ("0", "false", "")
+_SNIFF_BYTES = 2 * 1024 * 1024
 
 _client = httpx.AsyncClient(
     follow_redirects=True,
@@ -52,6 +59,11 @@ class ProbeResult:
     media_bps: float = 0.0   # declared BANDWIDTH (bits/s), 0 = unknown
     media_height: int = 0    # declared RESOLUTION height, 0 = unknown
     media_codecs: str = ""   # declared CODECS string, "" = unknown
+    # Measured codecs, ffprobe'd from the probe's own bytes (direct files only;
+    # HLS variants declare theirs above). Feeds decode-compatibility demotion.
+    acodecs: tuple = ()      # audio codec names, () = not sniffed
+    vcodec: str = ""         # video codec name, "" = not sniffed
+    head: bytes = field(default=b"", repr=False)   # transient; cleared by probe()
 
 
 def _required_bps(need_bps: float | None) -> float:
@@ -155,8 +167,16 @@ def _hls_variant_info(text: str) -> dict:
 
 async def probe(url: str, need_bps: float | None, ttfb_max: float) -> ProbeResult:
     """need_bps is the file's real bitrate (size/runtime) or None if unknown."""
-    return await _probe_url(url, _required_bps(need_bps), ttfb_max,
-                            time.monotonic(), hops=0)
+    r = await _probe_url(url, _required_bps(need_bps), ttfb_max,
+                         time.monotonic(), hops=0)
+    if r.ok and r.head and CODEC_SNIFF and vprobe.enabled():
+        try:
+            ac, vc = await vprobe.codecs_of(r.head)
+            r.acodecs, r.vcodec = tuple(ac), vc
+        except Exception:
+            pass
+    r.head = b""            # transient sniff buffer — never leaves this module
+    return r
 
 
 async def _probe_url(url: str, required: float, ttfb_max: float,
@@ -188,6 +208,7 @@ async def _probe_url(url: str, required: float, ttfb_max: float,
             head = b""
             is_playlist = False
             body = bytearray()
+            sniff = bytearray()      # file head kept for codec identification
             async for chunk in resp.aiter_bytes():
                 now = time.monotonic()
                 if t_first is None:
@@ -216,6 +237,8 @@ async def _probe_url(url: str, required: float, ttfb_max: float,
                         return ProbeResult(False, ttfb=t_first - t0, **ni,
                                            reason="playlist too large")
                     continue
+                if hops == 0 and len(sniff) < _SNIFF_BYTES:
+                    sniff += chunk
                 if got >= PROBE_BYTES:
                     break
                 # sustained-throughput bail-out: if we're this far in and
@@ -262,6 +285,7 @@ async def _probe_url(url: str, required: float, ttfb_max: float,
                 )
             else:
                 return ProbeResult(True, ttfb=ttfb, speed_bps=speed, **ni,
+                                   head=bytes(sniff) if hops == 0 else b"",
                                    **(media or {}))
     except asyncio.CancelledError:
         raise
