@@ -158,6 +158,7 @@ class PrefetchCacheRegressionTests(unittest.IsolatedAsyncioTestCase):
             nxt = f"tt9999999:1:{i}"
             with self.subTest(kind=kind), \
                     mock.patch.object(picker, "_cache", {}), \
+                    mock.patch.object(picker, "_background", {}), \
                     mock.patch.object(picker, "_prefetching", set()), \
                     mock.patch.object(
                         picker, "_next_episode",
@@ -165,27 +166,104 @@ class PrefetchCacheRegressionTests(unittest.IsolatedAsyncioTestCase):
                     mock.patch.object(
                         picker, "pick",
                         new=mock.AsyncMock(
+                            return_value=[picker._notice_stream(kind)])), \
+                    mock.patch.object(
+                        picker, "pick_slow",
+                        new=mock.AsyncMock(
                             return_value=[picker._notice_stream(kind)])):
                 await picker.prefetch_next(
                     "series", "tt9999999:1:1", "fast")
 
                 self.assertEqual({}, picker._cache)
 
-    async def test_fast_prefetch_primes_only_fast_picker_key(self) -> None:
+    async def test_prefetch_primes_both_picker_caches_viewers_first(self) -> None:
         nxt = "tt9999999:1:2"
         stream = _stream("Show.S01E02.1080p.WEB-DL-GOOD.mkv")
+        order: list[str] = []
+
+        async def fast_pick(media, media_id, profile):
+            order.append("fast")
+            return [dict(stream)]
+
+        async def slow_pick(media, media_id, profile):
+            order.append("slow")
+            return [dict(stream)]
+
         with mock.patch.object(picker, "_cache", {}), \
+                mock.patch.object(picker, "_background", {}), \
                 mock.patch.object(picker, "_prefetching", set()), \
                 mock.patch.object(
                     picker, "_next_episode",
                     new=mock.AsyncMock(return_value=nxt)), \
-                mock.patch.object(
-                    picker, "pick",
-                    new=mock.AsyncMock(return_value=[stream])):
-            await picker.prefetch_next(
-                "series", "tt9999999:1:1", "fast")
+                mock.patch.object(picker, "pick", new=fast_pick), \
+                mock.patch.object(picker, "pick_slow", new=slow_pick):
+            await picker.prefetch_next("series", "tt9999999:1:1", "slow")
 
-            self.assertEqual({f"full:series:{nxt}"}, set(picker._cache))
+            self.assertEqual({f"full:series:{nxt}",
+                              f"slow:full:series:{nxt}"}, set(picker._cache))
+            self.assertEqual(["slow", "fast"], order)
+
+    async def test_prefetch_waits_for_current_episode_work(self) -> None:
+        nxt = "tt9999999:1:2"
+        current_finisher = asyncio.create_task(asyncio.sleep(0.05))
+        finisher_done_at_pick: list[bool] = []
+
+        async def a_pick(media, media_id, profile):
+            finisher_done_at_pick.append(current_finisher.done())
+            return [dict(_stream("Show.S01E02.1080p.WEB-DL-GOOD.mkv"))]
+
+        with mock.patch.object(picker, "_cache", {}), \
+                mock.patch.object(
+                    picker, "_background",
+                    {"full:series:tt9999999:1:1": current_finisher}), \
+                mock.patch.object(picker, "_prefetching", set()), \
+                mock.patch.object(picker, "_PREFETCH_QUIESCE_POLL", 0.01), \
+                mock.patch.object(
+                    picker, "_next_episode",
+                    new=mock.AsyncMock(return_value=nxt)), \
+                mock.patch.object(picker, "pick", new=a_pick), \
+                mock.patch.object(picker, "pick_slow", new=a_pick):
+            await picker.prefetch_next("series", "tt9999999:1:1", "fast")
+
+        self.assertEqual([True, True], finisher_done_at_pick)
+
+    async def test_prefetch_quiesce_wait_is_capped(self) -> None:
+        nxt = "tt9999999:1:2"
+        never_done: asyncio.Future = asyncio.get_event_loop().create_future()
+        picked = mock.AsyncMock(
+            return_value=[dict(_stream("Show.S01E02.1080p.WEB-DL-GOOD.mkv"))])
+        try:
+            with mock.patch.object(picker, "_cache", {}), \
+                    mock.patch.object(
+                        picker, "_background",
+                        {"full:series:tt9999999:1:1": never_done}), \
+                    mock.patch.object(picker, "_prefetching", set()), \
+                    mock.patch.object(picker, "_PREFETCH_QUIESCE_POLL", 0.01), \
+                    mock.patch.object(picker, "_PREFETCH_QUIESCE_MAX", 0.03), \
+                    mock.patch.object(
+                        picker, "_next_episode",
+                        new=mock.AsyncMock(return_value=nxt)), \
+                    mock.patch.object(picker, "pick", new=picked), \
+                    mock.patch.object(picker, "pick_slow", new=picked):
+                await picker.prefetch_next("series", "tt9999999:1:1", "fast")
+
+            self.assertEqual(2, picked.await_count)
+        finally:
+            never_done.cancel()
+
+    async def test_hls_real_play_fires_next_episode_prefetch(self) -> None:
+        from app import hlsproxy, proxy
+        entry = {"id": "tt9999999:1:1", "picker": "slow"}
+        st = {"flushed": False, "t0": 0.0, "segs": 0, "bytes": 0,
+              "last": 0.0, "credited": False}
+        with mock.patch.object(proxy, "PREFETCH_NEXT", True), \
+                mock.patch.object(
+                    proxy, "_fire_prefetch", new=mock.AsyncMock()) as fired:
+            for _ in range(3):
+                hlsproxy._note_segment("tok", entry, st, 1024)
+            await asyncio.sleep(0)
+            self.assertTrue(entry.get("nextfetched"))
+            fired.assert_awaited_once_with("tt9999999:1:1", "slow")
 
 
 class FailureDetailTelemetryTests(unittest.TestCase):

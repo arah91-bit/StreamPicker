@@ -2492,12 +2492,31 @@ async def _next_episode(media_id: str) -> str | None:
     return f"{base}:{se[0]}:{se[1]}" if se else None
 
 
+_PREFETCH_QUIESCE_POLL = 5.0
+_PREFETCH_QUIESCE_MAX = 600.0
+
+
+def _episode_work_active(media: str, media_id: str) -> bool:
+    """Whether the playing episode's own search work is still running.
+
+    The fast/slow background finishers and the nzb lane's mounts own the
+    probe slots, NNTP connections, and indexer quota; the prefetch must not
+    compete with them for a result the viewer needs twenty minutes from now.
+    """
+    suffix = f":{media}:{media_id}"
+    if any(key.endswith(suffix) and not task.done()
+           for key, task in _background.items()):
+        return True
+    return nzb_lane.in_progress(media, media_id)
+
+
 async def prefetch_next(media: str, media_id: str, picker_label: str) -> None:
     """Search-and-cache the next episode — fired by the proxy the moment a series
-    episode starts playing. Runs the same picker the viewer is on for episode
-    E+1, so its full search + verification lands in both pickers' result caches;
-    opening the next episode is then an instant cache hit with a verified #1.
-    Caches only the picked result list — no stream bytes are downloaded (the
+    episode starts playing. Waits for the playing episode's own search work to
+    finish, then runs BOTH pickers for episode E+1 (the viewer's first), so its
+    full search + verification lands in both result caches; opening the next
+    episode is an instant cache hit with a verified #1 on either addon.
+    Caches only the picked result lists — no stream bytes are downloaded (the
     verification probes' few MB are the only transfer). Best-effort, deduped per
     next-episode id."""
     nxt = await _next_episode(media_id)
@@ -2507,30 +2526,47 @@ async def prefetch_next(media: str, media_id: str, picker_label: str) -> None:
     try:
         profile = "mobile" if "mob" in (picker_label or "") else "full"
         slow = "slow" in (picker_label or "")
+        deadline = time.monotonic() + _PREFETCH_QUIESCE_MAX
+        while (_episode_work_active(media, media_id)
+               and time.monotonic() < deadline):
+            await asyncio.sleep(_PREFETCH_QUIESCE_POLL)
         # Attribute the prefetch's probes to the episode being prepped, not the
         # one currently playing.
         telemetry.request_ctx.set({"media": media, "media_id": nxt,
                                    "picker": (picker_label or "") + "/prefetch"})
-        streams = await (pick_slow if slow else pick)(media, nxt, profile)
-        if not streams:
-            logger.info(f"prefetch: no streams for next episode {nxt}")
-            return
-        # Notices deliberately have short, separately-managed lifetimes. Putting
-        # one in the normal result cache turns a transient check/download state
-        # into a six-hour answer, and a fast prefetch has no slow-key finisher to
-        # replace the copy it would leave behind.
-        if _contains_notice(streams):
-            kind = streams[0].get(_NOTICE_STATE_KEY, "notice")
-            logger.info(f"prefetch: next episode {nxt} still {kind}; not caching")
-            return
-        # Preserve picker semantics: a fast prefetch must not freeze its early
-        # delivery-ranked answer into the slow best-quality cache (or vice
-        # versa). Raw source and verification evidence are already shared.
-        target = (f"slow:{profile}:{media}:{nxt}" if slow
-                  else f"{profile}:{media}:{nxt}")
-        _store(target, streams)
-        top = " ".join((streams[0].get("name") or "").split())[:40]
-        logger.info(f"prefetch: cached next episode {nxt} — #1 {top!r}")
+        # Both pickers, viewer's first: Stremio installs both addons and shows
+        # both lists on the next open, so a prefetch that primes only one
+        # leaves the other re-running its whole merge in the viewer's face.
+        # Each result goes only to its own key — a fast delivery-ranked answer
+        # must not freeze into the slow best-quality cache (or vice versa);
+        # raw source and verification evidence are already shared, so the
+        # second pick reuses the first one's searches and probes.
+        pickers = [("slow", pick_slow), ("fast", pick)]
+        if not slow:
+            pickers.reverse()
+        cached = []
+        for kind, one_pick in pickers:
+            streams = await one_pick(media, nxt, profile)
+            if not streams:
+                logger.info(f"prefetch: no streams for next episode {nxt} "
+                            f"({kind})")
+                continue
+            # Notices deliberately have short, separately-managed lifetimes.
+            # Putting one in the normal result cache turns a transient
+            # check/download state into a six-hour answer.
+            if _contains_notice(streams):
+                state = streams[0].get(_NOTICE_STATE_KEY, "notice")
+                logger.info(f"prefetch: next episode {nxt} still {state} "
+                            f"({kind}); not caching")
+                continue
+            target = (f"slow:{profile}:{media}:{nxt}" if kind == "slow"
+                      else f"{profile}:{media}:{nxt}")
+            _store(target, streams)
+            top = " ".join((streams[0].get("name") or "").split())[:40]
+            cached.append(f"{kind} #1 {top!r}")
+        if cached:
+            logger.info(f"prefetch: cached next episode {nxt} — "
+                        + "; ".join(cached))
     except Exception:
         logger.exception(f"prefetch: failed for {media_id}")
     finally:
