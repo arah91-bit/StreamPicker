@@ -71,15 +71,16 @@ class HlsHelperTests(unittest.TestCase):
         self.assertEqual(2160, info["media_height"])
         self.assertIn("hvc1", info["media_codecs"])
 
-    def test_variant_info_reads_the_first_uri_not_the_best(self):
+    def test_variant_info_selects_the_best_declared_variant(self):
         master = ('#EXTM3U\n'
                   '#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720\n'
                   'low.m3u8\n'
                   '#EXT-X-STREAM-INF:BANDWIDTH=16000000,RESOLUTION=3840x2160\n'
                   'high.m3u8\n')
         info = probe._hls_variant_info(master)
-        self.assertEqual(2_500_000.0, info["media_bps"])
-        self.assertEqual(720, info["media_height"])
+        self.assertEqual(16_000_000.0, info["media_bps"])
+        self.assertEqual(2160, info["media_height"])
+        self.assertEqual("high.m3u8", probe._hls_first_uri(master))
 
     def test_media_playlist_declares_nothing(self):
         media = "#EXTM3U\n#EXTINF:6.0,\nseg-000.ts\n"
@@ -206,6 +207,21 @@ class HlsProbeDescentTests(unittest.TestCase):
         self.assertFalse(r.ok)
         self.assertIn("not video", r.reason)
 
+    def test_tiny_plaintext_hls_segment_is_not_verified(self):
+        base = "https://cdn.example/bad.m3u8"
+        segment = "https://cdn.example/forbidden.ts"
+        client = _FakeClient({
+            base: _FakeResponse(
+                200, {"content-type": "application/vnd.apple.mpegurl"},
+                [b"#EXTM3U\n#EXTINF:6.0,\nforbidden.ts\n"], base),
+            segment: _FakeResponse(
+                200, {"content-type": "text/plain"}, [b"Forbidden"], segment),
+        })
+        probe._client = client
+        r = self._run(probe.probe(base, None, ttfb_max=10))
+        self.assertFalse(r.ok)
+        self.assertIn("not media", r.reason)
+
     def test_direct_file_short_body_still_fails(self):
         # the segment tolerance must not weaken the missing-articles detector
         url = "https://dav.example/content/movie.mkv"
@@ -216,6 +232,29 @@ class HlsProbeDescentTests(unittest.TestCase):
         r = self._run(probe.probe(url, None, ttfb_max=10))
         self.assertFalse(r.ok)
         self.assertIn("short body", r.reason)
+
+    def test_slow_deep_check_validates_middle_and_tail_ranges(self):
+        url = "https://dav.example/content/movie.mkv"
+        total = 64 * 1024 * 1024
+
+        class RangeClient:
+            def __init__(self):
+                self.ranges = []
+
+            def stream(self, method, requested, headers=None, timeout=None):
+                value = headers["Range"]
+                self.ranges.append(value)
+                start, end = map(int, value.removeprefix("bytes=").split("-"))
+                body = b"x" * (end - start + 1)
+                return _FakeStream(_FakeResponse(
+                    206, {"content-range": f"bytes {start}-{end}/{total}"},
+                    [body], requested))
+
+        client = RangeClient()
+        probe._client = client
+        reason = self._run(probe._probe_spots(url, total, 10, {}))
+        self.assertEqual("", reason)
+        self.assertEqual(2, len(client.ranges))
 
 
 if __name__ == "__main__":

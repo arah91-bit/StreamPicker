@@ -10,6 +10,7 @@ of 'X buffered last night' can be checked against what we auto-picked for it.
 
 import html
 import os
+from urllib.parse import quote
 
 from app import adminui, reputation, telemetry, usenet_health
 
@@ -261,16 +262,29 @@ def _nzb_indexer_table() -> str:
     rows = usenet_health.indexer_listing()
     if not rows:
         return ""
-    body = "".join(
-        f"<tr><td class='k1'>{_esc(r['name'])}</td>"
-        f"<td>{r['score']:.3f}</td><td>{r['samples']}</td></tr>" for r in rows)
+    body = []
+    for r in rows:
+        allowed = r.get("fetch_allowed", True)
+        state = ("ready" if allowed else
+                 "<span class='bad'>FETCH BLOCKED</span>")
+        clear = ("" if allowed else
+                 f"<a href='/api/nzb-indexer/clear?name="
+                 f"{quote(r['name'], safe='')}'>retry</a>")
+        body.append(
+            f"<tr><td class='k1'>{_esc(r['name'])}</td>"
+            f"<td>{r['score']:.3f}</td><td>{r['samples']}</td>"
+            f"<td>{r.get('fetch_ok', 0):g}/{r.get('fetch_fail', 0):g}</td>"
+            f"<td>{state}</td><td>{clear}</td></tr>")
     return (
         "<h2>Direct usenet — learned indexer order</h2>"
         "<div class='note'>Bayesian-smoothed, time-decayed evidence from search, "
         "NZB fetch, probe, and playback outcomes. Higher-scoring indexers supply "
-        "the first mount candidates; all indexers are still searched in parallel.</div>"
+        "the first mount candidates; all indexers are still searched in parallel. "
+        "An endpoint with zero successful NZB downloads after sustained failures "
+        "is persistently suppressed; use retry after repairing its account/plan.</div>"
         "<div class='scroll'><table><thead><tr><th>indexer</th><th>score</th>"
-        f"<th>evidence</th></tr></thead><tbody>{body}</tbody></table></div>")
+        "<th>evidence</th><th>NZB fetch ok/fail</th><th>fetch state</th><th></th>"
+        f"</tr></thead><tbody>{''.join(body)}</tbody></table></div>")
 
 
 def _nzb_failure_table(recs: list[dict]) -> str:

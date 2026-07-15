@@ -62,9 +62,26 @@ class ReleaseKeyTests(unittest.TestCase):
         self.assertNotEqual(one, next_ep)
         self.assertNotEqual(one, different_file)
 
+    def test_scoped_release_key_isolates_same_name_titles_and_episodes(self) -> None:
+        title = "The.Office.S01E01.1080p.WEB-DL-GROUP"
+        size = 4_000_000_000
+        uk = release_key(title, size, "series", "tt0290978:1:1")
+        us = release_key(title, size, "series", "tt0386676:1:1")
+        next_episode = release_key(title, size, "series", "tt0290978:1:2")
+        movie = release_key(title, size, "movie", "tt0290978")
+
+        self.assertEqual(4, len({uk, us, next_episode, movie}))
+        self.assertEqual(
+            uk, release_key(title, size, "tv", "tt0290978:01:001"))
+        self.assertEqual(
+            uk, release_key(title, size, "series", "tt290978:1:1"))
+        # Legacy two-argument identity remains stable for existing databases.
+        self.assertEqual(release_key(title, size), release_key(title, size))
+
     def test_probe_reason_classification_separates_decisive_and_transient(self) -> None:
         for reason in ("missing articles", "MISSING ARTICLES", "HTTP 404",
-                       "not-video", "not-media"):
+                       "not-video", "not-media", "wrong-title", "wrong-year",
+                       "wrong-imdb", "wrong-season"):
             with self.subTest(reason=reason):
                 self.assertEqual("hard", classify_reason(reason))
 
@@ -150,6 +167,32 @@ class HealthStoreTests(unittest.TestCase):
         self.assertEqual(first_samples,
                          self.store.indexer_samples("NZBgeek"))
 
+    def test_old_attempt_remains_idempotent_after_many_newer_attempts(self) -> None:
+        self._probe(ok=False, reason="missing articles", attempt_id="oldest")
+        for i in range(12):
+            self._probe(ok=False, reason="HTTP 502",
+                        attempt_id=f"newer-{i}")
+        before = self.store.release_status(self.key)
+        before_samples = self.store.indexer_samples("NZBgeek")
+
+        # The former eight-marker cap evicted "oldest" here and replaying it
+        # produced another indexer sample (and potentially another hard strike).
+        self._probe(ok=False, reason="missing articles", attempt_id="oldest")
+
+        self.assertEqual(before, self.store.release_status(self.key))
+        self.assertEqual(before_samples,
+                         self.store.indexer_samples("NZBgeek"))
+
+    def test_transient_failure_cannot_shorten_hard_retry(self) -> None:
+        self._probe(ok=False, reason="missing articles", attempt_id="hard")
+        hard_retry = _field(self.store.release_status(self.key), "retry_at")
+        self.clock.advance(60)
+
+        self._probe(ok=False, reason="HTTP 502", attempt_id="transient")
+
+        self.assertGreaterEqual(
+            _field(self.store.release_status(self.key), "retry_at"), hard_retry)
+
     def test_first_hard_failure_cools_down_second_separated_failure_blocks(self) -> None:
         self._probe(ok=False, reason="missing articles", attempt_id="try-1")
         first = self.store.release_status(self.key)
@@ -230,8 +273,14 @@ class HealthStoreTests(unittest.TestCase):
             self.store.record_fetch("goodfetch", True)
         self.assertLess(self.store.fetch_score("deadfetch"), 0.1)
         self.assertGreater(self.store.fetch_score("goodfetch"), 0.8)
+        self.assertFalse(self.store.fetch_allowed("deadfetch"))
+        self.assertTrue(self.store.fetch_allowed("goodfetch"))
+        self.store.clear_fetch_health("deadfetch")
+        self.assertTrue(self.store.fetch_allowed("deadfetch"))
+        self.assertEqual(0.5, self.store.fetch_score("deadfetch"))
         # cold start stays neutral so new indexers aren't punished
         self.assertEqual(0.5, self.store.fetch_score("brand-new"))
+        self.assertTrue(self.store.fetch_allowed("brand-new"))
 
     def test_search_and_fetch_evidence_contributes_to_indexer_learning(self) -> None:
         for _ in range(5):

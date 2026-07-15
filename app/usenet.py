@@ -1,9 +1,9 @@
 """Direct usenet lane: search the household's Newznab indexers in parallel and
 turn the promising releases into streamable URLs through nzbdav.
 
-Why this exists: Usenet Ultimate (the upstream addon) answers slowly and its
-health tags proved unreliable — only ~40% of usenet releases actually play, but
-the ones that do are often the best available quality. This lane makes usenet
+Why this exists: generic upstream Usenet addons answer slowly and their health
+tags proved unreliable — only ~40% of releases actually play, but the ones that
+do are often the best available quality. This direct lane makes usenet
 fast enough to race the debrid sources and cheap enough to verify honestly:
 
   1. Search all indexers concurrently (Newznab API, ~1-3s each).
@@ -25,6 +25,7 @@ import hashlib
 import logging
 import os
 import re
+import secrets
 import time
 import xml.etree.ElementTree as ET
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
@@ -57,11 +58,6 @@ MOUNT_RETURN_WANT = int(os.environ.get("NZB_MOUNT_RETURN_WANT", "1"))
 MOUNT_EARLY_WAIT = float(os.environ.get("NZB_MOUNT_EARLY_WAIT", "30"))
 MOUNT_STAGGER = float(os.environ.get("NZB_MOUNT_STAGGER", "1.5"))
 IMPORT_CONCURRENCY = max(1, int(os.environ.get("NZB_IMPORT_CONCURRENCY", "2")))
-# A healthy import has completed in roughly 100s on this deployment.  Keep its
-# scarce submit slot long enough to avoid building a server-side queue; release
-# the slot eventually if the item is dead while its mount poll continues.
-IMPORT_SLOT_HOLD = float(os.environ.get("NZB_IMPORT_SLOT_HOLD", "150"))
-
 # Reserve early mount slots for encodes whose size is plausibly deliverable,
 # while still importing the largest remuxes for the slow/background quality
 # pass.  These are selection targets, not hard caps.
@@ -99,34 +95,139 @@ def _stream_base() -> str:
 
 # ── Newznab search ───────────────────────────────────────────────────────────
 
-def _parse_items(text: str) -> list[dict]:
-    """Newznab XML → [{title, size, link}]. XML is the one format every indexer
-    speaks (JSON support varies), so parse that only."""
-    out = []
+class _SearchRows(list):
+    """List-compatible search result carrying success/failure separately."""
+
+    def __init__(self, values=(), *, ok: bool = True, detail: str = ""):
+        super().__init__(values)
+        self.ok = ok
+        self.detail = detail
+
+
+class _ReleaseRows(list):
+    """List-compatible aggregate used by the lane outcome diagnostics."""
+
+    search_ok = 0
+    search_failed = 0
+
+
+def _local_name(tag: object) -> str:
+    value = str(tag or "")
+    return value.rsplit("}", 1)[-1].strip().lower()
+
+
+def _child_text(node: ET.Element, name: str) -> str:
+    wanted = name.lower()
+    for child in node:
+        if _local_name(child.tag) == wanted:
+            return (child.text or "").strip()
+    return ""
+
+
+_NEWZNAB_IDENTITY_ATTRS = {
+    "imdb": "imdb", "imdbid": "imdb", "imdb_id": "imdb",
+    "season": "season", "tvseason": "season",
+    "episode": "episode", "ep": "episode", "tvepisode": "episode",
+}
+
+
+def _parse_items_diagnostic(text: str) -> tuple[list[dict], tuple[str, str] | None]:
+    """Parse namespace-tolerant Newznab XML and retain safe error shapes."""
     try:
-        root = ET.fromstring(text)
-    except ET.ParseError:
-        return out
-    for item in root.iter("item"):
-        title = (item.findtext("title") or "").strip()
-        link = (item.findtext("link") or "").strip()
+        root = ET.fromstring((text or "").strip())
+    except ET.ParseError as exc:
+        # Line/column and parser class are useful for grouping malformed feeds;
+        # the raw body may contain reflected credentials and is never retained.
+        line, column = getattr(exc, "position", (0, 0))
+        return [], ("invalid-xml", f"ParseError line={line} column={column}")
+
+    for node in root.iter():
+        if _local_name(node.tag) != "error":
+            continue
+        code = re.sub(r"[^A-Za-z0-9_.-]", "", node.get("code") or "")[:40]
+        description = telemetry.sanitize_failure_detail(
+            node.get("description") or (node.text or "").strip(), 500)
+        detail = f"Newznab error code={code or 'unknown'}"
+        if description:
+            detail += f" description={description}"
+        return [], ("newznab-error", detail)
+
+    out = []
+    for item in (node for node in root.iter()
+                 if _local_name(node.tag) == "item"):
+        title = _child_text(item, "title")
+        link = _child_text(item, "link")
         size = 0
-        enc = item.find("enclosure")
-        if enc is not None:
-            link = enc.get("url") or link
+        identity_attrs: dict[str, list[str]] = {}
+        enclosure = next((node for node in item
+                          if _local_name(node.tag) == "enclosure"), None)
+        if enclosure is not None:
+            link = (enclosure.get("url") or link).strip()
             try:
-                size = int(enc.get("length") or 0)
+                size = int((enclosure.get("length") or "0").strip())
             except ValueError:
                 size = 0
         for attr in item.iter():
-            if attr.tag.endswith("attr") and attr.get("name") == "size":
+            if _local_name(attr.tag) != "attr":
+                continue
+            attr_name = (attr.get("name") or "").strip().lower()
+            attr_value = (attr.get("value") or "").strip()
+            if attr_name == "size":
                 try:
-                    size = int(attr.get("value") or 0)
+                    size = int(attr_value or "0")
                 except ValueError:
                     pass
+            identity_name = _NEWZNAB_IDENTITY_ATTRS.get(attr_name)
+            if identity_name and attr_value:
+                values = identity_attrs.setdefault(identity_name, [])
+                bounded = attr_value[:80]
+                if bounded not in values and len(values) < 16:
+                    values.append(bounded)
         if title and link:
-            out.append({"title": title, "size": size, "link": link})
-    return out
+            row = {"title": title, "size": size, "link": link}
+            if identity_attrs:
+                # Private, bounded semantic evidence only.  Raw categories and
+                # arbitrary attrs are deliberately not retained.
+                row["_newznab_identity_attrs"] = identity_attrs
+            out.append(row)
+    return out, None
+
+
+def _parse_items(text: str) -> list[dict]:
+    """Newznab XML → [{title, size, link}]. XML is the one format every indexer
+    speaks (JSON support varies), so parse that only."""
+    return _parse_items_diagnostic(text)[0]
+
+
+def _record_indexer_failure(name: str, *, stage: str, reason: str,
+                            detail: str) -> None:
+    safe = telemetry.sanitize_failure_detail(detail)
+    telemetry.record_usenet_failure(
+        indexers=[name], stage=stage, decision="transient", reason=reason,
+        detail=safe, evidence_id=f"{name}:{stage}:{reason}:{safe}")
+
+
+def _nzb_payload_issue(content: bytes) -> tuple[str, str] | None:
+    """Return a safe, structured reason when a fetch is not valid NZB XML."""
+    try:
+        root = ET.fromstring(content)
+    except ET.ParseError as exc:
+        line, column = getattr(exc, "position", (0, 0))
+        return "invalid-nzb-xml", f"ParseError line={line} column={column}"
+    if _local_name(root.tag) == "nzb":
+        return None
+    error = next((node for node in root.iter()
+                  if _local_name(node.tag) == "error"), None)
+    if error is not None:
+        code = re.sub(r"[^A-Za-z0-9_.-]", "", error.get("code") or "")[:40]
+        description = telemetry.sanitize_failure_detail(
+            error.get("description") or (error.text or "").strip(), 500)
+        detail = f"Newznab error code={code or 'unknown'}"
+        if description:
+            detail += f" description={description}"
+        return "newznab-error", detail
+    tag = re.sub(r"[^a-z0-9_.-]", "", _local_name(root.tag))[:40]
+    return "non-nzb", f"unexpected XML root={tag or 'unknown'}"
 
 
 async def _search_one(name: str, base: str, key: str, params: dict) -> list[dict]:
@@ -135,13 +236,21 @@ async def _search_one(name: str, base: str, key: str, params: dict) -> list[dict
         r = await _client.get(base, params={**params, "apikey": key},
                               timeout=SEARCH_TIMEOUT)
         r.raise_for_status()
-        items = _parse_items(r.text)
+        items, issue = _parse_items_diagnostic(r.text)
+        if issue:
+            reason, detail = issue
+            usenet_health.record_search(name, False, results=0,
+                                        latency=time.monotonic() - t0)
+            _record_indexer_failure(
+                name, stage="newznab-search", reason=reason, detail=detail)
+            logger.info(f"nzb search {name} failed: {detail[:120]}")
+            return _SearchRows(ok=False, detail=detail)
         for it in items:
             it["indexer"] = name
         usenet_health.record_search(name, True, results=len(items),
                                     latency=time.monotonic() - t0)
         logger.info(f"nzb search {name}: {len(items)} results")
-        return items
+        return _SearchRows(items, ok=True)
     except Exception as e:
         usenet_health.record_search(name, False,
                                     latency=time.monotonic() - t0)
@@ -149,12 +258,94 @@ async def _search_one(name: str, base: str, key: str, params: dict) -> list[dict
         # Log only the exception class/status, never the URL-bearing message.
         status = getattr(getattr(e, "response", None), "status_code", None)
         detail = f" HTTP {status}" if status else ""
+        reason, shape = _exception_failure(e)
+        _record_indexer_failure(
+            name, stage="newznab-search", reason=reason, detail=shape)
         logger.info(f"nzb search {name} failed: {type(e).__name__}{detail}")
-        return []
+        return _SearchRows(ok=False, detail=shape)
 
 
 def _norm(t: str) -> str:
     return re.sub(r"[^a-z0-9]", "", (t or "").lower())
+
+
+_IMDB_VALUE_RE = re.compile(r"^(?:tt)?(\d+)$", re.I)
+
+
+def _canonical_imdb(value: object) -> str:
+    match = _IMDB_VALUE_RE.fullmatch(str(value or "").strip())
+    if not match:
+        return ""
+    digits = match.group(1).lstrip("0") or "0"
+    return f"tt{digits}"
+
+
+def _identity_number(value: object, prefix: str) -> int | None:
+    raw = str(value or "").strip()
+    match = re.fullmatch(rf"(?:{prefix})?0*(\d+)", raw, re.I)
+    return int(match.group(1)) if match else None
+
+
+def _identity_attr_values(attrs: dict, key: str) -> list[object]:
+    values = attrs.get(key) or []
+    if isinstance(values, (str, int)):
+        return [values]
+    if isinstance(values, (list, tuple, set)):
+        return list(values)[:16]
+    return []
+
+
+def _newznab_identity_evidence(
+        item: dict, media: str, media_id: str,
+        ) -> tuple[bool, bool, list[str], str]:
+    """Validate optional Newznab semantic attrs against the exact request.
+
+    Returns ``(contradiction, fully_trusted, evidence, reason)``.  Malformed
+    optional attrs are ignored rather than treated as proof; any *valid* value
+    which contradicts the request rejects the item even when another value
+    happens to match it.
+    """
+    attrs = item.get("_newznab_identity_attrs") or {}
+    if not isinstance(attrs, dict):
+        return False, False, [], ""
+    parts = media_id.split(":")
+    expected_imdb = _canonical_imdb(parts[0])
+    evidence: list[str] = []
+
+    imdb_values = {_canonical_imdb(v)
+                   for v in _identity_attr_values(attrs, "imdb")}
+    imdb_values.discard("")
+    if imdb_values and imdb_values != {expected_imdb}:
+        return True, False, ["newznab-imdb-mismatch"], "wrong-imdb"
+    imdb_exact = bool(expected_imdb and imdb_values == {expected_imdb})
+    if imdb_exact:
+        evidence.append("newznab-imdb")
+
+    season_values = {_identity_number(v, "s")
+                     for v in _identity_attr_values(attrs, "season")}
+    season_values.discard(None)
+    episode_values = {_identity_number(v, "e")
+                      for v in _identity_attr_values(attrs, "episode")}
+    episode_values.discard(None)
+    if media == "movie":
+        if season_values or episode_values:
+            return True, False, evidence + ["newznab-tv-attrs"], "wrong-media"
+        return False, imdb_exact, evidence, ""
+
+    if len(parts) != 3 or not parts[1].isdigit() or not parts[2].isdigit():
+        return True, False, evidence, "wrong-episode"
+    expected_season, expected_episode = int(parts[1]), int(parts[2])
+    if season_values and season_values != {expected_season}:
+        return True, False, evidence + ["newznab-season-mismatch"], "wrong-season"
+    if episode_values and episode_values != {expected_episode}:
+        return True, False, evidence + ["newznab-episode-mismatch"], "wrong-episode"
+    season_exact = season_values == {expected_season}
+    episode_exact = episode_values == {expected_episode}
+    if season_exact:
+        evidence.append("newznab-season")
+    if episode_exact:
+        evidence.append("newznab-episode")
+    return False, bool(imdb_exact and season_exact and episode_exact), evidence, ""
 
 
 async def _expected_info(media: str, media_id: str) -> tuple[list[str], int | None]:
@@ -254,10 +445,20 @@ async def search(media: str, media_id: str) -> list[dict]:
     if not expected_titles:
         logger.info(f"nzb search {media_id}: no authoritative title; skipping lane")
         return []
-    releases, seen, dropped, suppressed = [], {}, 0, 0
+    releases = _ReleaseRows()
+    releases.search_ok = sum(1 for rows in results
+                             if getattr(rows, "ok", True))
+    releases.search_failed = len(results) - releases.search_ok
+    seen, dropped, attr_dropped, suppressed = {}, 0, 0, 0
     for lst in results:
         for it in lst:
             nt = _norm(it["title"])
+            contradiction, attrs_trusted, attr_evidence, _ = (
+                _newznab_identity_evidence(it, media, media_id))
+            if contradiction:
+                dropped += 1
+                attr_dropped += 1
+                continue
             if not any(_release_title_match(it["title"], title)
                        for title in expected_titles):
                 dropped += 1
@@ -275,26 +476,75 @@ async def search(media: str, media_id: str) -> list[dict]:
             if not _mountable_release(it["title"]):
                 dropped += 1
                 continue
-            key = usenet_health.release_key(it["title"], it["size"])
+            key = usenet_health.release_key(
+                it["title"], it["size"], media, media_id)
+            legacy_key = usenet_health.release_key(it["title"], it["size"])
             if key and usenet_health.should_skip(key):
                 suppressed += 1
                 continue
             # Exact full-title + exact-size identity.  Preserve every offering
             # indexer so alternate downloads and learned attribution stay true.
             dedup = key or f"raw:{nt}:{it['size']}"
-            offer = {"indexer": it["indexer"], "link": it["link"]}
+            offer = {"indexer": it["indexer"], "link": it["link"],
+                     "_nzb_identity_trusted": attrs_trusted,
+                     "_nzb_identity_evidence": attr_evidence}
             if dedup in seen:
-                if offer not in seen[dedup]["offers"]:
+                duplicate_offer = next((o for o in seen[dedup]["offers"]
+                                        if o.get("indexer") == it["indexer"]
+                                        and o.get("link") == it["link"]), None)
+                if duplicate_offer is None:
                     seen[dedup]["offers"].append(offer)
+                else:
+                    duplicate_offer["_nzb_identity_trusted"] = bool(
+                        duplicate_offer.get("_nzb_identity_trusted")
+                        or attrs_trusted)
+                    old_evidence = list(
+                        duplicate_offer.get("_nzb_identity_evidence") or [])
+                    duplicate_offer["_nzb_identity_evidence"] = list(
+                        dict.fromkeys(old_evidence + attr_evidence))
+                if attrs_trusted:
+                    seen[dedup]["_nzb_attrs_trusted"] = True
+                merged = seen[dedup]["_nzb_attr_evidence"]
+                merged[:] = list(dict.fromkeys(merged + attr_evidence))
                 continue
             release = {"title": it["title"], "size": it["size"],
-                       "release_key": key, "offers": [offer]}
+                       "release_key": key, "legacy_release_key": legacy_key,
+                       "offers": [offer],
+                       "_nzb_attrs_trusted": attrs_trusted,
+                       "_nzb_attr_evidence": list(attr_evidence),
+                       "_nzb_expected": {
+                           "media": media,
+                           "media_id": media_id,
+                           "titles": list(expected_titles),
+                           "year": expected_year,
+                       }}
             seen[dedup] = release
             releases.append(release)
     if dropped:
         logger.info(f"nzb search {media_id}: dropped {dropped} wrong-title results")
+    if attr_dropped:
+        logger.info(f"nzb search {media_id}: rejected {attr_dropped} "
+                    "Newznab identity contradictions")
     if suppressed:
         logger.info(f"nzb search {media_id}: skipped {suppressed} known-bad/cooling results")
+    # Persistently dead download endpoints (an indexer may search perfectly yet
+    # return 403 for every NZB fetch) must not consume a mount slot forever.
+    # Retain a deduplicated release when *any* alternate indexer can still
+    # provide it; remove only the proven-dead offers.
+    fetch_suppressed = 0
+    fetchable = []
+    for release in releases:
+        offers = release.get("offers") or []
+        allowed = [o for o in offers if usenet_health.fetch_allowed(
+            o.get("indexer", ""))]
+        fetch_suppressed += len(offers) - len(allowed)
+        if allowed:
+            release["offers"] = allowed
+            fetchable.append(release)
+    releases[:] = fetchable
+    if fetch_suppressed:
+        logger.info(f"nzb search {media_id}: suppressed {fetch_suppressed} "
+                    "offers from persistently failed NZB endpoints")
     releases.sort(key=_priority, reverse=True)
     return releases
 
@@ -305,6 +555,7 @@ _RES_ORDER = [(re.compile(r"2160p|\b4k\b|\buhd\b", re.I), 3),
 _JUNK_RE = re.compile(
     r"\bsample\b|\.(?:iso|img|exe)\b|\bbdmv\b|\b3d\b|half-?sbs|full-?sbs|"
     r"\bh-?sbs\b|upscal|\bblu-?ray[\s._-]?(?:disc|untouched)\b|"
+    r"\bbd(?:25|50|66|100)\b|\b(?:uhd|blu-?ray)[\s._-]*iso\b|"
     r"\bcomplete\b.*\b(?:uhd|blu-?ray)\b|"
     r"\b(?:uhd|blu-?ray)\b.*\bcomplete\b|\bDV\b.*\bno.?fallback\b",
     re.I,
@@ -441,10 +692,33 @@ def _evidence_token(value: str) -> str:
 def _exception_failure(exc: Exception) -> tuple[str, str]:
     """Credential-safe structured reason plus the exact exception/status shape."""
     name = type(exc).__name__
-    status = getattr(getattr(exc, "response", None), "status_code", None)
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
     if status:
-        return f"http-{status}", f"{name} HTTP {status}"
-    return ("timeout" if "timeout" in name.lower() else "transport", name)
+        return f"http-{status}", f"{name} {_response_failure_detail(response)}"
+    message = telemetry.sanitize_failure_detail(str(exc), 500)
+    detail = name + (f": {message}" if message else "")
+    return ("timeout" if "timeout" in name.lower() else "transport", detail)
+
+
+def _response_failure_detail(response: httpx.Response) -> str:
+    """Credential-safe status/header/body shape without ever retaining its URL."""
+    parts = [f"HTTP {response.status_code}"]
+    for header in ("content-type", "retry-after", "server"):
+        value = telemetry.sanitize_failure_detail(
+            response.headers.get(header, ""), 160)
+        if value:
+            parts.append(f"{header}={value}")
+    raw = response.content[:800]
+    if raw:
+        decoded = raw.decode("utf-8", "replace")
+        printable = sum(char.isprintable() or char.isspace() for char in decoded)
+        if decoded and printable / len(decoded) >= 0.85:
+            shape = re.sub(r"\s+", " ", decoded).strip()
+            shape = telemetry.sanitize_failure_detail(shape, 500)
+            if shape:
+                parts.append(f"body={shape}")
+    return " ".join(parts)
 
 
 def _record_failure_sample(
@@ -492,22 +766,26 @@ async def _dav_list(path: str, release: dict | None = None,
         return None
     if r.status_code >= 400:
         if release is not None:
+            detail = _response_failure_detail(r)
             _record_failure_sample(
                 release, stage="nzbdav-dav", decision="transient",
-                reason=f"http-{r.status_code}", detail=f"HTTP {r.status_code}",
+                reason=f"http-{r.status_code}", detail=detail,
                 evidence=f"list:{_evidence_token(path)}:http-{r.status_code}",
                 seen=failure_seen)
         return None
-    out = []
+    out: list[tuple[str, int]] = []
     try:
         root = ET.fromstring(r.content)
-        for resp in root.iter("{DAV:}response"):
-            href = resp.findtext("{DAV:}href") or ""
+        for resp in (node for node in root.iter()
+                     if _local_name(node.tag) == "response"):
+            href = next(((node.text or "").strip() for node in resp.iter()
+                         if _local_name(node.tag) == "href"), "")
             href = re.sub(r"^https?://[^/]+", "", href)
             size = 0
-            ln = resp.find(".//{DAV:}getcontentlength")
-            if ln is not None and (ln.text or "").isdigit():
-                size = int(ln.text)
+            length = next(((node.text or "").strip() for node in resp.iter()
+                           if _local_name(node.tag) == "getcontentlength"), "")
+            if length.isdigit():
+                size = int(length)
             out.append((href, size))
     except ET.ParseError as exc:
         if release is not None:
@@ -544,40 +822,148 @@ def _history_failure_class(message: str) -> tuple[str, str]:
     return "transient", "transport"
 
 
-async def _history_failure(job: str) -> tuple[str, str, str, str] | None:
+_API_SNAPSHOT_TTL = max(0.2, float(os.environ.get("NZB_API_POLL_TTL", "1.5")))
+_api_snapshot_lock: asyncio.Lock | None = None
+_api_snapshot_loop: asyncio.AbstractEventLoop | None = None
+_api_snapshot_cache: tuple[float, list[dict], list[dict], list[tuple[str, str, str]]] = (
+    0.0, [], [], [])
+
+
+def _api_slots(payload: object, section: str) -> list[dict]:
+    if not isinstance(payload, dict):
+        raise ValueError("root-not-object")
+    body = payload.get(section)
+    if not isinstance(body, dict):
+        raise ValueError(f"missing-{section}-object")
+    slots = body.get("slots") or []
+    if not isinstance(slots, list):
+        raise ValueError(f"invalid-{section}-slots")
+    return [slot for slot in slots if isinstance(slot, dict)]
+
+
+async def _nzbdav_api_snapshot(*, force: bool = False
+                                ) -> tuple[list[dict], list[dict],
+                                           list[tuple[str, str, str]]]:
+    """One shared queue/history poll for all active mounts.
+
+    nzbdav imports are globally bounded, but polling each import independently
+    still multiplied API traffic.  This short-lived snapshot coalesces those
+    requests and carries structured endpoint failures back to every interested
+    mount without retaining credentialed request URLs.
+    """
+    global _api_snapshot_cache, _api_snapshot_lock, _api_snapshot_loop
+    if not NZBDAV_API_KEY:
+        return [], [], []
+    now = time.monotonic()
+    cached_at, queue, history, issues = _api_snapshot_cache
+    if not force and now - cached_at < _API_SNAPSHOT_TTL:
+        return queue, history, issues
+    loop = asyncio.get_running_loop()
+    if _api_snapshot_lock is None or _api_snapshot_loop is not loop:
+        _api_snapshot_lock = asyncio.Lock()
+        _api_snapshot_loop = loop
+    async with _api_snapshot_lock:
+        now = time.monotonic()
+        cached_at, queue, history, issues = _api_snapshot_cache
+        if not force and now - cached_at < _API_SNAPSHOT_TTL:
+            return queue, history, issues
+        common = {"output": "json", "pageSize": 200,
+                  "apikey": NZBDAV_API_KEY}
+        queue, history, issues = [], [], []
+        for mode in ("queue", "history"):
+            try:
+                response = await _client.get(
+                    f"{NZBDAV_URL}/api",
+                    params={**common, "mode": mode}, timeout=10)
+                if response.status_code != 200:
+                    issues.append((f"nzbdav-{mode}",
+                                   f"http-{response.status_code}",
+                                   _response_failure_detail(response)))
+                    continue
+                try:
+                    slots = _api_slots(response.json(), mode)
+                except (ValueError, TypeError) as exc:
+                    issues.append((f"nzbdav-{mode}", "invalid-json-shape",
+                                   f"{type(exc).__name__}: {exc}"))
+                    continue
+                if mode == "queue":
+                    queue = slots
+                else:
+                    history = slots
+            except Exception as exc:
+                reason, detail = _exception_failure(exc)
+                issues.append((f"nzbdav-{mode}", reason, detail))
+        _api_snapshot_cache = (time.monotonic(), queue, history, issues)
+        return queue, history, issues
+
+
+def _slot_job(slot: dict) -> str:
+    raw = str(slot.get("filename") or slot.get("name") or "").strip()
+    raw = unquote(raw).replace("\\", "/").rsplit("/", 1)[-1]
+    return raw[:-4] if raw.lower().endswith(".nzb") else raw
+
+
+def _related_job(base_job: str, candidate: str) -> bool:
+    attempt_prefix = f"{base_job[:96]}-a"
+    return candidate == base_job or candidate.startswith(attempt_prefix)
+
+
+def _record_api_issues(release: dict | None,
+                       failure_seen: set[str] | None,
+                       issues: list[tuple[str, str, str]]) -> None:
+    if release is None:
+        return
+    for stage, reason, detail in issues:
+        _record_failure_sample(
+            release, stage=stage, decision="transient", reason=reason,
+            detail=detail, evidence=f"api:{stage}:{reason}:{detail}",
+            seen=failure_seen)
+
+
+async def _related_attempts(
+        base_job: str, release: dict | None = None,
+        failure_seen: set[str] | None = None,
+        ) -> tuple[list[str], list[str]]:
+    """Queued/completed attempts retained by nzbdav for this release."""
+    if not NZBDAV_API_KEY:
+        return [], []
+    queue, history, issues = await _nzbdav_api_snapshot()
+    _record_api_issues(release, failure_seen, issues)
+    queued = list(dict.fromkeys(
+        job for slot in queue if (job := _slot_job(slot))
+        and _related_job(base_job, job)))
+    completed = list(dict.fromkeys(
+        job for slot in history if (job := _slot_job(slot))
+        and _related_job(base_job, job)
+        and str(slot.get("status") or "").strip().lower()
+        in ("completed", "complete", "success")))
+    # APIs generally return newest first; preserve that order and cap the DAV
+    # checks so a very old, repeatedly retried release cannot fan out reads.
+    return queued[:3], completed[:5]
+
+
+async def _history_failure(
+        job: str, release: dict | None = None,
+        failure_seen: set[str] | None = None,
+        ) -> tuple[str, str, str, str] | None:
     """Return a safe failure class for this exact nzbdav job, if finalized."""
     if not NZBDAV_API_KEY:
         return None
-    try:
-        common = {"output": "json", "pageSize": 100,
-                  "apikey": NZBDAV_API_KEY}
-        queue_response = await _client.get(
-            f"{NZBDAV_URL}/api", params={**common, "mode": "queue"},
-            timeout=10)
-        if queue_response.status_code == 200:
-            queued = ((queue_response.json().get("queue") or {}).get("slots")
-                      or [])
-            if any(str(s.get("filename") or "").removesuffix(".nzb") == job
-                   for s in queued):
-                return None
-        response = await _client.get(
-            f"{NZBDAV_URL}/api",
-            params={**common, "mode": "history"},
-            timeout=10,
-        )
-        if response.status_code != 200:
-            return None
-        slots = ((response.json().get("history") or {}).get("slots") or [])
-        slot = next((s for s in slots if s.get("name") == job), None)
-        if not slot or str(slot.get("status", "")).lower() != "failed":
-            return None
-        detail = str(slot.get("fail_message") or "")
-        kind, reason = _history_failure_class(detail)
-        evidence = str(slot.get("nzo_id") or "")
-        return kind, reason, evidence, detail
-    except Exception:
-        # Best-effort only; WebDAV polling remains the compatibility fallback.
+    queue, history, issues = await _nzbdav_api_snapshot()
+    _record_api_issues(release, failure_seen, issues)
+    if any(_slot_job(slot) == job for slot in queue):
         return None
+    # Attempt-specific watch names make this correlation exact.  A failed row
+    # belonging to yesterday's deterministic name cannot suppress today's
+    # retry, even if nzbdav retains history forever.
+    slot = next((slot for slot in history if _slot_job(slot) == job), None)
+    if not slot or str(slot.get("status", "")).strip().lower() != "failed":
+        return None
+    detail = telemetry.sanitize_failure_detail(
+        str(slot.get("fail_message") or ""), 2000)
+    kind, reason = _history_failure_class(detail)
+    evidence = str(slot.get("nzo_id") or _evidence_token(f"{job}:{detail}"))
+    return kind, reason, evidence, detail
 
 
 def _record_import_failure(release: dict, kind: str, reason: str,
@@ -599,14 +985,31 @@ def _record_import_failure(release: dict, kind: str, reason: str,
         key, release["title"],
         indexers,
         reason, attempt)
-    if accepted:
-        telemetry.record_usenet_failure(
-            release_key=key, label=release["title"], indexers=indexers,
-            stage=stage, decision=kind, reason=reason,
-            detail=detail or reason, evidence_id=evidence)
+    # Diagnostic evidence is deliberately independent of policy acceptance.
+    # A replay may be idempotent for strikes yet still be valuable when we are
+    # learning all the shapes nzbdav/provider failures take in the wild.
+    telemetry.record_usenet_failure(
+        release_key=key, label=release["title"], indexers=indexers,
+        stage=stage, decision=kind, reason=reason,
+        detail=detail or reason,
+        evidence_id=evidence or f"{attempt}:accepted={int(accepted)}")
 
 
 _VIDEO_EXT = (".mkv", ".mp4", ".avi", ".m2ts", ".ts", ".wmv")
+_UNSUPPORTED_MOUNT_RE = re.compile(
+    r"(?:^|/)(?:bdmv)(?:/|$)|\.(?:iso|img)$", re.I)
+_EPISODE_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:S0*(\d+)[^A-Za-z0-9]*E0*(\d+)|"
+    r"0*(\d+)x0*(\d+))(?!\d)", re.I)
+_GENERIC_FILE_WORDS = {
+    "file", "media", "movie", "rarbg", "sample", "stream", "title",
+    "unknown", "video",
+}
+_RELEASE_META_WORD_RE = re.compile(
+    r"^(?:19|20)\d{2}$|^(?:2160|1080|720|576|480)p$|^(?:4|8)k$|"
+    r"^(?:web|webdl|webrip|bluray|bdrip|brrip|remux|hdtv|dvdrip|"
+    r"hdr|hdr10|dovi|dv|uhd|hevc|x26[45]|h26[45]|av1|aac|ac3|eac3|"
+    r"dts|truehd|atmos|multi|dual|repack|proper|internal)$", re.I)
 
 
 def _pick_video(entries: list[tuple[str, int]],
@@ -621,10 +1024,141 @@ def _pick_video(entries: list[tuple[str, int]],
     return max(vids, key=lambda v: v[1]) if vids else None
 
 
+def _episode_tokens(text: str) -> set[tuple[int, int]]:
+    out = set()
+    for match in _EPISODE_TOKEN_RE.finditer(text or ""):
+        season = match.group(1) or match.group(3)
+        episode = match.group(2) or match.group(4)
+        out.add((int(season), int(episode)))
+    return out
+
+
+def _looks_obfuscated_basename(stem: str) -> bool:
+    """Whether a basename carries no credible human title to contradict.
+
+    Obfuscation is common on Usenet (hashes, UUIDs, ``video.mkv``).  Such a file
+    is unknown, not automatically wrong.  Conversely, a readable different
+    title is decisive and must never ride an outer job-directory name into the
+    auto picker.
+    """
+    compact = re.sub(r"[^A-Za-z0-9]", "", stem or "")
+    if not compact:
+        return True
+    if (re.fullmatch(r"[a-f0-9]{16,}", compact, re.I)
+            or re.fullmatch(r"\d{12,}", compact)):
+        return True
+    words = re.findall(r"[A-Za-z0-9]+", stem or "")
+    semantic = []
+    for word in words:
+        low = word.lower()
+        if (_RELEASE_META_WORD_RE.fullmatch(low)
+                or re.fullmatch(r"s\d{1,3}e\d{1,4}", low)
+                or re.fullmatch(r"\d{1,3}x\d{1,4}", low)
+                or low in _GENERIC_FILE_WORDS):
+            continue
+        semantic.append(word)
+    if not semantic:
+        return True
+    # One long delimiter-free token is more safely treated as ambiguous than as
+    # proof of another title.  ``unknown`` cannot lead automatically; a readable
+    # multiword different title still becomes a contradiction.
+    return bool(len(semantic) == 1 and len(semantic[0]) >= 16)
+
+
+def _basename_identity(href: str, release: dict,
+                       episode: tuple[int, int] | None,
+                       ) -> tuple[str, list[str], str]:
+    """Classify the mounted *file basename*, never its trusted parent path."""
+    expected = release.get("_nzb_expected") or {}
+    if not isinstance(expected, dict) or not expected.get("titles"):
+        return "unknown", ["basename-unscoped"], ""
+    basename = unquote(href).rstrip("/").rsplit("/", 1)[-1]
+    stem = re.sub(r"\.[A-Za-z0-9]{1,5}$", "", basename)
+    # Some releases prepend a bracketed group tag to every payload filename.
+    # It is packaging, not part of the title, and bounded stripping avoids
+    # turning arbitrary leading prose into a match.
+    stem = re.sub(r"^(?:\[[^\]\r\n]{1,40}\][\s._-]*){1,2}", "", stem)
+    titles = [str(t) for t in expected.get("titles") or [] if str(t).strip()]
+    title_exact = any(_release_title_match(stem, title) for title in titles)
+    years = {int(y) for y in re.findall(
+        r"(?<!\d)((?:19|20)\d{2})(?!\d)", stem)}
+    year = expected.get("year")
+    try:
+        year = int(year) if year else None
+    except (TypeError, ValueError):
+        year = None
+    evidence: list[str] = ["basename-title"] if title_exact else []
+
+    if expected.get("media") == "movie":
+        if title_exact:
+            if year and years and years != {year}:
+                return "contradiction", evidence + ["basename-year-mismatch"], "wrong-year"
+            if year and years == {year}:
+                return "strong", evidence + ["basename-year"], ""
+            return "compatible", evidence + ["basename-year-missing"], ""
+        if year and years and year not in years:
+            return "contradiction", ["basename-year-mismatch"], "wrong-year"
+        if _looks_obfuscated_basename(stem):
+            return "unknown", ["basename-obfuscated"], ""
+        return "contradiction", ["basename-title-mismatch"], "wrong-title"
+
+    requested = episode
+    tokens = _episode_tokens(stem)
+    if requested and tokens and requested not in tokens:
+        return "contradiction", evidence + ["basename-episode-mismatch"], "wrong-episode"
+    episode_exact = bool(requested and _episode_match(stem, *requested))
+    if requested and tokens and not episode_exact:
+        # The requested token began a range/multi-episode bundle.
+        return "contradiction", evidence + ["basename-episode-bundle"], "wrong-episode"
+    if year and years and year not in years:
+        return "contradiction", evidence + ["basename-year-mismatch"], "wrong-year"
+    if title_exact and episode_exact:
+        return "strong", evidence + ["basename-episode"], ""
+    if title_exact:
+        return "compatible", evidence + ["basename-episode-missing"], ""
+    if episode_exact:
+        return "compatible", ["basename-episode", "basename-title-missing"], ""
+    if _looks_obfuscated_basename(stem):
+        return "unknown", ["basename-obfuscated"], ""
+    return "contradiction", ["basename-title-mismatch"], "wrong-title"
+
+
+def _pick_video_identity(
+        entries: list[tuple[str, int]], release: dict,
+        episode: tuple[int, int] | None = None,
+        ) -> tuple[tuple[str, int] | None, str, list[str], str]:
+    """Pick by semantic confidence before size; explicit mismatches never win."""
+    videos = [(href, size) for href, size in entries
+              if href.lower().endswith(_VIDEO_EXT)]
+    ranked = []
+    mismatch_reason = ""
+    trusted = bool(release.get("_nzb_attrs_trusted"))
+    trusted_evidence = list(release.get("_nzb_attr_evidence") or [])
+    order = {"strong": 3, "compatible": 2, "unknown": 1}
+    for video in videos:
+        confidence, evidence, reason = _basename_identity(
+            video[0], release, episode)
+        if confidence == "contradiction":
+            mismatch_reason = mismatch_reason or reason or "wrong-identity"
+            continue
+        evidence = list(dict.fromkeys(evidence + trusted_evidence))
+        if trusted:
+            confidence = "strong"
+        ranked.append((order[confidence], int(video[1] or 0), video,
+                       confidence, evidence))
+    if not ranked:
+        return None, "contradiction" if mismatch_reason else "unknown", [], mismatch_reason
+    _, _, video, confidence, evidence = max(ranked, key=lambda row: row[:2])
+    return video, confidence, evidence, ""
+
+
 def _missing_content_reason(entries: list[tuple[str, int]],
                             episode: tuple[int, int] | None,
-                            directory_seen: bool) -> str:
+                            directory_seen: bool,
+                            identity_reason: str = "") -> str:
     """Classify a completed mount that did not yield the requested video."""
+    if identity_reason in ("wrong-title", "wrong-year", "wrong-episode"):
+        return identity_reason
     if episode and _pick_video(entries):
         return "wrong-episode"
     if directory_seen:
@@ -639,6 +1173,108 @@ def _content_evidence(entries: list[tuple[str, int]]) -> str:
     return _evidence_token(stable)
 
 
+def _stable_nonvideo(entries: list[tuple[str, int]],
+                     episode: tuple[int, int] | None = None,
+                     release: dict | None = None) -> bool:
+    """Whether a populated, finalized-looking listing has no playable file."""
+    material = []
+    for href, size in entries:
+        path = unquote(href).rstrip("/")
+        if not path:
+            continue
+        name = path.rsplit("/", 1)[-1]
+        if size > 0 or "." in name or _UNSUPPORTED_MOUNT_RE.search(path):
+            material.append((path, size))
+    if not material:
+        return False
+    if release is not None:
+        selected, _, _, _ = _pick_video_identity(material, release, episode)
+        return selected is None
+    return not _pick_video(material, episode)
+
+
+def _new_attempt_job(base_job: str) -> str:
+    # The exact watch name is the import correlation id.  It prevents an old
+    # immutable history row for the same release from being interpreted as the
+    # result of this PUT.  Keep enough entropy for concurrent/restarted jobs.
+    token = f"{int(time.time() * 1000):x}{secrets.token_hex(3)}"
+    return f"{base_job[:96]}-a{token}"
+
+
+async def _fetch_and_submit(release: dict, cat: str, job: str,
+                            failure_seen: set[str]) -> tuple[bool, str]:
+    """Fetch an alternate NZB offer and submit one exact nzbdav attempt."""
+    content = None
+    fetched_from = ""
+    offers = sorted(
+        (offer for offer in (release.get("offers") or [])
+         if usenet_health.fetch_allowed(offer.get("indexer", ""))),
+        key=lambda offer: (
+            usenet_health.fetch_score(offer.get("indexer", "")),
+            usenet_health.indexer_score(offer.get("indexer", ""))),
+        reverse=True)
+    for offer in offers:
+        indexer, link = offer.get("indexer", ""), offer.get("link", "")
+        try:
+            nzb = await _client.get(link, timeout=30)
+            nzb.raise_for_status()
+            payload_issue = _nzb_payload_issue(nzb.content)
+            if payload_issue is None:
+                content = nzb.content
+                fetched_from = indexer
+                usenet_health.record_fetch(indexer, True)
+                break
+            usenet_health.record_fetch(indexer, False)
+            payload_reason, payload_detail = payload_issue
+            _record_failure_sample(
+                release, stage="nzb-fetch", decision="transient",
+                reason=payload_reason, detail=payload_detail,
+                evidence=(f"fetch:{indexer}:{_evidence_token(link)}:"
+                          f"{payload_reason}:{payload_detail}"),
+                seen=failure_seen, indexers=[indexer])
+            logger.info(f"nzb mount {job[:40]}: link returned {payload_reason}")
+        except Exception as exc:
+            usenet_health.record_fetch(indexer, False)
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            status_detail = f" HTTP {status}" if status else ""
+            reason, shape = _exception_failure(exc)
+            _record_failure_sample(
+                release, stage="nzb-fetch", decision="transient",
+                reason=reason, detail=shape,
+                evidence=f"fetch:{indexer}:{_evidence_token(link)}:{shape}",
+                seen=failure_seen, indexers=[indexer])
+            logger.info(
+                f"nzb mount {job[:40]}: {type(exc).__name__}{status_detail}")
+    if content is None:
+        return False, ""
+    for attempt in (1, 2):
+        try:
+            put = await _client.put(
+                f"{NZBDAV_URL}/nzbs/{cat}/{quote(job)}.nzb",
+                content=content, auth=_dav_auth(), timeout=20)
+            if put.status_code < 400:
+                return True, fetched_from
+            _record_failure_sample(
+                release, stage="nzbdav-put", decision="transient",
+                reason=f"http-{put.status_code}",
+                detail=_response_failure_detail(put),
+                evidence=f"put:{_evidence_token(job)}:http-{put.status_code}",
+                seen=failure_seen)
+            logger.info(f"nzb mount {job[:40]}: PUT {put.status_code}"
+                        f" (attempt {attempt})")
+        except Exception as exc:
+            reason, shape = _exception_failure(exc)
+            _record_failure_sample(
+                release, stage="nzbdav-put", decision="transient",
+                reason=reason, detail=shape,
+                evidence=f"put:{_evidence_token(job)}:{shape}",
+                seen=failure_seen)
+            logger.info(f"nzb mount {job[:40]}: PUT {type(exc).__name__}")
+        if attempt == 1:
+            await asyncio.sleep(2)
+    return False, ""
+
+
 async def _mount(release: dict, cat: str, delay: float = 0,
                  episode: tuple[int, int] | None = None) -> dict | None:
     """Ensure this release is mounted in nzbdav; return a stream dict or None.
@@ -647,131 +1283,131 @@ async def _mount(release: dict, cat: str, delay: float = 0,
     that mount anyway are caught later by the picker's probe)."""
     t_start = time.monotonic()
     key = release.get("release_key") or ""
-    suffix = f"-{key[-8:]}" if key else ""
-    job = _slug(release["title"]) + suffix
-    dir_path = f"/content/{cat}/{job}"
+    legacy_key = release.get("legacy_release_key") or ""
+    scoped = bool(legacy_key and legacy_key != key)
+    # New scoped jobs use 64 bits of the digest.  The title slug plus the former
+    # 32-bit suffix was serviceable, but avoidable collisions are unacceptable
+    # when the exact mount is an identity boundary.
+    suffix_chars = 16 if scoped else 8
+    suffix = f"-{key[-suffix_chars:]}" if key else ""
+    base_job = _slug(release["title"]) + suffix
+    job = base_job
+    dir_path = f"/content/{cat}/{base_job}"
     failure_seen: set[str] = set()
     entries = await _dav_list(dir_path, release, failure_seen)
+    # Scoped release keys intentionally change the deterministic job suffix.
+    # Probe the legacy title+size mount once so upgrades can reuse existing
+    # content, but validate its basename below before it becomes a candidate.
+    legacy_base = (_slug(release["title"]) + f"-{legacy_key[-8:]}"
+                   if legacy_key and legacy_key != key else "")
+    if entries is None and legacy_base:
+        legacy_path = f"/content/{cat}/{legacy_base}"
+        legacy_entries = await _dav_list(legacy_path, release, failure_seen)
+        if legacy_entries is not None:
+            job, dir_path, entries = legacy_base, legacy_path, legacy_entries
     directory_seen = entries is not None
     reused = directory_seen                 # mount already existed in nzbdav
     fetched_from = ""
     if entries is None:
-        prior_failure = await _history_failure(job)
-        if prior_failure:
-            kind, reason, evidence, detail = prior_failure
-            if kind == "hard":
-                _record_import_failure(
-                    release, kind, reason, evidence, detail)
-                logger.info(f"nzb mount {job[:40]}: prior import {reason}")
+        queued, completed = await _related_attempts(
+            base_job, release, failure_seen)
+        if legacy_base:
+            legacy_queued, legacy_completed = await _related_attempts(
+                legacy_base, release, failure_seen)
+            queued = list(dict.fromkeys(queued + legacy_queued))
+            completed = list(dict.fromkeys(completed + legacy_completed))
+        # Reuse a successful attempt-specific mount after a process restart or
+        # raw-cache expiry.  This avoids importing the same NZB every six hours.
+        for prior_job in completed:
+            prior_path = f"/content/{cat}/{prior_job}"
+            listed = await _dav_list(prior_path, release, failure_seen)
+            if listed is not None:
+                job, dir_path, entries = prior_job, prior_path, listed
+                directory_seen = reused = True
+                break
+
+        pending_existing = entries is None and bool(queued)
+        if pending_existing:
+            # A prior process already submitted this exact attempt.  Join its
+            # mount instead of duplicating the watch-folder PUT.
+            job = queued[0]
+            dir_path = f"/content/{cat}/{job}"
+        elif entries is None:
+            prior_failure = await _history_failure(
+                base_job, release, failure_seen)
+            if prior_failure:
+                kind, reason, evidence, detail = prior_failure
+                _record_import_failure(release, kind, reason, evidence, detail)
+                logger.info(
+                    f"nzb mount {base_job[:40]}: prior import {reason}; retrying")
+                # Never let the immutable prior row answer for this retry.
+                job = _new_attempt_job(base_job)
+                dir_path = f"/content/{cat}/{job}"
+            if delay > 0:
+                await asyncio.sleep(delay)
+            submitted, fetched_from = await _fetch_and_submit(
+                release, cat, job, failure_seen)
+            if not submitted:
                 return None
-        if delay > 0:
-            await asyncio.sleep(delay)
-        # Fetch the NZB, falling through the alternate indexer links for the
-        # same release — download endpoints individually 403/503 at times.
-        # Order by download-endpoint reliability specifically: composite score
-        # is play-weighted, so an indexer whose fetches always 403 could still
-        # win the first attempt and cost a wasted round-trip every mount.
-        content = None
-        offers = sorted(release.get("offers") or [],
-                        key=lambda o: (usenet_health.fetch_score(o.get("indexer", "")),
-                                       usenet_health.indexer_score(o.get("indexer", ""))),
-                        reverse=True)
-        for offer in offers:
-            indexer, link = offer.get("indexer", ""), offer.get("link", "")
-            try:
-                nzb = await _client.get(link, timeout=30)
-                nzb.raise_for_status()
-                if b"<nzb" in nzb.content[:2000]:
-                    content = nzb.content
-                    fetched_from = indexer
-                    usenet_health.record_fetch(indexer, True)
-                    break
-                usenet_health.record_fetch(indexer, False)
-                _record_failure_sample(
-                    release, stage="nzb-fetch", decision="transient",
-                    reason="non-nzb",
-                    detail=f"HTTP {nzb.status_code} response was not NZB XML",
-                    evidence=(f"fetch:{indexer}:{_evidence_token(link)}:non-nzb"),
-                    seen=failure_seen, indexers=[indexer])
-                logger.info(f"nzb mount {job[:40]}: link returned non-NZB")
-            except Exception as e:
-                usenet_health.record_fetch(indexer, False)
-                status = getattr(getattr(e, "response", None), "status_code", None)
-                detail = f" HTTP {status}" if status else ""
-                reason, shape = _exception_failure(e)
-                _record_failure_sample(
-                    release, stage="nzb-fetch", decision="transient",
-                    reason=reason, detail=shape,
-                    evidence=f"fetch:{indexer}:{_evidence_token(link)}:{shape}",
-                    seen=failure_seen, indexers=[indexer])
-                logger.info(f"nzb mount {job[:40]}: {type(e).__name__}{detail}")
-        if content is None:
-            return None
-        for attempt in (1, 2):        # nzbdav PUT can 500 transiently under load
-            try:
-                put = await _client.put(
-                    f"{NZBDAV_URL}/nzbs/{cat}/{quote(job)}.nzb",
-                    content=content, auth=_dav_auth(), timeout=20)
-                if put.status_code < 400:
-                    break
-                _record_failure_sample(
-                    release, stage="nzbdav-put", decision="transient",
-                    reason=f"http-{put.status_code}",
-                    detail=f"HTTP {put.status_code}",
-                    evidence=f"put:{_evidence_token(job)}:http-{put.status_code}",
-                    seen=failure_seen)
-                logger.info(f"nzb mount {job[:40]}: PUT {put.status_code}"
-                            f" (attempt {attempt})")
-            except Exception as e:
-                reason, shape = _exception_failure(e)
-                _record_failure_sample(
-                    release, stage="nzbdav-put", decision="transient",
-                    reason=reason, detail=shape,
-                    evidence=f"put:{_evidence_token(job)}:{shape}",
-                    seen=failure_seen)
-                logger.info(f"nzb mount {job[:40]}: PUT {type(e).__name__}")
-            if attempt == 2:
-                return None
-            await asyncio.sleep(2)
-    video = _pick_video(entries or [], episode)
+    video, identity_confidence, identity_evidence, identity_reason = (
+        _pick_video_identity(entries or [], release, episode))
     if not video:
         deadline = time.monotonic() + MOUNT_WAIT
-        # Give the just-submitted watch-folder item time to appear in queue;
-        # this prevents an older transient history row for the same deterministic
-        # job name from being mistaken for the current attempt.
-        next_history_check = time.monotonic() + 3.0
+        next_history_check = time.monotonic() + 1.5
+        poll_delay = 0.5
+        stable_shape = ""
+        stable_count = 0
         while time.monotonic() < deadline:
-            await asyncio.sleep(0.7)
+            await asyncio.sleep(min(poll_delay,
+                                    max(0.01, deadline - time.monotonic())))
             listed = await _dav_list(dir_path, release, failure_seen)
             if listed is not None:
                 entries = listed
                 directory_seen = True
-            video = _pick_video(entries or [], episode)
+            video, identity_confidence, identity_evidence, identity_reason = (
+                _pick_video_identity(entries or [], release, episode))
             if video:
+                break
+            shape = _content_evidence(entries or []) if entries else ""
+            if (shape and shape == stable_shape
+                    and _stable_nonvideo(entries or [], episode, release)):
+                stable_count += 1
+            else:
+                stable_shape, stable_count = shape, 1 if shape else 0
+            # ISO/BDMV is terminal immediately; other populated non-video
+            # layouts get three observations so a just-materializing mount is
+            # not rejected between its metadata and video file appearing.
+            unsupported = any(_UNSUPPORTED_MOUNT_RE.search(unquote(href))
+                              for href, _ in (entries or []))
+            if unsupported or stable_count >= 3:
                 break
             now = time.monotonic()
             if now >= next_history_check:
-                next_history_check = now + 3.0
-                failure = await _history_failure(job)
+                next_history_check = now + max(1.5, poll_delay)
+                failure = await _history_failure(job, release, failure_seen)
                 if failure:
                     kind, reason, evidence, detail = failure
                     _record_import_failure(
                         release, kind, reason, evidence, detail)
                     logger.info(f"nzb mount {job[:40]}: import {reason}")
                     return None
+            poll_delay = min(5.0, poll_delay * 1.65)
     if not video:
         failure_reason = _missing_content_reason(
-            entries or [], episode, directory_seen)
+            entries or [], episode, directory_seen, identity_reason)
         failure_text = {
             "wrong-episode": "no matching video",
+            "wrong-title": "mounted video title contradicted the request",
+            "wrong-year": "mounted video year contradicted the request",
             "not-video": "mounted content was not video",
             "never-appeared": "never appeared",
         }[failure_reason]
         logger.info(f"nzb mount {job[:40]}: "
                     f"{failure_text}")
-        if key and failure_reason in ("wrong-episode", "not-video"):
+        if key and failure_reason in (
+                "wrong-episode", "wrong-title", "wrong-year", "not-video"):
             detail = (f"mounted directory contained {len(entries or [])} entries; "
-                      f"no {'requested episode' if failure_reason == 'wrong-episode' else 'supported video'}")
+                      f"identity result={failure_reason}")
             evidence = (f"content:{key}:{failure_reason}:"
                         f"{_content_evidence(entries or [])}")
             _record_import_failure(
@@ -794,16 +1430,24 @@ async def _mount(release: dict, cat: str, delay: float = 0,
         o.get("indexer", "") for o in release.get("offers") or []
         if o.get("indexer")))
     source = fetched_from or (all_indexers[0] if all_indexers else "unknown")
+    hints = {"filename": fname}
+    if size:
+        # Preserve the exact DAV byte count. The slow picker's middle/tail
+        # range verification compares Content-Range totals exactly; the rounded
+        # human-readable GB value is deliberately unsuitable for that gate.
+        hints["videoSize"] = int(size)
     return {
         "name": f"NZB\n{release['title'][:60]}",
         "description": (f"Source: {source}\nSize: {gb}\n"
                         f"{release['title']}"),
         "url": _stream_base() + quote(href),
-        "behaviorHints": {"filename": fname},
+        "behaviorHints": hints,
         "_nzb_release_key": key,
         "_nzb_label": release["title"][:180],
         "_nzb_indexer": source,
         "_nzb_indexers": all_indexers,
+        "_nzb_identity_confidence": identity_confidence,
+        "_nzb_identity_evidence": identity_evidence,
         # Mount economics, carried into this release's probe telemetry so the
         # time-to-streamable distribution (fresh vs reused) is measurable.
         "_nzb_mount_secs": round(time.monotonic() - t_start, 1),
@@ -813,35 +1457,22 @@ async def _mount(release: dict, cat: str, delay: float = 0,
 
 async def _mount_limited(release: dict, cat: str, delay: float = 0,
                          episode: tuple[int, int] | None = None) -> dict | None:
-    """Globally stage imports to the number of nzbdav NNTP work slots."""
+    """Globally bound complete imports, including their DAV/history polling."""
     if delay > 0:
         await asyncio.sleep(delay)
-    mount_task: asyncio.Task | None = None
-    try:
-        async with _import_slots:
-            mount_task = asyncio.create_task(
-                _mount(release, cat, 0, episode))
-            try:
-                return await asyncio.wait_for(
-                    asyncio.shield(mount_task), IMPORT_SLOT_HOLD)
-            except asyncio.TimeoutError:
-                # The import is already submitted.  Let its WebDAV poll keep
-                # running, but allow the next release/title to submit rather
-                # than creating an unbounded queue immediately.
-                pass
-        return await mount_task
-    except asyncio.CancelledError:
-        if mount_task is not None and not mount_task.done():
-            mount_task.cancel()
-            await asyncio.gather(mount_task, return_exceptions=True)
-        raise
+    async with _import_slots:
+        return await _mount(release, cat, 0, episode)
 
 
 TRANSIENT_BUCKET = float(os.environ.get("NZB_MOUNT_FAILURE_BUCKET", "1800"))
 HARD_BUCKET = float(os.environ.get("NZB_CONTENT_FAILURE_BUCKET", "86400"))
-_mount_background: set[asyncio.Task] = set()
+LANE_MAX_ACTIVE = max(1, int(os.environ.get("NZB_LANE_MAX_ACTIVE", "32")))
+LANE_REGISTRY_MAX = max(LANE_MAX_ACTIVE,
+                        int(os.environ.get("NZB_LANE_REGISTRY_MAX", "500")))
+_mount_jobs: dict[tuple[str, str], asyncio.Task] = {}
 _mount_events: dict[tuple[str, str], asyncio.Event] = {}
 _mount_outputs: dict[tuple[str, str], list[dict]] = {}
+_mount_outcomes: dict[tuple[str, str], dict] = {}
 
 
 def _refresh_out(out: list[dict], results: dict[int, dict]) -> None:
@@ -851,28 +1482,142 @@ def _refresh_out(out: list[dict], results: dict[int, dict]) -> None:
     out[:] = [results[i] for i in sorted(results)]
 
 
-async def _finish_mounts(pending: dict[asyncio.Task, int], results: dict[int, dict],
-                         out: list[dict], media_id: str, total: int,
-                         started: float, done_event: asyncio.Event) -> None:
+def _prune_mount_registry() -> None:
+    """Evict completed lanes without letting one old active key pin the cap."""
+    if len(_mount_events) <= LANE_REGISTRY_MAX:
+        return
+    for key in list(_mount_events):
+        event = _mount_events.get(key)
+        if event is None or not event.is_set():
+            continue
+        _mount_events.pop(key, None)
+        _mount_outputs.pop(key, None)
+        _mount_outcomes.pop(key, None)
+        task = _mount_jobs.pop(key, None)
+        if task is not None and not task.done():
+            # Defensive only: a completed event must belong to a terminal job.
+            _mount_jobs[key] = task
+            continue
+        if len(_mount_events) <= LANE_REGISTRY_MAX:
+            break
+
+
+def _lane_task_done(key: tuple[str, str], task: asyncio.Task) -> None:
+    # Consume every exception and remove only the exact task; a newer refresh
+    # for the same title may already own the registry entry.
     try:
+        task.result()
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        logger.exception("detached nzb lane task failed")
+    if _mount_jobs.get(key) is task:
+        _mount_jobs.pop(key, None)
+    _prune_mount_registry()
+
+
+async def _run_lane(media: str, media_id: str, out: list[dict],
+                    done_event: asyncio.Event) -> None:
+    """Registry-owned title job; no requesting picker owns or cancels it."""
+    lane_key = (media, media_id)
+    started = time.monotonic()
+    pending: dict[asyncio.Task, tuple[int, dict]] = {}
+    results: dict[int, dict] = {}
+    total = 0
+    _mount_outcomes[lane_key] = {"state": "searching", "detail": "",
+                                 "finished_at": 0.0}
+    try:
+        releases = await search(media, media_id)
+        successful_searches = int(getattr(releases, "search_ok", 1))
+        failed_searches = int(getattr(releases, "search_failed", 0))
+        if not releases:
+            state = "failed" if successful_searches == 0 and failed_searches else "empty"
+            detail = ("all-indexers-failed" if state == "failed"
+                      else "no-eligible-releases")
+            _mount_outcomes[lane_key] = {
+                "state": state, "detail": detail,
+                "finished_at": time.monotonic()}
+            return
+        cat = "movies" if media == "movie" else "tv"
+        parts = media_id.split(":")
+        episode = ((int(parts[1]), int(parts[2]))
+                   if media != "movie" and len(parts) == 3 else None)
+        top = _select_releases(releases, MOUNT_MAX, media)
+        total = len(top)
+        order = []
+        for release in top:
+            best = max((o.get("indexer", "")
+                        for o in release.get("offers") or []),
+                       key=usenet_health.indexer_score, default="")
+            order.append(f"{best}:{usenet_health.indexer_score(best):.2f}")
+        if order:
+            logger.info(f"nzb lane {media_id}: mount priority {' > '.join(order)}")
+        pending = {
+            asyncio.create_task(
+                _mount_limited(release, cat, idx * MOUNT_STAGGER, episode)):
+            (idx, release)
+            for idx, release in enumerate(top)
+        }
+        _mount_outcomes[lane_key] = {
+            "state": "mounting", "detail": f"0/{total}", "finished_at": 0.0}
+        failures = 0
         while pending:
             done, _ = await asyncio.wait(set(pending),
                                          return_when=asyncio.FIRST_COMPLETED)
             for task in done:
-                idx = pending.pop(task)
+                idx, release = pending.pop(task)
                 try:
                     mounted = task.result()
-                except Exception:
-                    mounted = None
+                except asyncio.CancelledError:
+                    failures += 1
+                    _record_failure_sample(
+                        release, stage="usenet-task", decision="transient",
+                        reason="cancelled", detail="CancelledError",
+                        evidence=f"lane:{media}:{media_id}:{idx}:cancelled")
+                    continue
+                except Exception as exc:
+                    failures += 1
+                    reason, detail = _exception_failure(exc)
+                    _record_failure_sample(
+                        release, stage="usenet-task", decision="transient",
+                        reason=reason, detail=detail,
+                        evidence=f"lane:{media}:{media_id}:{idx}:{detail}")
+                    logger.exception("nzb mount task failed")
+                    continue
                 if mounted:
                     results[idx] = mounted
+                else:
+                    failures += 1
             _refresh_out(out, results)
+            _mount_outcomes[lane_key] = {
+                "state": "mounting",
+                "detail": f"{len(out)}/{total}", "finished_at": 0.0}
+        state = "ok" if out else "empty"
+        detail = f"mounted={len(out)} failed={failures} total={total}"
+        _mount_outcomes[lane_key] = {
+            "state": state, "detail": detail,
+            "finished_at": time.monotonic()}
         logger.info(f"nzb lane {media_id}: background mounts complete "
                     f"{len(out)}/{total} in {time.monotonic() - started:.1f}s")
     except asyncio.CancelledError:
         for task in pending:
             task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        _mount_outcomes[lane_key] = {
+            "state": "cancelled", "detail": "lane-task-cancelled",
+            "finished_at": time.monotonic()}
         raise
+    except Exception as exc:
+        reason, detail = _exception_failure(exc)
+        telemetry.record_usenet_failure(
+            stage="usenet-lane", decision="transient", reason=reason,
+            detail=detail,
+            evidence_id=f"lane:{media}:{media_id}:{reason}:{detail}")
+        _mount_outcomes[lane_key] = {
+            "state": "failed", "detail": detail[:160],
+            "finished_at": time.monotonic()}
+        logger.exception("nzb lane failed")
     finally:
         done_event.set()
 
@@ -909,6 +1654,44 @@ def in_progress(media: str, media_id: str) -> bool:
     return bool(event and not event.is_set())
 
 
+def outcome(media: str, media_id: str) -> dict:
+    """Last lane state, preserving failed vs successful-empty for callers."""
+    key = (media, media_id)
+    event = _mount_events.get(key)
+    if event is not None and not event.is_set():
+        current = dict(_mount_outcomes.get(key) or {})
+        current.setdefault("state", "running")
+        current.setdefault("detail", "")
+        current.setdefault("finished_at", 0.0)
+        return current
+    return dict(_mount_outcomes.get(key) or {
+        "state": "unknown", "detail": "", "finished_at": 0.0})
+
+
+def _start_lane(media: str, media_id: str) -> tuple[list[dict], asyncio.Event] | None:
+    key = (media, media_id)
+    active = sum(1 for event in _mount_events.values() if not event.is_set())
+    if active >= LANE_MAX_ACTIVE:
+        detail = f"active={active} limit={LANE_MAX_ACTIVE}"
+        telemetry.record_usenet_failure(
+            stage="usenet-lane", decision="transient", reason="capacity",
+            detail=detail,
+            evidence_id=f"lane-capacity:{int(time.time() // 60)}")
+        _mount_outcomes[key] = {
+            "state": "failed", "detail": detail,
+            "finished_at": time.monotonic()}
+        return None
+    out: list[dict] = []
+    event = asyncio.Event()
+    _mount_outputs[key] = out
+    _mount_events[key] = event
+    task = asyncio.create_task(_run_lane(media, media_id, out, event))
+    _mount_jobs[key] = task
+    task.add_done_callback(lambda done, lane=key: _lane_task_done(lane, done))
+    _prune_mount_registry()
+    return out, event
+
+
 async def streams(media: str, media_id: str) -> list[dict]:
     """The lane's entry point (called via app.sources like any other source):
     search all indexers, mount the top MOUNT_MAX releases concurrently, and
@@ -916,11 +1699,7 @@ async def streams(media: str, media_id: str) -> list[dict]:
     the picker's probe then decides which actually play."""
     if not enabled():
         return []
-    t0 = time.monotonic()
     lane_key = (media, media_id)
-    # A previous source call may have returned an empty/partial progressive list
-    # while its detached nzbdav imports are still running.  Rejoin that exact
-    # lane instead of enqueueing duplicate NZBs after the short negative TTL.
     existing_event = _mount_events.get(lane_key)
     existing_out = _mount_outputs.get(lane_key)
     if existing_event is not None and not existing_event.is_set():
@@ -929,63 +1708,24 @@ async def streams(media: str, media_id: str) -> list[dict]:
         logger.info(f"nzb lane {media_id}: rejoined in-progress mounts, "
                     f"returning {len(out or [])}")
         return out if out is not None else []
-    done_event = asyncio.Event()
-    _mount_events[lane_key] = done_event
-    releases = await search(media, media_id)
-    if not releases:
-        out: list[dict] = []
-        _mount_outputs[lane_key] = out
-        done_event.set()
+    started = _start_lane(media, media_id)
+    if started is None:
         return []
-    cat = "movies" if media == "movie" else "tv"
-    episode = ((int(media_id.split(":")[1]), int(media_id.split(":")[2]))
-               if media != "movie" else None)
-    top = _select_releases(releases, MOUNT_MAX, media)
-    order = []
-    for release in top:
-        best = max((o.get("indexer", "") for o in release.get("offers") or []),
-                   key=usenet_health.indexer_score, default="")
-        order.append(f"{best}:{usenet_health.indexer_score(best):.2f}")
-    if order:
-        logger.info(f"nzb lane {media_id}: mount priority {' > '.join(order)}")
-    tasks = {asyncio.create_task(
-                 _mount_limited(r, cat, i * MOUNT_STAGGER, episode)): i
-             for i, r in enumerate(top)}
-    pending = dict(tasks)
-    results: dict[int, dict] = {}
-    out: list[dict] = []
-    _mount_outputs[lane_key] = out
-    deadline = time.monotonic() + MOUNT_EARLY_WAIT
-    want = max(1, MOUNT_RETURN_WANT)
-    while pending and len(results) < want and time.monotonic() < deadline:
-        done, _ = await asyncio.wait(
-            set(pending), timeout=max(0, deadline - time.monotonic()),
-            return_when=asyncio.FIRST_COMPLETED)
-        if not done:
-            break
-        for task in done:
-            idx = pending.pop(task)
-            try:
-                mounted = task.result()
-            except Exception:
-                mounted = None
-            if mounted:
-                results[idx] = mounted
-        _refresh_out(out, results)
-    if pending:
-        finisher = asyncio.create_task(
-            _finish_mounts(pending, results, out, media_id, len(top), t0,
-                           done_event))
-        _mount_background.add(finisher)
-        finisher.add_done_callback(_mount_background.discard)
-    else:
-        done_event.set()
-    if len(_mount_events) > 500:
-        old = next(iter(_mount_events))
-        if _mount_events[old].is_set():
-            _mount_events.pop(old, None)
-            _mount_outputs.pop(old, None)
-    logger.info(f"nzb lane {media_id}: {len(releases)} eligible releases from "
-                f"{len(INDEXERS)} indexers, returning {len(out)}/{len(top)} now "
-                f"in {time.monotonic() - t0:.1f}s")
+    out, _ = started
+    await wait_for_more(media, media_id,
+                        max(0, MOUNT_RETURN_WANT - 1), MOUNT_EARLY_WAIT)
+    # This coroutine is only a shielded view of registry state.  Cancellation
+    # here cannot cancel _run_lane or any mount task.
     return out
+
+
+async def shutdown() -> None:
+    """Drain detached mount jobs, close HTTP, and checkpoint learned health."""
+    tasks = list(_mount_jobs.values())
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    _mount_jobs.clear()
+    await _client.aclose()
+    usenet_health.close()

@@ -1,9 +1,12 @@
 import asyncio
+from contextlib import asynccontextmanager
+import json
 import logging
 import os
 import pathlib
 import re
 import secrets
+import signal
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
@@ -15,10 +18,18 @@ from app import config
 # run BEFORE the imports below bake env vars into module constants — which is
 # also why edits there only land on restart. See app/config.py.
 _CONFIG_APPLIED = config.apply_env()
+# Validate before importing modules that parse numbers into constants. A bad
+# environment now fails with one actionable message instead of a traceback in
+# an arbitrary picker/proxy module. Invalid saved files are quarantined by
+# config.apply_env() so the service can recover on environment/defaults.
+try:
+    config.validate_pending()
+except ValueError as exc:
+    raise RuntimeError(f"invalid stream-picker configuration: {exc}") from exc
 
-from app import (adminui, connections, dashboard, envref,  # noqa: E402
-                 overview, picker, proxy, reputation, settings_ui,
-                 telemetry, usenet_health)
+from app import (acquire, admin_auth, adminui, connections, dashboard, envref,  # noqa: E402
+                 library, meta, overview, picker, probe, proxy, reputation,
+                 settings_ui, sources, telemetry, usenet, usenet_health, vprobe)
 
 NOTICE_FILE = pathlib.Path(__file__).parent / "static" / "notice.mp4"
 NOTICE_THEATRICAL_FILE = (pathlib.Path(__file__).parent / "static"
@@ -33,7 +44,51 @@ logger = logging.getLogger("stream-picker")
 SECRET = os.environ["ADDON_SECRET"]
 ADDON_NAME = os.environ.get("ADDON_NAME", "Auto Stream")
 
-app = FastAPI()
+_READY = False
+_RESTART_TASK: asyncio.Task | None = None
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    global _READY
+    if _CONFIG_APPLIED:
+        logger.info("config: %d setting(s) overlaid from config.json onto "
+                    "the environment", _CONFIG_APPLIED)
+    data_dir = config.ensure_storage()
+    if await adminui.migrate_legacy():
+        logger.info("admin: migrated explicit dashboard credentials to scrypt")
+    proxy.load()
+    _READY = True
+    logger.info("startup complete; persistent data writable at %s", data_dir)
+    try:
+        yield
+    finally:
+        _READY = False
+        logger.info("shutdown: draining background work and upstream clients")
+        hooks = []
+        names = []
+        for name, module in (
+            ("proxy", proxy), ("picker", picker), ("probe", probe),
+            ("metadata", meta), ("library", library), ("acquire", acquire),
+            ("video probe", vprobe), ("sources", sources), ("usenet", usenet),
+        ):
+            shutdown = getattr(module, "shutdown", None)
+            if shutdown is not None:
+                names.append(name)
+                hooks.append(shutdown())
+        client = getattr(connections, "_client", None)
+        if client is not None:
+            names.append("settings client")
+            hooks.append(client.aclose())
+        results = await asyncio.gather(*hooks, return_exceptions=True)
+        for name, result in zip(names, results):
+            if isinstance(result, BaseException):
+                logger.error("shutdown: %s cleanup failed: %s", name, result,
+                             exc_info=(type(result), result,
+                                       result.__traceback__))
+
+
+app = FastAPI(lifespan=_lifespan)
 
 
 @app.middleware("http")
@@ -42,8 +97,21 @@ async def _log_request(request: Request, call_next):
     # so we can tell which app is actually hitting which endpoint — e.g. whether
     # Nuvio is querying /slow/ at all, vs. bots hitting the bare domain.
     resp = await call_next(request)
-    client = request.headers.get("x-forwarded-for", "") or (
-        request.client.host if request.client else "-")
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("Referrer-Policy", "no-referrer")
+    resp.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    if (request.url.path in ("/", "/settings", "/stats")
+            or request.url.path.startswith("/api/")):
+        resp.headers["Cache-Control"] = "no-store"
+        resp.headers.setdefault("X-Frame-Options", "DENY")
+        resp.headers.setdefault(
+            "Content-Security-Policy",
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+            "style-src 'self' 'unsafe-inline'; connect-src 'self'; "
+            "img-src 'self' data:; media-src 'self'; object-src 'none'; "
+            "base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+        )
+    client = adminui.client_ip(request) or "untrusted-forwarder"
     ua = (request.headers.get("user-agent") or "-")[:70]
     # The addon secret is a path segment — mask it so logs can't leak an
     # installable addon URL.  Proxy tokens are short-lived playback capabilities
@@ -89,19 +157,57 @@ def _check(secret: str) -> None:
         raise HTTPException(status_code=404)
 
 
-def _admin(request: Request) -> None:
-    """Gate the local admin dashboard. On by default: only loopback/LAN/Docker
-    clients may reach it, never the public reverse proxy. DASHBOARD_LOCAL_ONLY=0
-    lifts it (do that only behind your own auth)."""
+def _setup_local(request: Request) -> None:
+    """First-run enrollment is always local, even if the dashboard is public."""
+    if not adminui.is_local(request):
+        raise HTTPException(status_code=404)
+
+
+async def _admin(request: Request, *, mutation: bool = False) -> None:
+    """Apply network, authentication, and (for writes) CSRF boundaries."""
+    if adminui.setup_required():
+        _setup_local(request)
+        if request.url.path.startswith("/api/"):
+            raise HTTPException(status_code=428,
+                                detail="administrator setup required")
+        raise HTTPException(status_code=307, headers={"Location": "/"})
     local_only = os.environ.get("DASHBOARD_LOCAL_ONLY", "1") not in (
         "0", "false", "no", "off", "")
     if local_only and not adminui.is_local(request):
         raise HTTPException(status_code=404)
+    await adminui.require_auth(request)
+    if mutation:
+        adminui.require_csrf(request)
+
+
+def _readiness() -> tuple[bool, str]:
+    if not _READY:
+        return False, "startup not complete"
+    try:
+        config.validate_pending()
+    except ValueError as exc:
+        return False, f"configuration invalid: {exc}"
+    if not config.storage_ready():
+        return False, "persistent data directory is not writable"
+    return True, "ready"
+
+
+@app.get("/health/live")
+async def health_live():
+    return {"ok": True, "status": "alive"}
+
+
+@app.get("/health/ready")
+async def health_ready():
+    ok, detail = _readiness()
+    return JSONResponse({"ok": ok, "status": detail},
+                        status_code=200 if ok else 503)
 
 
 @app.get("/health")
 async def health():
-    return {"ok": True}
+    """Compatibility/readiness endpoint used by the container healthcheck."""
+    return await health_ready()
 
 
 @app.get("/notice.mp4")
@@ -198,26 +304,57 @@ async def stream_slow_mobile(secret: str, media: str, media_id: str):
 # ── local admin dashboard (clean paths, no secret; see _admin guard) ─────────
 @app.get("/")
 async def dash_home(request: Request):
-    _admin(request)
+    if adminui.setup_required():
+        _setup_local(request)
+        return HTMLResponse(adminui.setup_page(ADDON_NAME))
+    await _admin(request)
     return HTMLResponse(overview.render(telemetry.load()))
+
+
+@app.post("/api/admin/setup", status_code=201)
+async def admin_setup(request: Request):
+    """Create the one and only administrator account from a local browser."""
+    _setup_local(request)
+    if not adminui.setup_required():
+        raise HTTPException(status_code=409,
+                            detail="administrator account is already initialized")
+    adminui.require_csrf(request)
+    body = await _json_body(request)
+    username = body.get("username")
+    password = body.get("password")
+    confirmation = body.get("confirmation")
+    if not all(isinstance(v, str)
+               for v in (username, password, confirmation)):
+        raise HTTPException(status_code=400, detail="all account fields are required")
+    if password != confirmation:
+        raise HTTPException(status_code=400, detail="passwords do not match")
+    try:
+        username = await adminui.create_account(username, password)
+    except admin_auth.AccountExistsError:
+        raise HTTPException(status_code=409,
+                            detail="administrator account is already initialized")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    logger.info("admin: first-run administrator account initialized")
+    return {"ok": True, "username": username}
 
 
 @app.get("/settings")
 async def settings_page(request: Request):
-    _admin(request)
+    await _admin(request)
     return HTMLResponse(settings_ui.render())
 
 
 @app.get("/stats")
 async def stats(request: Request, min_n: int = 3):
-    _admin(request)
+    await _admin(request)
     blocks = reputation.listing() + usenet_health.blocked_listing()
     return HTMLResponse(dashboard.render(telemetry.load(), blocks, min_n=min_n))
 
 
 @app.get("/api/stats.json")
 async def stats_json(request: Request, min_n: int = 3):
-    _admin(request)
+    await _admin(request)
     recs = telemetry.load()
     return {
         "records": len(recs),
@@ -230,9 +367,9 @@ async def stats_json(request: Request, min_n: int = 3):
     }
 
 
-@app.get("/api/unblock")
+@app.post("/api/unblock")
 async def unblock(request: Request, sig: str):
-    _admin(request)
+    await _admin(request, mutation=True)
     if sig.startswith("nzb:"):
         usenet_health.unblock(sig)
     else:
@@ -240,25 +377,39 @@ async def unblock(request: Request, sig: str):
     return RedirectResponse(url="/stats", status_code=303)
 
 
-@app.get("/api/decode/clear")
+@app.post("/api/decode/clear")
 async def decode_clear(request: Request, key: str):
-    _admin(request)
+    await _admin(request, mutation=True)
     from app import decode_health
     decode_health.clear(key)
     return RedirectResponse(url="/stats", status_code=303)
 
 
+@app.post("/api/nzb-indexer/clear")
+async def nzb_indexer_clear(request: Request, name: str):
+    await _admin(request, mutation=True)
+    usenet_health.clear_fetch_health(name)
+    return RedirectResponse(url="/stats", status_code=303)
+
+
 @app.get("/api/settings/status.json")
 async def settings_status(request: Request):
-    _admin(request)
+    await _admin(request)
     return {"playing": proxy.active_streams(),
             "restart_pending": config.restart_pending()}
 
 
+@app.get("/api/admin/csrf")
+async def admin_csrf(request: Request):
+    """Issue the process-local mutation token to an authenticated operator."""
+    await _admin(request)
+    return {"csrf_token": adminui.csrf_token()}
+
+
 @app.post("/api/settings/save")
 async def settings_save(request: Request):
-    _admin(request)
-    body = await request.json()
+    await _admin(request, mutation=True)
+    body = await _json_body(request)
     try:
         return config.save(dict(body.get("values") or {}))
     except ValueError as e:
@@ -267,8 +418,8 @@ async def settings_save(request: Request):
 
 @app.post("/api/settings/test/{service}")
 async def settings_test(service: str, request: Request):
-    _admin(request)
-    body = await request.json()
+    await _admin(request, mutation=True)
+    body = await _json_body(request)
     try:
         return await connections.test(service, dict(body.get("values") or {}))
     except ValueError as e:
@@ -278,7 +429,7 @@ async def settings_test(service: str, request: Request):
 @app.get("/api/settings/export.env")
 async def settings_export(request: Request):
     # The current effective config as a ready-to-edit .env (secrets redacted).
-    _admin(request)
+    await _admin(request)
     return PlainTextResponse(
         envref.current_dotenv(),
         headers={"Content-Disposition":
@@ -287,20 +438,49 @@ async def settings_export(request: Request):
 
 @app.post("/api/settings/restart")
 async def settings_restart(request: Request):
-    # Clean exit; the container's restart policy brings the process back up
-    # with the saved config applied. The delay lets this response flush.
-    _admin(request)
-    logger.info("settings: restart requested — exiting to apply saved config")
-    asyncio.get_running_loop().call_later(0.6, os._exit, 0)
+    # SIGTERM lets Uvicorn stop accepting work and execute the lifespan cleanup;
+    # the container's restart policy then brings the process back with new config.
+    await _admin(request, mutation=True)
+    try:
+        config.validate_pending()
+    except ValueError as exc:
+        raise HTTPException(status_code=409,
+                            detail=f"configuration cannot restart: {exc}")
+    global _RESTART_TASK
+    if _RESTART_TASK is None or _RESTART_TASK.done():
+        _RESTART_TASK = asyncio.create_task(_signal_restart())
+    logger.info("settings: graceful restart requested")
     return {"ok": True}
 
 
-@app.on_event("startup")
-async def _startup():
-    if _CONFIG_APPLIED:
-        logger.info(f"config: {_CONFIG_APPLIED} setting(s) overlaid from "
-                    "config.json onto the environment")
-    proxy.load()
+async def _json_body(request: Request, limit: int = 256 * 1024) -> dict:
+    content_type = request.headers.get("content-type", "").split(";", 1)[0].lower()
+    if content_type != "application/json":
+        raise HTTPException(status_code=415, detail="application/json required")
+    declared = request.headers.get("content-length", "")
+    if declared:
+        try:
+            if int(declared) > limit:
+                raise HTTPException(status_code=413, detail="request body too large")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="invalid Content-Length")
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if len(body) > limit:
+            raise HTTPException(status_code=413, detail="request body too large")
+    try:
+        value = json.loads(body or b"{}")
+    except (ValueError, UnicodeDecodeError):
+        raise HTTPException(status_code=400, detail="invalid JSON") from None
+    if not isinstance(value, dict):
+        raise HTTPException(status_code=400, detail="JSON object required")
+    return value
+
+
+async def _signal_restart() -> None:
+    await asyncio.sleep(0.6)  # allow the JSON response to reach the browser
+    os.kill(os.getpid(), signal.SIGTERM)
 
 
 @app.api_route("/proxy/{token}", methods=["GET", "HEAD"])

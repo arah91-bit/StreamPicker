@@ -225,7 +225,8 @@ document.addEventListener('input',e=>{
 
 async function post(url,body){
  const r=await fetch(url,{method:'POST',
-  headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
+  headers:{'Content-Type':'application/json','X-CSRF-Token':
+   document.querySelector('.adminnav').dataset.csrf},body:JSON.stringify(body||{})});
  if(!r.ok)throw new Error((await r.json().catch(()=>({}))).detail||('HTTP '+r.status));
  return r.json();
 }
@@ -352,7 +353,13 @@ def _row(spec: dict) -> str:
             f"<span class='envk'>{_esc(key)}</span>"
             f"<div class='desc'>{_esc(spec.get('desc', ''))}</div></div>")
     t = spec["type"]
-    if t == "bool":
+    if config.is_secret(key):
+        ph = config.mask(val, key) or (
+            "uses ADDON_SECRET" if key == "ADMIN_PASSWORD" else "not set")
+        ctl = (f"<input type='password' data-key='{key}' data-secret='1' "
+               f"data-init='' placeholder='{_esc(ph)}' "
+               f"autocomplete='new-password' style='width:280px'>")
+    elif t == "bool":
         on = val.strip().lower() not in ("", "0", "false", "no", "off")
         ctl = (f"<input type='checkbox' class='swi' data-key='{key}' "
                f"data-init='{'1' if on else '0'}' {'checked' if on else ''}>")
@@ -502,11 +509,17 @@ def _conn_card(conn: dict) -> str:
         val = config.pending(key)
         hint = (f"<div class='hint'>{_esc(f['hint'])}</div>"
                 if f.get("hint") else "")
-        if kind == "secret":
-            ph = config.mask(val) or "not set"
-            inp = (f"<input type='password' data-key='{key}' data-secret='1' "
-                   f"data-init='' placeholder='{_esc(ph)}' "
-                   f"autocomplete='new-password'>")
+        if config.is_secret(key):
+            ph = config.mask(val, key) or "not set"
+            tag = "textarea" if kind == "multiline" else "input"
+            if tag == "textarea":
+                inp = (f"<textarea data-key='{key}' data-secret='1' data-init='' "
+                       f"placeholder='{_esc(ph)}' rows='2' spellcheck='false' "
+                       f"autocomplete='off'></textarea>")
+            else:
+                inp = (f"<input type='password' data-key='{key}' data-secret='1' "
+                       f"data-init='' placeholder='{_esc(ph)}' "
+                       f"autocomplete='new-password'>")
         elif kind == "multiline":
             shown = val.replace(";", "\n")
             inp = (f"<textarea data-key='{key}' data-init='{_esc(shown)}' "

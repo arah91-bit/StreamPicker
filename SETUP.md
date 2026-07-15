@@ -40,6 +40,7 @@ source; add the rest later from the dashboard.
 | **A debrid account** | Turns torrent/usenet hashes into instant HTTPS streams | **Essential** | A paid service — TorBox or Real-Debrid. This is what makes "torrents" stream instantly. |
 | **A search addon** | Finds candidate releases for a title | **Essential** (≥1) | A Stremio-protocol addon that returns `/stream` results — e.g. **Comet** (`g0ldyy/comet`), configured with your debrid key. Self-host or use a hosted instance. |
 | **TMDB API key** | Titles, original language, release dates | Strongly recommended | Free from themoviedb.org. Powers the audio-language gate and release-date logic. |
+| **OMDb API key** | Independent title identity and runtime check | Optional | The app persists exact-IMDb results and caps uncached calls at 750/day, leaving headroom under OMDb's 1,000-call plan. |
 | More search addons | Wider coverage | Optional | **StremThru Torz** (`MunifTanjim/stremthru`), **MediaFusion** (`mhdzumair/MediaFusion`), or *any* addon via the **Custom addons** panel (AIOStreams, etc.). |
 | **Usenet lane** | Direct usenet as a source | Optional (advanced) | Needs Newznab **indexers** (paid), a usenet **provider** (paid), and **nzbdav** to mount NZBs as a streamable filesystem. The most complex piece — skip it for your first run. |
 | Jellyfin + Jellio | Serve titles you already own first | Optional | Jellio is a Jellyfin→player addon; its URL goes in the dashboard. |
@@ -158,6 +159,9 @@ Install the fast and best-quality addons side by side — they share one search.
    sure your debrid account is active.
 
 ### Optional add-ons (later)
+- **OMDb identity check** — add an OMDb API key for a persistent independent
+  title/year/type/runtime cross-check. The default hard limit is 750 calls per
+  UTC day; cached lookups do not consume the budget.
 - **Usenet lane** — add Newznab indexers (`NZB_INDEXERS`) + nzbdav creds in
   Settings. Expect it to be fiddly; usenet is ~40% reliable by nature and the
   probe correctly drops the misses.
@@ -177,14 +181,18 @@ Everything is file- and API-driven, so no clicking is required:
   keys you want into `.env` and `docker compose up -d`. Required to boot:
   `ADDON_SECRET`. Strongly recommended: `ADDON_PUBLIC_URL`, one search source
   (`FAST_BASE_URL`), and `TMDB_API_KEY`.
-- **Config via API** (dashboard endpoints, LAN/loopback only): `POST
-  /api/settings/save` with `{"values": {KEY: VALUE, …}}`; test a service with
-  `POST /api/settings/test/<service>`; snapshot current config with `GET
-  /api/settings/export.env`; apply with `POST /api/settings/restart`. Unknown
-  keys are rejected — it's not a generic env-setter.
+- **Config via API** (dashboard endpoints, LAN/loopback only): first open `/`
+  locally and create the administrator account. Use that account with HTTP
+  Basic auth. Automated deployments can
+  preseed `ADMIN_USERNAME` + `ADMIN_PASSWORD` instead. Fetch
+  `GET /api/admin/csrf`, then send its `csrf_token` as
+  `X-CSRF-Token` on every POST. Save with `POST /api/settings/save` and
+  `{"values": {KEY: VALUE, …}}`; test with `POST
+  /api/settings/test/<service>`; export with `GET /api/settings/export.env`;
+  apply with `POST /api/settings/restart`. Unknown keys are rejected.
 - **Precedence:** stored config (`data/config.json`) overrides `.env`, which
   overrides code defaults. Changes apply on **restart**.
-- **Verify programmatically:** `GET /health` → `{"ok":true}`; open a title's
+- **Verify programmatically:** `GET /health/ready` → `{"ok":true,…}`; open a title's
   stream endpoint `GET /<secret>/stream/movie/<imdb-id>.json` and confirm the
   `streams` array is non-empty.
 
@@ -195,8 +203,11 @@ Everything is file- and API-driven, so no clicking is required:
 - **No streams returned** — no source connected, a failed **Test**, or an
   inactive debrid account. Start with Comet + debrid; confirm the Test is green.
 - **Dashboard 404 from your domain** — expected; it's LAN-only. Use
-  `http://<LAN-IP>:8011/`, or set `DASHBOARD_LOCAL_ONLY=0` only behind your own
-  auth.
+  `http://<LAN-IP>:8011/`. On the first visit, create an account; afterward
+  sign in with that account. Set
+  `DASHBOARD_LOCAL_ONLY=0` only over HTTPS. If
+  a reverse proxy supplies client-IP headers, list only its IP/CIDR in
+  `TRUSTED_PROXIES`.
 - **Player can't play the stream** — check `ADDON_PUBLIC_URL` is reachable from
   the player's device (it's baked into the proxied playback URLs).
 - **Settings didn't take effect** — they apply on **restart**; use the dashboard's

@@ -215,18 +215,14 @@ class RejectedEntryReuseTests(unittest.IsolatedAsyncioTestCase):
             calls.append(True)
             return None
 
-        async def fake_direct(sess, cands, request, token, source=None,
-                              expected_total=None):
-            from starlette.responses import Response
-            return Response(status_code=204)
-
         with (patch("app.proxy._get_or_start_entry", side_effect=fake_start),
-              patch("app.proxy._serve_direct", side_effect=fake_direct)):
+              patch("app.proxy._serve_direct") as direct):
             resp = await proxy._serve_buffered("tok1", session, [], 0, None,
                                                False, request=None)
         self.assertTrue(calls)                       # reselected, not reused
         self.assertNotIn("bufsig", session)          # sticky pick cleared
-        self.assertEqual(204, resp.status_code)
+        self.assertEqual(502, resp.status_code)
+        direct.assert_not_called()                   # never serve an unverified fallback
 
 
 class SkipRejectedTests(unittest.TestCase):
@@ -242,24 +238,24 @@ class SkipRejectedTests(unittest.TestCase):
         proxy._entries.clear()
         proxy._entries.update(self._saved)
 
-    def test_rejected_anchor_swaps_to_clean_candidate(self):
+    def test_rejected_anchor_never_swaps_to_a_different_file(self):
         bad = _entry("file:bad")
         bad.playfail["rejected"] = True
         proxy._entries["file:bad"] = bad
         a = {"sig": "file:bad", "u": "u1"}
         b = {"sig": "file:ok", "u": "u2"}
-        self.assertIs(b, proxy._skip_rejected(a, [a, b]))
+        self.assertIsNone(proxy._skip_rejected(a, [a, b]))
 
     def test_clean_anchor_is_kept(self):
         a = {"sig": "file:ok", "u": "u1"}
         self.assertIs(a, proxy._skip_rejected(a, [a]))
 
-    def test_all_rejected_keeps_the_anchor(self):
+    def test_all_rejected_returns_no_anchor(self):
         bad = _entry("file:bad")
         bad.playfail["rejected"] = True
         proxy._entries["file:bad"] = bad
         a = {"sig": "file:bad", "u": "u1"}
-        self.assertIs(a, proxy._skip_rejected(a, [a]))
+        self.assertIsNone(proxy._skip_rejected(a, [a]))
 
 
 if __name__ == "__main__":

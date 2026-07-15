@@ -18,10 +18,18 @@ adjusts, not a web copy of the env file.
 """
 
 import json
+import ipaddress
+import logging
+import math
 import os
+import re
 import tempfile
+import time
+from urllib.parse import urlsplit
 
 from app import knobs
+
+logger = logging.getLogger("stream-picker.config")
 
 # ── schema ───────────────────────────────────────────────────────────────────
 
@@ -91,6 +99,12 @@ SETTINGS = [
          label="Quality picker probe budget",
          desc="The slow picker probes only the top of its quality ranking. "
               "Raise to dig deeper when top releases keep failing."),
+    dict(key="OMDB_DAILY_BUDGET", group="picking", type="number",
+         default="750", min=0, max=900, step=50, unit="calls/day",
+         label="OMDb daily budget",
+         desc="Hard UTC-day ceiling for uncached OMDb identity lookups. "
+              "Persistent title caching keeps normal use far below this and "
+              "leaves headroom under OMDb's 1,000-call plan."),
     dict(key="FAST_RACE_DEADLINE", group="picking", type="number",
          default="55", min=10, max=90, step=5, unit="s",
          label="Fast picker deadline",
@@ -115,7 +129,20 @@ SETTINGS = [
          default="1", label="Restrict this dashboard to local/LAN",
          desc="Serve the dashboard only to loopback/LAN/Docker clients, never "
               "through the public reverse proxy. The addon's stream URLs are "
-              "unaffected. Turn off only if you put your own auth in front."),
+              "unaffected."),
+    dict(key="ADMIN_USERNAME", group="identity", type="text",
+         default="admin", hidden=True, label="Dashboard username",
+         desc="Optional deployment-time username that skips first-run account "
+              "creation when ADMIN_PASSWORD is also set."),
+    dict(key="ADMIN_PASSWORD", group="identity", type="text", kind="secret",
+         default="", hidden=True, label="Dashboard password",
+         desc="Optional deployment-time password. If omitted, the first local "
+              "dashboard visit creates a scrypt-protected account."),
+    dict(key="TRUSTED_PROXIES", group="identity", type="text",
+         default="127.0.0.0/8,::1/128", label="Trusted reverse proxies",
+         desc="Comma-separated proxy IPs/CIDRs allowed to supply "
+              "X-Forwarded-For. Keep this narrow; forwarded headers from all "
+              "other peers are rejected."),
     # Managed by the "Custom addons" panel, not a generic row (hence hidden).
     dict(key="EXTRA_ADDONS", group="identity", type="addons", default="",
          hidden=True, label="Custom addons"),
@@ -126,8 +153,8 @@ SETTINGS = [
 # per line in the UI, ';'-joined in storage (the format usenet.py parses).
 CONNECTIONS = [
     dict(id="comet", name="Comet", role="Fast lane — cached debrid search",
-         fields=[dict(key="FAST_BASE_URL", label="Manifest base URL",
-                      kind="url",
+        fields=[dict(key="FAST_BASE_URL", label="Manifest base URL",
+                      kind="url", sensitive=True,
                       hint="Your configured Comet base, without "
                            "/manifest.json. The URL embeds your debrid "
                            "keys — treat it like a password.")]),
@@ -141,8 +168,8 @@ CONNECTIONS = [
                       kind="url")]),
     dict(id="indexers", name="Usenet indexers",
          role="Direct usenet searches (Newznab)",
-         fields=[dict(key="NZB_INDEXERS", label="One per line: name|api-url|apikey",
-                      kind="multiline")]),
+        fields=[dict(key="NZB_INDEXERS", label="One per line: name|api-url|apikey",
+                      kind="multiline", sensitive=True)]),
     dict(id="nzbdav", name="nzbdav",
          role="Mounts NZBs so usenet releases stream directly",
          fields=[dict(key="NZBDAV_URL", label="Base URL", kind="url"),
@@ -154,13 +181,16 @@ CONNECTIONS = [
     dict(id="tmdb", name="TMDB",
          role="Titles, original language, release dates",
          fields=[dict(key="TMDB_API_KEY", label="API key", kind="secret")]),
+    dict(id="omdb", name="OMDb",
+         role="Independent title, year, type and runtime corroboration",
+         fields=[dict(key="OMDB_API_KEY", label="API key", kind="secret")]),
     dict(id="tvdb", name="TVDB",
          role="Season-rollover fallback for episode prefetch",
          fields=[dict(key="TVDB_API_KEY", label="API key", kind="secret")]),
     dict(id="jellio", name="Jellyfin library (Jellio)",
          role="Serves titles you already have — checked before any search",
-         fields=[dict(key="JELLIO_URL", label="Public manifest base URL",
-                      kind="url",
+        fields=[dict(key="JELLIO_URL", label="Public manifest base URL",
+                      kind="url", sensitive=True,
                       hint="Public base including the Jellio token, so the "
                            "playback URLs it returns work from the player.")]),
     dict(id="jellyseerr", name="Jellyseerr",
@@ -185,9 +215,58 @@ CONNECTIONS = [
 _TRUE = ("1", "true", "yes", "on")
 _FALSE = ("0", "false", "no", "off", "")
 
+# These values are consumed with int(...) in their owning modules. Keeping the
+# distinction here prevents a dashboard save such as "2.5" from creating a
+# restart crash that the generic float parser used to permit.
+_INT_KEYS = {
+    "BUFFER_CACHE_GB", "BUFFER_AHEAD_GB", "VERIFIED_WANT", "MAX_PROBES",
+    "SLOW_MAX_PROBES", "FAST_ENOUGH_4K", "FAST_ENOUGH_1080",
+    "FAST_PROBE_BATCH", "PROBE_HOST_BENCH", "SLOW_CONCURRENCY",
+    "SLOW_NZB_PROBES", "SLOW_FINISH_MAX_PROBES", "SLOW_VIDEO_PROBE_N",
+    "UNPROVEN_MAX_RES", "PROXY_WRAP_MAX", "PROXY_MAX_FAILOVER",
+    "PLAYER_REJECT_STARTS", "DECODE_BAD_REJECTS", "PROXY_SESSION_MAX_BYTES",
+    "PROXY_SESSION_MAX", "HLS_BUFFER_CONCURRENCY", "TWIN_SPLICE_MAX",
+    "BUFFER_READ_CHUNK", "NZB_MOUNT_MAX",
+    "NZB_MOUNT_RETURN_WANT", "NZB_IMPORT_CONCURRENCY", "NZB_HEALTH_MAX_BYTES",
+    "NZB_HARD_FAILURES_TO_BLOCK", "NZB_LANE_MAX_ACTIVE",
+    "NZB_LANE_REGISTRY_MAX", "TMDB_DIGITAL_ASSUME_DAYS",
+    "OMDB_DAILY_BUDGET",
+    "REPUTATION_MAX_ENTRIES", "MIN_BLOCK_SESSIONS", "TELEMETRY_MAX_BYTES",
+    "TELEMETRY_SEGMENTS",
+}
+
+_FRACTION_KEYS = {
+    "DURATION_MIN_FRAC", "QUALITY_BAND", "TWIN_SPLICE_MARGIN",
+    "BUFFER_SLOW_MARGIN",
+}
+
+
+def _advanced_bounds(spec: dict) -> tuple[float, float]:
+    key, unit = spec["key"], spec.get("unit", "")
+    if key == "ACQUIRE_FOREGROUND_WAIT":
+        return 0.0, 60.0
+    if key in _FRACTION_KEYS:
+        return 0.0, 1.0
+    maximum = {
+        "s": 31 * 86400,
+        "bytes": float(1 << 40),
+        "GB": 10_000.0,
+        "bps": 1_000_000_000_000.0,
+        "h": 8760.0,
+        "d": 3650.0,
+        "min": 525_600.0,
+        "MB/s": 100_000.0,
+    }.get(unit, 1_000_000_000.0)
+    return 0.0, maximum
+
 
 def _specs() -> dict[str, dict]:
-    out = {s["key"]: s for s in SETTINGS}
+    out = {}
+    for original in SETTINGS:
+        s = dict(original)
+        if s.get("type") == "number":
+            s["number_kind"] = "int" if s["key"] in _INT_KEYS else "float"
+        out[s["key"]] = s
     for c in CONNECTIONS:
         for f in c["fields"]:
             out[f["key"]] = {**f, "type": "connection"}
@@ -195,15 +274,20 @@ def _specs() -> dict[str, dict]:
     # section. setdefault so a curated/connection spec always wins over these.
     for k in knobs.keys():
         s = knobs.spec(k)
-        out.setdefault(k, {"key": k, "type": "number" if s["type"] == "num"
-                           else s["type"], "default": s["default"],
-                           "unit": s["unit"], "group": s["group"],
-                           "desc": s["blurb"], "choices": s.get("choices"),
-                           "advanced": True})
+        candidate = {"key": k, "type": "number" if s["type"] == "num"
+                     else s["type"], "default": s["default"],
+                     "unit": s["unit"], "group": s["group"],
+                     "desc": s["blurb"], "choices": s.get("choices"),
+                     "advanced": True}
+        if candidate["type"] == "number":
+            candidate["number_kind"] = "int" if k in _INT_KEYS else "float"
+            candidate["min"], candidate["max"] = _advanced_bounds(candidate)
+        out.setdefault(k, candidate)
     return out
 
 
 _SPECS = _specs()
+_RETIRED_KEYS = {"NZB_TIMEOUT", "NZB_IMPORT_SLOT_HOLD"}
 
 
 def _path() -> str:
@@ -212,25 +296,78 @@ def _path() -> str:
         os.environ.get("TELEMETRY_DIR", "/data"), "config.json")
 
 
-def _read() -> dict[str, str]:
+def _quarantine(path: str, reason: Exception | str) -> None:
+    backup = f"{path}.corrupt-{int(time.time())}-{os.getpid()}"
     try:
-        with open(_path()) as f:
+        os.replace(path, backup)
+        logger.error("config: quarantined invalid %s as %s: %s",
+                     path, backup, reason)
+    except OSError:
+        logger.exception("config: invalid %s could not be quarantined: %s",
+                         path, reason)
+
+
+def _read() -> dict[str, str]:
+    path = _path()
+    try:
+        with open(path, encoding="utf-8") as f:
             data = json.load(f)
+        if not isinstance(data, dict) or not isinstance(data.get("env", {}), dict):
+            raise ValueError("root and 'env' must be JSON objects")
         env = data.get("env", {})
-        return {str(k): str(v) for k, v in env.items()}
-    except (OSError, ValueError):
+        out = {}
+        for key, value in env.items():
+            if key in _RETIRED_KEYS:
+                logger.warning("config: ignoring retired setting %s", key)
+                continue
+            if not isinstance(key, str) or key not in _SPECS:
+                raise ValueError(f"unknown setting in store: {str(key)[:40]}")
+            if isinstance(value, (dict, list)) or value is None:
+                raise ValueError(f"{key}: stored value must be scalar")
+            raw = str(value)
+            norm = _normalize(_SPECS[key], raw)
+            if norm == "" and _SPECS[key].get("type") == "number":
+                logger.warning("config: ignoring blank numeric override %s", key)
+                continue
+            # A blank sensitive field means "keep" only for a form submit. An
+            # older store containing it is harmless and remains explicitly blank.
+            out[key] = raw.strip() if norm is None else norm
+        return out
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError, TypeError) as exc:
+        if isinstance(exc, OSError):
+            logger.error("config: cannot read %s; using environment/defaults: %s",
+                         path, exc)
+        else:
+            _quarantine(path, exc)
         return {}
 
 
 def _write(store: dict[str, str]) -> None:
     path = _path()
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".config-")
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    encoded = json.dumps({"env": store}, indent=1, sort_keys=True)
+    if len(encoded.encode("utf-8")) > 256 * 1024:
+        raise ValueError("configuration exceeds 256 KiB")
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".config-")
     try:
-        with os.fdopen(fd, "w") as f:
-            json.dump({"env": store}, f, indent=1, sort_keys=True)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(encoded)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
         os.chmod(tmp, 0o600)   # holds API keys — owner-only, like the env file
         os.replace(tmp, path)
+        try:
+            dfd = os.open(directory, os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError:
+            pass
     except BaseException:
         try:
             os.unlink(tmp)
@@ -244,8 +381,24 @@ def apply_env() -> int:
     bakes env into constants — main.py calls it above its own app imports.
     Returns how many keys were applied (for the startup log line)."""
     store = _read()
-    for k, v in store.items():
-        os.environ[k] = v
+    try:
+        effective = _validate_effective(store)
+    except ValueError as exc:
+        # A syntactically valid but contradictory/invalid saved config must not
+        # trap the container in an import-time crash loop. Preserve it beside
+        # the live path for repair, then boot on environment/defaults.
+        if store and os.path.exists(_path()):
+            _quarantine(_path(), exc)
+            store = {}
+            effective = _validate_effective(store)
+        else:
+            raise
+    # Canonicalize explicit .env values too. This makes every boolean spelling
+    # behave consistently in modules whose historic parsers accepted only
+    # 0/false, and guarantees int/float consumers see the validated form.
+    explicit = set(store) | {k for k in _SPECS if k in os.environ}
+    for key in explicit:
+        os.environ[key] = effective[key]
     return len(store)
 
 
@@ -276,19 +429,46 @@ def pending(key: str) -> str:
 
 
 def restart_pending() -> bool:
-    return any(pending(k) != running(k) for k in _SPECS)
+    store = _read()
+    return any(pending_from(store, k) != running(k) for k in _SPECS)
 
 
 def is_secret(key: str) -> bool:
-    return (_SPECS.get(key) or {}).get("kind") == "secret"
+    spec = _SPECS.get(key) or {}
+    return spec.get("kind") == "secret" or bool(spec.get("sensitive"))
 
 
-def mask(value: str) -> str:
+def mask(value: str, key: str = "") -> str:
     """Displayable stand-in for a secret: enough to recognize, never enough
     to use. Short values give no tail at all."""
     if not value:
         return ""
+    if key and (_SPECS.get(key) or {}).get("sensitive"):
+        return "kept · hidden"
     return f"kept · ends …{value[-4:]}" if len(value) >= 12 else "kept"
+
+
+def _http_url(key: str, raw: str) -> str:
+    if not raw:
+        return raw
+    if len(raw) > 8192 or any(ord(c) < 32 for c in raw):
+        raise ValueError(f"{key}: URL is too long or contains control characters")
+    parsed = urlsplit(raw)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ValueError(f"{key}: must be an absolute http(s) URL")
+    return raw
+
+
+def _trusted_proxies(raw: str) -> str:
+    parts = [p for p in re.split(r"[\s,]+", raw.strip()) if p]
+    if len(parts) > 64:
+        raise ValueError("TRUSTED_PROXIES: at most 64 networks are allowed")
+    for part in parts:
+        try:
+            ipaddress.ip_network(part, strict=False)
+        except ValueError:
+            raise ValueError(f"TRUSTED_PROXIES: invalid IP/CIDR {part[:60]!r}") from None
+    return ",".join(parts)
 
 
 def _normalize(spec: dict, raw: str):
@@ -297,8 +477,13 @@ def _normalize(spec: dict, raw: str):
     '' meaning 'store empty' / raises ValueError on garbage."""
     raw = (raw or "").strip()
     kind, typ = spec.get("kind"), spec.get("type")
+    sensitive = kind == "secret" or spec.get("sensitive")
+    if sensitive and raw == "":
+        return None
     if kind == "secret":
-        return None if raw == "" else raw
+        if len(raw.encode("utf-8")) > 8192 or "\x00" in raw:
+            raise ValueError(f"{spec['key']}: secret is too long or invalid")
+        return raw
     if typ == "bool":
         low = raw.lower()
         if low in _TRUE:
@@ -313,16 +498,22 @@ def _normalize(spec: dict, raw: str):
             v = float(raw)
         except ValueError:
             raise ValueError(f"{spec['key']}: not a number") from None
-        if "min" in spec:                   # curated sliders clamp; advanced
-            v = min(max(v, spec["min"]), spec["max"])  # knobs are free-form
-        if v < 0:
-            raise ValueError(f"{spec['key']}: must not be negative")
-        return str(int(v)) if float(v).is_integer() else str(v)
+        if not math.isfinite(v):
+            raise ValueError(f"{spec['key']}: must be finite")
+        if spec.get("number_kind") == "int" and not v.is_integer():
+            raise ValueError(f"{spec['key']}: must be a whole number")
+        if "min" in spec and v < float(spec["min"]):
+            raise ValueError(f"{spec['key']}: must be at least {spec['min']}")
+        if "max" in spec and v > float(spec["max"]):
+            raise ValueError(f"{spec['key']}: must be at most {spec['max']}")
+        return str(int(v)) if v.is_integer() else format(v, ".15g")
     if typ == "choice":
         if raw not in [c[0] for c in spec["choices"]]:
             raise ValueError(f"{spec['key']}: not one of the choices")
         return raw
     if kind == "multiline":
+        if len(raw.encode("utf-8")) > 64 * 1024 or "\x00" in raw:
+            raise ValueError(f"{spec['key']}: value is too long or invalid")
         parts = [p.strip() for chunk in raw.split("\n")
                  for p in chunk.split(";")]
         return ";".join(p for p in parts if p)
@@ -333,8 +524,12 @@ def _normalize(spec: dict, raw: str):
             items = json.loads(raw)
         except ValueError:
             raise ValueError("custom addons: not valid JSON") from None
+        if not isinstance(items, list):
+            raise ValueError("custom addons: expected a JSON list")
+        if len(items) > 64:
+            raise ValueError("custom addons: at most 64 entries are allowed")
         out = []
-        for it in items if isinstance(items, list) else []:
+        for it in items:
             if not isinstance(it, dict):
                 continue
             url = str(it.get("url", "")).strip().rstrip("/")
@@ -342,12 +537,94 @@ def _normalize(spec: dict, raw: str):
                 url = url[:-len("/manifest.json")].rstrip("/")
             if not url:
                 continue
-            if not url.startswith(("http://", "https://")):
-                raise ValueError(f"custom addon URL must be http(s): {url[:40]}")
+            _http_url("custom addon URL", url)
             name = str(it.get("name", "")).strip()[:60] or url
             out.append({"name": name, "url": url})
         return json.dumps(out, separators=(",", ":")) if out else ""
+    if kind == "url":
+        return _http_url(spec["key"], raw)
+    if spec["key"] == "ADDON_PUBLIC_URL":
+        return _http_url(spec["key"], raw).rstrip("/")
+    if spec["key"] == "TRUSTED_PROXIES":
+        return _trusted_proxies(raw)
+    if spec["key"] == "ADMIN_USERNAME":
+        if not raw or len(raw) > 128 or ":" in raw or any(ord(c) < 33 for c in raw):
+            raise ValueError("ADMIN_USERNAME: use 1-128 visible characters without ':'")
+    if len(raw.encode("utf-8")) > 8192 or "\x00" in raw:
+        raise ValueError(f"{spec['key']}: value is too long or invalid")
     return raw
+
+
+def _validate_effective(store: dict[str, str]) -> dict[str, str]:
+    """Validate the complete config that the next process would import."""
+    effective = {}
+    for key, spec in _SPECS.items():
+        raw = store[key] if key in store else running(key)
+        norm = _normalize(spec, raw)
+        effective[key] = raw.strip() if norm is None else norm
+
+    def num(key: str) -> float:
+        return float(effective[key])
+
+    if num("BUFFER_AHEAD_GB") > num("BUFFER_CACHE_GB"):
+        raise ValueError("BUFFER_AHEAD_GB must not exceed BUFFER_CACHE_GB")
+    if num("VERIFIED_WANT") > num("MAX_PROBES"):
+        raise ValueError("VERIFIED_WANT must not exceed MAX_PROBES")
+    if num("SLOW_PROBE_RESERVE") >= num("SLOW_TOTAL_DEADLINE"):
+        raise ValueError("SLOW_PROBE_RESERVE must be below SLOW_TOTAL_DEADLINE")
+    if num("FAST_RACE_DEADLINE") > num("TOTAL_DEADLINE"):
+        raise ValueError("FAST_RACE_DEADLINE must not exceed TOTAL_DEADLINE")
+    return effective
+
+
+def validate_pending() -> dict[str, str]:
+    """Raise ValueError unless the entire next-start configuration is valid."""
+    return _validate_effective(_read())
+
+
+def ensure_storage() -> str:
+    """Create and verify the persistent config directory is writable."""
+    directory = os.path.dirname(_path()) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, probe = tempfile.mkstemp(dir=directory, prefix=".write-test-")
+    try:
+        os.write(fd, b"ok")
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+        try:
+            os.unlink(probe)
+        except OSError:
+            pass
+    return directory
+
+
+def storage_ready() -> bool:
+    directory = os.path.dirname(_path()) or "."
+    if not os.path.isdir(directory):
+        return False
+    fd = None
+    probe = ""
+    try:
+        fd, probe = tempfile.mkstemp(dir=directory, prefix=".health-")
+        os.write(fd, b"ok")
+        os.close(fd)
+        fd = None
+        os.unlink(probe)
+        probe = ""
+        return True
+    except OSError:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if probe:
+            try:
+                os.unlink(probe)
+            except OSError:
+                pass
+        return False
 
 
 def save(values: dict[str, str]) -> dict:
@@ -356,7 +633,8 @@ def save(values: dict[str, str]) -> dict:
     value reverts a setting to its env-file/code default (secrets: blank
     keeps the stored one). Returns what changed and whether a restart is
     needed to apply it."""
-    store = _read()
+    original = _read()
+    store = dict(original)
     changed = []
     for key, raw in values.items():
         spec = _SPECS.get(key)
@@ -365,7 +643,7 @@ def save(values: dict[str, str]) -> dict:
         norm = _normalize(spec, str(raw))
         if norm is None:
             continue
-        before = pending(key)
+        before = pending_from(original, key)
         if norm == "" and spec.get("type") != "connection":
             store.pop(key, None)            # revert knob to env/default
         elif spec.get("advanced") and norm == default(key):
@@ -374,6 +652,9 @@ def save(values: dict[str, str]) -> dict:
             store[key] = norm
         if pending_from(store, key) != before:
             changed.append(key)
+    # Validate the complete prospective configuration, not just each changed
+    # field. This catches cross-setting contradictions before restart.
+    _validate_effective(store)
     if changed:
         _write(store)
     return {"changed": changed, "restart_needed": restart_pending()}

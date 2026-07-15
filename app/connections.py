@@ -108,6 +108,42 @@ async def _tmdb(overrides: dict) -> dict:
         return _fail(t0, e)
 
 
+async def _omdb(overrides: dict) -> dict:
+    """Validate the key with one exact-ID lookup (never a title search)."""
+    key = _val("OMDB_API_KEY", overrides)
+    t0 = time.monotonic()
+    if not key:
+        return _fail(t0, "no API key configured")
+    try:
+        response = await _client.get(
+            "https://www.omdbapi.com/",
+            params={"apikey": key, "i": "tt0133093", "r": "json"},
+        )
+        if response.status_code != 200:
+            return _fail(t0, f"HTTP {response.status_code}")
+        try:
+            payload = response.json()
+        except Exception:
+            return _fail(t0, "invalid JSON response")
+        if str(payload.get("Response") or "").lower() != "true":
+            # OMDb returns authentication/quota failures in a HTTP-200 JSON
+            # body.  Never reflect its free-form Error field: it is external
+            # input and provides no value beyond this safe classification.
+            error = str(payload.get("Error") or "").lower()
+            reason = ("request limit reached" if "limit" in error else
+                      "API key rejected" if "api key" in error else
+                      "exact-ID lookup failed")
+            return _fail(t0, reason)
+        if (str(payload.get("imdbID") or "").lower() != "tt0133093"
+                or str(payload.get("Type") or "").lower() != "movie"):
+            return _fail(t0, "unexpected exact-ID response")
+        return _ok(t0, "key accepted · exact IMDb lookup")
+    except Exception as e:
+        # Exception strings from HTTP clients can include the full key-bearing
+        # request URL. The exception class is enough for this credential test.
+        return _fail(t0, type(e).__name__)
+
+
 async def _tvdb(overrides: dict) -> dict:
     key = _val("TVDB_API_KEY", overrides)
     t0 = time.monotonic()
@@ -229,6 +265,7 @@ _TESTS = {
     "jellio": lambda o: _manifest("JELLIO_URL", o),
     "addon": _addon,
     "tmdb": _tmdb,
+    "omdb": _omdb,
     "tvdb": _tvdb,
     "jellyseerr": _jellyseerr,
     "radarr": lambda o: _arr("RADARR", o),

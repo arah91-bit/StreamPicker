@@ -20,6 +20,8 @@ import time
 
 import httpx
 
+from app import content_identity, omdb
+
 logger = logging.getLogger("stream-picker")
 
 TMDB_KEY = os.environ.get("TMDB_API_KEY") or None
@@ -29,6 +31,13 @@ DIGITAL_ASSUME_DAYS = int(os.environ.get("TMDB_DIGITAL_ASSUME_DAYS", "120"))
 _client = httpx.AsyncClient(timeout=8, headers={"User-Agent": "stream-picker"})
 _cache: dict[str, tuple[float, object]] = {}
 _TTL = 6 * 3600
+_NEG_TTL = 120
+
+
+def _put_cache(key: str, value: object) -> None:
+    _cache[key] = (time.monotonic(), value)
+    if len(_cache) > 2000:
+        _cache.pop(next(iter(_cache)))
 
 
 def enabled() -> bool:
@@ -69,7 +78,7 @@ async def digital_released(imdb_id: str) -> bool | None:
         return None
     ck = f"movie:{imdb_id}"
     hit = _cache.get(ck)
-    if hit and time.monotonic() - hit[0] < _TTL:
+    if hit and time.monotonic() - hit[0] < (_TTL if hit[1] is not None else _NEG_TTL):
         return hit[1]
     result: bool | None = None
     try:
@@ -97,7 +106,7 @@ async def digital_released(imdb_id: str) -> bool | None:
     except Exception as e:
         logger.warning(f"tmdb digital_released {imdb_id}: {type(e).__name__}")
         result = None
-    _cache[ck] = (time.monotonic(), result)
+    _put_cache(ck, result)
     return result
 
 
@@ -108,7 +117,7 @@ async def episode_aired(imdb_id: str, season: int, episode: int) -> bool | None:
         return None
     ck = f"tv:{imdb_id}:{season}:{episode}"
     hit = _cache.get(ck)
-    if hit and time.monotonic() - hit[0] < _TTL:
+    if hit and time.monotonic() - hit[0] < (_TTL if hit[1] is not None else _NEG_TTL):
         return hit[1]
     result: bool | None = None
     try:
@@ -121,7 +130,7 @@ async def episode_aired(imdb_id: str, season: int, episode: int) -> bool | None:
     except Exception as e:
         logger.warning(f"tmdb episode_aired {imdb_id}: {type(e).__name__}")
         result = None
-    _cache[ck] = (time.monotonic(), result)
+    _put_cache(ck, result)
     return result
 
 
@@ -156,7 +165,7 @@ async def tmdb_id(media: str, imdb: str) -> int | None:
 TVDB_KEY = os.environ.get("TVDB_API_KEY") or None
 _TVDB = "https://api4.thetvdb.com/v4"
 _tvdb_token: str | None = None
-_seasons_cache: dict[str, dict[int, int] | None] = {}
+_seasons_cache: dict[str, tuple[float, dict[int, int] | None]] = {}
 
 
 async def _tvdb_get(path: str, **params):
@@ -200,8 +209,10 @@ async def _tvdb_season_counts(imdb: str) -> dict[int, int] | None:
 async def _season_counts(imdb: str) -> dict[int, int] | None:
     """{season_number: episode_count} for a series, TMDB first then TVDB.
     Cached per imdb id; None when neither API knows the show."""
-    if imdb in _seasons_cache:
-        return _seasons_cache[imdb]
+    cached = _seasons_cache.get(imdb)
+    if cached and time.monotonic() - cached[0] < (
+            _TTL if cached[1] is not None else _NEG_TTL):
+        return cached[1]
     counts = None
     if TMDB_KEY:
         try:
@@ -218,7 +229,9 @@ async def _season_counts(imdb: str) -> dict[int, int] | None:
             counts = await _tvdb_season_counts(imdb)
         except Exception as e:
             logger.warning(f"tvdb seasons {imdb}: {type(e).__name__}")
-    _seasons_cache[imdb] = counts
+    _seasons_cache[imdb] = (time.monotonic(), counts)
+    if len(_seasons_cache) > 1000:
+        _seasons_cache.pop(next(iter(_seasons_cache)))
     return counts
 
 
@@ -239,9 +252,25 @@ async def next_episode(imdb: str, season: int, ep: int) -> tuple[int, int] | Non
     return None
 
 
-_title_details_cache: dict[tuple[str, str], tuple[str | None, str | None,
-                                                  int | None, str | None]] = {}
+_title_details_cache: dict[tuple[str, str], tuple[float, tuple[
+    str | None, str | None, int | None, str | None]]] = {}
 _title_details_inflight: dict[tuple[str, str], asyncio.Task] = {}
+_identity_cache: dict[tuple[str, str], tuple[float, content_identity.IdentityProfile]] = {}
+_identity_inflight: dict[tuple[str, str], asyncio.Task] = {}
+
+_COUNTRY_REGION = {
+    "united states": "us", "united states of america": "us", "usa": "us",
+    "united kingdom": "uk", "great britain": "uk", "uk": "uk",
+    "australia": "au", "canada": "ca", "japan": "jp",
+    "south korea": "kr", "korea": "kr", "france": "fr",
+    "germany": "de", "spain": "es", "italy": "it",
+}
+
+
+def _region_tags(countries: tuple[str, ...]) -> frozenset[str]:
+    return frozenset(_COUNTRY_REGION[c.strip().lower()]
+                     for c in countries
+                     if c.strip().lower() in _COUNTRY_REGION)
 
 
 async def _title_details(media: str, imdb: str
@@ -249,8 +278,10 @@ async def _title_details(media: str, imdb: str
     """One shared TMDB /find call for title, native title, year and language."""
     base = imdb.split(":")[0]
     key = (media, base)
-    if key in _title_details_cache:
-        return _title_details_cache[key]
+    cached = _title_details_cache.get(key)
+    if cached and time.monotonic() - cached[0] < (
+            _TTL if any(cached[1]) else _NEG_TTL):
+        return cached[1]
     task = _title_details_inflight.get(key)
     if task is None:
         async def fetch():
@@ -267,7 +298,9 @@ async def _title_details(media: str, imdb: str
                 year = int(date[:4]) if date[:4].isdigit() else None
                 lang = (d.get("original_language") or "").lower() or None
                 result = title, orig, year, lang
-                _title_details_cache[key] = result
+                _title_details_cache[key] = (time.monotonic(), result)
+                if len(_title_details_cache) > 1000:
+                    _title_details_cache.pop(next(iter(_title_details_cache)))
                 return result
             except Exception as e:
                 logger.warning(f"tmdb title details {base}: {type(e).__name__}")
@@ -277,6 +310,98 @@ async def _title_details(media: str, imdb: str
         _title_details_inflight[key] = task
         task.add_done_callback(lambda _t, k=key: _title_details_inflight.pop(k, None))
     return await asyncio.shield(task)
+
+
+async def identity_profile(media: str, media_id: str
+                           ) -> content_identity.IdentityProfile:
+    """One shared authoritative identity profile for a picker request.
+
+    TMDB supplies the original/native title and true original language; OMDb is
+    an independent exact-IMDb corroborator for canonical title, year, country,
+    and runtime.  For episodes OMDb's exact Season/Episode form supplies the
+    episode runtime.  Both providers are cached/singleflight, so this function
+    is called once per request identity, never per candidate.
+    """
+    parts = media_id.split(":")
+    base = parts[0].lower()
+    key = (media, media_id.lower())
+    cached = _identity_cache.get(key)
+    if cached and time.monotonic() - cached[0] < _TTL:
+        return cached[1]
+    task = _identity_inflight.get(key)
+    if task is None:
+        async def fetch():
+            tmdb_result = (None, None, None, None)
+            omdb_result = None
+            episode_result = None
+            jobs: list[tuple[str, asyncio.Future | asyncio.Task | object]] = []
+            if TMDB_KEY:
+                jobs.append(("tmdb", _title_details(media, base)))
+            if omdb.enabled():
+                jobs.append(("omdb", omdb.lookup(media, base)))
+                if (media != "movie" and len(parts) == 3
+                        and parts[1].isdigit() and parts[2].isdigit()):
+                    jobs.append(("episode", omdb.lookup_episode(
+                        base, int(parts[1]), int(parts[2]))))
+            if jobs:
+                values = await asyncio.gather(
+                    *(job for _, job in jobs), return_exceptions=True)
+                for (name, _), value in zip(jobs, values):
+                    if isinstance(value, BaseException):
+                        continue
+                    if name == "tmdb":
+                        tmdb_result = value
+                    elif name == "omdb":
+                        omdb_result = value
+                    else:
+                        episode_result = value
+
+            title, original, tmdb_year, _lang = tmdb_result
+            aliases = tuple(dict.fromkeys(
+                value for value in (title, original,
+                                    getattr(omdb_result, "title", None))
+                if value))
+            omdb_year = getattr(omdb_result, "year", None)
+            years = frozenset(y for y in (tmdb_year, omdb_year)
+                              if isinstance(y, int))
+            # A one-year festival/theatrical discrepancy is ordinary. A larger
+            # disagreement means metadata cannot by itself authorize #1; exact
+            # per-item IMDb evidence can still resolve it in the classifier.
+            conflict = bool(tmdb_year and omdb_year
+                            and abs(int(tmdb_year) - int(omdb_year)) > 1)
+            countries = tuple(getattr(omdb_result, "countries", ()) or ())
+            season = episode = None
+            if media != "movie" and len(parts) == 3:
+                if parts[1].isdigit() and parts[2].isdigit():
+                    season, episode = int(parts[1]), int(parts[2])
+            # A series-level OMDb runtime is only a typical value. It must not
+            # masquerade as exact episode evidence when runtime is being used to
+            # disambiguate same-name content.
+            runtime = (getattr(omdb_result, "runtime_seconds", None)
+                       if media == "movie" or season is None
+                       else getattr(episode_result, "runtime_seconds", None))
+            profile = content_identity.IdentityProfile(
+                media=media, imdb_id=base, aliases=aliases, years=years,
+                season=season, episode=episode,
+                region_tags=_region_tags(countries),
+                metadata_conflict=conflict, runtime_seconds=runtime)
+            _identity_cache[key] = (time.monotonic(), profile)
+            if len(_identity_cache) > 2000:
+                _identity_cache.pop(next(iter(_identity_cache)))
+            return profile
+
+        task = asyncio.create_task(fetch())
+        _identity_inflight[key] = task
+        task.add_done_callback(lambda _t, k=key: _identity_inflight.pop(k, None))
+    return await asyncio.shield(task)
+
+
+async def expected_runtime(media: str, media_id: str) -> float | None:
+    """OMDb's exact movie/episode runtime, or None for the existing fallback."""
+    try:
+        return (await identity_profile(media, media_id)).runtime_seconds
+    except Exception:
+        return None
 
 
 async def original_language(media: str, imdb: str) -> str | None:
@@ -291,11 +416,28 @@ async def original_language(media: str, imdb: str) -> str | None:
 
 async def title_year(media: str, imdb: str
                      ) -> tuple[str | None, str | None, int | None]:
-    """(English title, original/native title, year) for an imdb id via TMDB —
+    """(English title, original/native title, year) for an exact IMDb id —
     used by the acquire fallback to search Sonarr/Radarr by title when the imdb
     id isn't in their metadata. The original name matters because TVDB often
-    lists Asian dramas only under their native (Chinese/Korean/…) title."""
-    if not TMDB_KEY:
+    lists Asian dramas only under their native (Chinese/Korean/…) title. TMDB
+    remains primary; quota-cached OMDb fills a missing canonical title/year."""
+    if not TMDB_KEY and not omdb.enabled():
         return None, None, None
-    title, orig, year, _ = await _title_details(media, imdb)
-    return title, orig, year
+    tmdb_result = ((await _title_details(media, imdb))
+                   if TMDB_KEY else (None, None, None, None))
+    omdb_result = await omdb.lookup(media, imdb) if omdb.enabled() else None
+    title, orig, year, _ = tmdb_result
+    return (title or getattr(omdb_result, "title", None), orig,
+            year or getattr(omdb_result, "year", None))
+
+
+async def shutdown() -> None:
+    for task in list(_title_details_inflight.values()) + list(_identity_inflight.values()):
+        task.cancel()
+    tasks = list(_title_details_inflight.values()) + list(_identity_inflight.values())
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    _title_details_inflight.clear()
+    _identity_inflight.clear()
+    await omdb.shutdown()
+    await _client.aclose()

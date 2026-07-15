@@ -73,7 +73,10 @@ class ProbeResult:
     # HLS variants declare theirs above). Feeds decode-compatibility demotion.
     acodecs: tuple = ()      # audio codec names, () = not sniffed
     vcodec: str = ""         # video codec name, "" = not sniffed
+    audio_langs: tuple = ()  # normalized ISO-639-1 audio-track languages
     media_secs: float = 0.0  # measured duration (playlist sum / container), 0 = unknown
+    content_kind: str = ""   # "file" or "hls" after content sniffing
+    encrypted: bool = False  # HLS playlist declares encrypted media segments
     head: bytes = field(default=b"", repr=False)   # transient; cleared by probe()
 
 
@@ -134,14 +137,70 @@ def _looks_text(head: bytes) -> bool:
     return head.lstrip()[:1] in (b"<", b"{")
 
 
-def _hls_first_uri(text: str) -> str:
-    """First URI line of an HLS playlist — the first variant in a master
-    playlist, or the first media segment in a media playlist."""
+def _looks_media_payload(content_type: str, head: bytes,
+                         encrypted: bool = False) -> bool:
+    """Conservative media check for direct files and HLS segments."""
+    ct = (content_type or "").split(";", 1)[0].strip().lower()
+    if ct.startswith("text/") or any(x in ct for x in ("json", "html", "xml")):
+        return False
+    h = bytes(head[:256])
+    magic = (
+        h.startswith(b"\x1aE\xdf\xa3") or h.startswith(b"OggS") or
+        h.startswith(b"FLV") or
+        (h.startswith(b"RIFF") and h[8:12] in (b"AVI ", b"WAVE")) or
+        (len(h) >= 12 and h[4:8] in (b"ftyp", b"styp", b"moof")) or
+        b"ftyp" in h[:64] or
+        h.startswith((b"\x00\x00\x01\xba", b"\x00\x00\x01\xb3")) or
+        h[:1] == b"G" or h.startswith(b"ID3") or
+        (len(h) >= 2 and h[0] == 0xFF and (h[1] & 0xF0) == 0xF0)
+    )
+    if magic or ct.startswith(("video/", "audio/")):
+        return True
+    # Declared AES HLS segments are opaque until the player decrypts them.
+    return encrypted and ct in ("", "application/octet-stream", "binary/octet-stream")
+
+
+def _hls_variants(text: str) -> list[tuple[str, dict]]:
+    """Master-playlist variants paired with their declared quality."""
+    variants: list[tuple[str, dict]] = []
+    pending = ""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("#EXT-X-STREAM-INF:"):
+            pending = line
+            continue
+        if line and not line.startswith("#") and pending:
+            info: dict = {}
+            m = _BANDWIDTH_RE.search(pending)
+            if m:
+                info["media_bps"] = float(m.group(1))
+            m = _RESOLUTION_RE.search(pending)
+            if m:
+                info["media_height"] = int(m.group(1))
+            m = _CODECS_RE.search(pending)
+            if m:
+                info["media_codecs"] = m.group(1)[:60]
+            variants.append((line, info))
+            pending = ""
+    return variants
+
+
+def _hls_target(text: str) -> tuple[str, dict]:
+    """Best master variant, or first segment for an ordinary media playlist."""
+    variants = _hls_variants(text)
+    if variants:
+        return max(variants, key=lambda item: (
+            item[1].get("media_height", 0), item[1].get("media_bps", 0)))
     for line in text.splitlines():
         line = line.strip()
         if line and not line.startswith("#"):
-            return line
-    return ""
+            return line, {}
+    return "", {}
+
+
+def _hls_first_uri(text: str) -> str:
+    """Compatibility helper returning the URI selected by current policy."""
+    return _hls_target(text)[0]
 
 
 _EXTINF_RE = re.compile(r"#EXTINF:([\d.]+)")
@@ -175,35 +234,54 @@ _CODECS_RE = re.compile(r'\bCODECS="([^"]*)"')
 
 
 def _hls_variant_info(text: str) -> dict:
-    """Declared quality of the variant the probe will descend into: the
-    EXT-X-STREAM-INF attributes directly above the first URI of a master
-    playlist, keyed to match ProbeResult's media_* fields. Empty for media
-    playlists — segments declare nothing."""
-    last_inf = ""
-    for line in text.splitlines():
-        line = line.strip()
-        if line.startswith("#EXT-X-STREAM-INF:"):
-            last_inf = line
-        elif line and not line.startswith("#"):
-            break
-    if not last_inf:
-        return {}
-    info: dict = {}
-    m = _BANDWIDTH_RE.search(last_inf)
-    if m:
-        info["media_bps"] = float(m.group(1))
-    m = _RESOLUTION_RE.search(last_inf)
-    if m:
-        info["media_height"] = int(m.group(1))
-    m = _CODECS_RE.search(last_inf)
-    if m:
-        info["media_codecs"] = m.group(1)[:60]
-    return info
+    """Declared quality of the best variant selected by the probe."""
+    return _hls_target(text)[1]
+
+
+_CONTENT_RANGE_RE = re.compile(r"^bytes\s+(\d+)-(\d+)/(\d+)$", re.I)
+
+
+async def _probe_spots(url: str, total: int, ttfb_max: float,
+                       headers: dict | None) -> str:
+    """Validate middle and tail availability for a slow direct-file probe."""
+    if total < 2 * 1024 * 1024:
+        return ""
+    sample = min(256 * 1024, max(total // 64, 64 * 1024))
+    starts = dict.fromkeys((max(total // 2 - sample // 2, 0),
+                            max(total - sample, 0)))
+    timeout = httpx.Timeout(connect=10, read=max(20.0, ttfb_max + 5),
+                            write=10, pool=10)
+    for label, start in zip(("middle", "tail"), starts):
+        end = min(start + sample - 1, total - 1)
+        req = dict(headers or {})
+        req["Range"] = f"bytes={start}-{end}"
+        try:
+            async with _client.stream("GET", url, headers=req,
+                                      timeout=timeout) as resp:
+                if resp.status_code != 206:
+                    return f"{label} range HTTP {resp.status_code}"
+                m = _CONTENT_RANGE_RE.fullmatch(
+                    (resp.headers.get("content-range") or "").strip())
+                if not m or int(m.group(1)) != start or int(m.group(3)) != total:
+                    return f"{label} bad Content-Range"
+                got = 0
+                async for chunk in resp.aiter_bytes():
+                    got += len(chunk)
+                    if got >= end - start + 1:
+                        break
+                if got < end - start + 1:
+                    return f"{label} short body ({got} bytes)"
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return f"{label} {type(exc).__name__}"
+    return ""
 
 
 async def probe(url: str, need_bps: float | None, ttfb_max: float,
                 headers: dict | None = None,
-                expect_secs: float | None = None) -> ProbeResult:
+                expect_secs: float | None = None,
+                verify_size: int | None = None) -> ProbeResult:
     """need_bps is the file's real bitrate (size/runtime) or None if unknown.
     `headers` are the stream's declared upstream request headers (proxyHeaders)
     — referer-gated hosts reject bare requests, so probing without them fails
@@ -216,8 +294,9 @@ async def probe(url: str, need_bps: float | None, ttfb_max: float,
                          expect_secs=expect_secs)
     if r.ok and r.head and CODEC_SNIFF and vprobe.enabled():
         try:
-            ac, vc, secs = await vprobe.codecs_of(r.head)
+            ac, vc, secs, langs = await vprobe.media_info_of(r.head)
             r.acodecs, r.vcodec = tuple(ac), vc
+            r.audio_langs = tuple(langs)
             if secs:
                 r.media_secs = secs
         except Exception:
@@ -225,6 +304,10 @@ async def probe(url: str, need_bps: float | None, ttfb_max: float,
     r.head = b""            # transient sniff buffer — never leaves this module
     if r.ok and expect_secs:
         reason = _duration_reason(r.media_secs, expect_secs)
+        if reason:
+            r.ok, r.reason = False, reason
+    if r.ok and verify_size:
+        reason = await _probe_spots(url, int(verify_size), ttfb_max, headers)
         if reason:
             r.ok, r.reason = False, reason
     return r
@@ -311,11 +394,13 @@ async def _probe_url(url: str, required: float, ttfb_max: float,
             ttfb = t_first - t0
             if is_playlist:
                 text = body.decode("utf-8", errors="replace")
-                uri = _hls_first_uri(text)
+                uri, selected = _hls_target(text)
                 if not uri:
                     return ProbeResult(False, ttfb=ttfb, **ni,
                                        reason="empty playlist")
-                media = dict(media or _hls_variant_info(text))
+                media = dict(media or selected)
+                if "#EXT-X-KEY" in text and "METHOD=NONE" not in text:
+                    media["encrypted"] = True
                 dur = _hls_duration(text)
                 if dur:
                     # The playlist declares its full runtime — judge it before
@@ -335,6 +420,10 @@ async def _probe_url(url: str, required: float, ttfb_max: float,
                 if hops == 0 or got == 0:
                     return ProbeResult(False, ttfb=ttfb, speed_bps=speed, **ni,
                                        reason=f"short body ({got} bytes)")
+                if not _looks_media_payload(
+                        ctype, head, encrypted=bool((media or {}).get("encrypted"))):
+                    return ProbeResult(False, ttfb=ttfb, speed_bps=speed, **ni,
+                                       reason="HLS segment is not media")
                 if got >= _SEGMENT_JUDGE_BYTES and speed < required:
                     return ProbeResult(
                         False, ttfb=ttfb, speed_bps=speed, **ni,
@@ -342,15 +431,20 @@ async def _probe_url(url: str, required: float, ttfb_max: float,
                                f"{required / 1e6:.1f} MB/s",
                     )
                 return ProbeResult(True, ttfb=ttfb, speed_bps=speed, **ni,
-                                   **(media or {}))
+                                   content_kind="hls", **(media or {}))
             elif speed < required:
                 return ProbeResult(
                     False, ttfb=ttfb, speed_bps=speed, **ni,
                     reason=f"{speed / 1e6:.1f} MB/s < required {required / 1e6:.1f} MB/s",
                 )
             else:
+                if not _looks_media_payload(
+                        ctype, head, encrypted=bool((media or {}).get("encrypted"))):
+                    return ProbeResult(False, ttfb=ttfb, speed_bps=speed, **ni,
+                                       reason="not a recognized media container")
                 return ProbeResult(True, ttfb=ttfb, speed_bps=speed, **ni,
                                    head=bytes(sniff) if hops == 0 else b"",
+                                   content_kind="hls" if hops else "file",
                                    **(media or {}))
     except asyncio.CancelledError:
         raise
@@ -358,7 +452,11 @@ async def _probe_url(url: str, required: float, ttfb_max: float,
         # Exception text from HTTP clients can contain the full credentialed
         # request URL. The class is enough for retry/reputation classification.
         return ProbeResult(False, reason=type(e).__name__)
-    return await _probe_url(urljoin(playlist_url, uri), required, ttfb_max,
+    next_required = required
+    if media and media.get("media_bps"):
+        # HLS BANDWIDTH is bits/s; probe throughput is measured in bytes/s.
+        next_required = float(media["media_bps"]) / 8 * SAFETY_FACTOR
+    return await _probe_url(urljoin(playlist_url, uri), next_required, ttfb_max,
                             t0, hops + 1, media=media, headers=headers,
                             expect_secs=expect_secs)
 
@@ -366,7 +464,7 @@ async def _probe_url(url: str, required: float, ttfb_max: float,
 async def probe_batch(
     candidates: list[dict], need_bps_of, ttfb_max: float,
     want: int, batch_size: int = 3, deadline: float | None = None,
-    expect_secs: float | None = None,
+    expect_secs: float | None = None, deep_check_of=None,
 ) -> list[tuple[dict, ProbeResult]]:
     """Probe candidates in upstream-preference order, batch_size at a time,
     stopping once `want` have passed. Returns [(stream, result)] for passes,
@@ -384,7 +482,9 @@ async def probe_batch(
         results = await asyncio.gather(
             *(probe(s["url"], need_bps_of(s), ttfb_max,
                     headers=hlsproxy.request_headers(s),
-                    expect_secs=expect_secs) for s in batch)
+                    expect_secs=expect_secs,
+                    verify_size=(deep_check_of(s) if deep_check_of else None))
+              for s in batch)
         )
         for s, r in zip(batch, results):
             _record(s, r, secrets.token_urlsafe(12))
@@ -403,7 +503,7 @@ async def probe_batch(
 async def probe_race(
     candidates: list[dict], need_bps_of, ttfb_max: float,
     want: int, concurrency: int = 8, deadline: float | None = None,
-    expect_secs: float | None = None,
+    expect_secs: float | None = None, deep_check_of=None, outcomes=None,
 ) -> list[tuple[dict, ProbeResult]]:
     """Like probe_batch, but keeps up to `concurrency` probes in flight at once
     and returns the instant `want` have passed — every still-pending probe is
@@ -427,7 +527,8 @@ async def probe_race(
             running[asyncio.create_task(
                 probe(s["url"], need_bps_of(s), ttfb_max,
                       headers=hlsproxy.request_headers(s),
-                      expect_secs=expect_secs))] = (
+                      expect_secs=expect_secs,
+                      verify_size=(deep_check_of(s) if deep_check_of else None)))] = (
                     s, secrets.token_urlsafe(12))
 
     _fill()
@@ -447,6 +548,8 @@ async def probe_race(
                 except Exception as e:         # defensive; probe() rarely raises
                     r = ProbeResult(False, reason=type(e).__name__)
                 _record(s, r, attempt_id)
+                if outcomes is not None:
+                    outcomes.append((s, r))
                 label = (s.get("behaviorHints", {}).get("filename")
                          or s.get("name", "?")).replace("\n", " ")[:70]
                 if r.ok:
@@ -461,3 +564,7 @@ async def probe_race(
         if running:
             await asyncio.gather(*running, return_exceptions=True)
     return passed
+
+
+async def shutdown() -> None:
+    await _client.aclose()

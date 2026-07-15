@@ -43,7 +43,7 @@ class ReleaseIdentTests(unittest.TestCase):
         # addons, byte-identical except one reports size+1.
         a = _copy("AddonA 2160p", "https://a.example/1", size=57_294_863_728)
         b = _copy("AddonB 4K", "https://b.example/2", size=57_294_863_729)
-        self.assertTrue(picker._release_ident(a).startswith("size:"))
+        self.assertTrue(picker._release_ident(a).startswith("weak:"))
         self.assertEqual(picker._release_ident(a), picker._release_ident(b))
 
     def test_different_sizes_are_different_releases(self):
@@ -148,11 +148,14 @@ class FastRaceDedupTests(unittest.IsolatedAsyncioTestCase):
 
         async def fake_probe_race(candidates, need_bps_of, ttfb_max, want,
                                   concurrency=8, deadline=None,
-                                  expect_secs=None):
+                                  expect_secs=None, outcomes=None, **_kwargs):
             stream = candidates[0]
             probed_urls.append(stream["url"])
             await asyncio.sleep(0.02)
             if stream["url"] in failing_urls:
+                if outcomes is not None:
+                    outcomes.append((stream, probe.ProbeResult(
+                        False, reason="HTTP 404")))
                 return []
             return [(stream, probe.ProbeResult(True, ttfb=0.1,
                                                speed_bps=50_000_000))]
@@ -199,16 +202,17 @@ class FastRaceDedupTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(copies[1]["url"], probed_urls)
         self.assertTrue(verified)
 
-    async def test_host_with_repeated_failures_is_benched_for_the_pick(self):
-        # Six distinct releases on one flaky host (all fail), one on a healthy
-        # host. Probe completions can land in partial batches, so a couple of
-        # extra flaky probes may dispatch before the third failure registers —
-        # the invariant is that the bench eventually stops the bleeding (some
-        # flaky candidates are never probed) and the healthy host still wins.
+    async def test_release_failures_do_not_bench_an_entire_provider(self):
+        # Release-specific misses behind a shared wrapper hostname must not hide
+        # a later healthy release from that provider. Host circuit breaking is
+        # reserved for systemic transport/5xx evidence.
         flaky = [_copy("Flaky 2160p", f"https://flaky.example/{i}",
                        size=20_000_000_000 + i * 1_000_000_000)
                  for i in range(6)]
-        healthy = _copy("Healthy 1080p", "https://healthy.example/ok",
+        # Put the healthy release behind the same provider hostname and after
+        # all six release-specific 404s. If 404s were misclassified as a host
+        # outage, this final source would be benched and never verify.
+        healthy = _copy("Healthy 1080p", "https://flaky.example/ok",
                         size=8_000_000_000)
         streams = flaky + [healthy]
 
@@ -216,9 +220,10 @@ class FastRaceDedupTests(unittest.IsolatedAsyncioTestCase):
             verified, probed_urls = await self._race(
                 streams, failing_urls={s["url"] for s in flaky})
 
-        flaky_probed = [u for u in probed_urls if "flaky.example" in u]
+        failing = {s["url"] for s in flaky}
+        flaky_probed = [u for u in probed_urls if u in failing]
         self.assertGreaterEqual(len(flaky_probed), 3)
-        self.assertLess(len(flaky_probed), 6)      # bench kicked in
+        self.assertEqual(6, len(flaky_probed))
         self.assertIn(healthy["url"], probed_urls)
         self.assertEqual(healthy["url"], verified[0][0]["url"])
 

@@ -32,6 +32,12 @@ from pathlib import Path
 
 logger = logging.getLogger("stream-picker")
 
+# A search-capable indexer whose NZB endpoint has never once worked after this
+# much evidence is not an alternate source; it is a persistent latency trap
+# (observed live as 0/140 HTTP 403s). Keep the evidence in SQLite and suppress
+# future fetches until the health database is deliberately reset/replaced.
+FETCH_BLOCK_FAILURES = 20.0
+
 ENABLED = os.environ.get("NZB_HEALTH", "1").lower() not in ("0", "false", "")
 DB_PATH = os.environ.get(
     "NZB_HEALTH_DB",
@@ -45,10 +51,49 @@ HARD_FAILURES_TO_BLOCK = int(os.environ.get("NZB_HARD_FAILURES_TO_BLOCK", "2"))
 HALF_LIFE = float(os.environ.get("NZB_INDEXER_HALF_LIFE_DAYS", "45")) * 86400
 
 _CANON_RE = re.compile(r"[^a-z0-9]+")
+_IMDB_RE = re.compile(r"^(?:tt)?(\d+)$", re.I)
 
 
-def release_key(title: str, size: int | float | None) -> str:
-    """High-entropy, non-secret identity for one exact Usenet release."""
+def _content_scope(media: str | None, media_id: str | None) -> str:
+    """Canonical requested-title scope for a release-health identity.
+
+    Older callers supplied only title and size.  Keeping an empty scope for that
+    form preserves their stable keys (and the existing database/dashboard), while
+    the direct lane now supplies both values so two same-named works can never
+    share health or mount state.  Episode scope is semantic rather than textual:
+    ``:01:002`` and ``:1:2`` intentionally identify the same episode.
+    """
+    kind = (media or "").strip().lower()
+    raw = (media_id or "").strip()
+    if not kind or not raw:
+        return ""
+    if kind == "movie":
+        kind = "movie"
+    elif kind in ("series", "tv"):
+        kind = "series"
+    else:
+        return ""
+    parts = raw.split(":")
+    imdb_match = _IMDB_RE.fullmatch(parts[0].strip())
+    if not imdb_match:
+        return ""
+    imdb = f"tt{imdb_match.group(1).lstrip('0') or '0'}"
+    if kind == "movie":
+        return f"movie:{imdb}"
+    if (len(parts) != 3 or not parts[1].strip().isdigit()
+            or not parts[2].strip().isdigit()):
+        return ""
+    return f"series:{imdb}:{int(parts[1])}:{int(parts[2])}"
+
+
+def release_key(title: str, size: int | float | None,
+                media: str | None = None, media_id: str | None = None) -> str:
+    """High-entropy, non-secret identity for one exact requested release.
+
+    ``media`` + ``media_id`` opt into the scoped v2 identity.  The two-argument
+    form remains byte-for-byte compatible for old databases, tests, telemetry,
+    and manually constructed streams.
+    """
     canonical = _CANON_RE.sub("", (title or "").lower())
     try:
         exact_size = max(0, int(size or 0))
@@ -56,12 +101,16 @@ def release_key(title: str, size: int | float | None) -> str:
         exact_size = 0
     if len(canonical) < 8:
         return ""
-    digest = hashlib.sha256(f"{canonical}\0{exact_size}".encode()).hexdigest()
+    scope = _content_scope(media, media_id)
+    material = (f"{scope}\0{canonical}\0{exact_size}" if scope
+                else f"{canonical}\0{exact_size}")
+    digest = hashlib.sha256(material.encode()).hexdigest()
     return f"nzb:{digest}"
 
 
 _HARD_REASON_RE = re.compile(
     r"missing[\s._-]*articles?|not[\s._-]*(?:video|media)|wrong[\s._-]*episode|"
+    r"wrong[\s._-]*(?:title|year|identity|imdb|media|season)|"
     r"empty body|"
     r"short body|http\s+(?:404|410)\b",
     re.I,
@@ -98,8 +147,13 @@ def _safe_reason(reason: str, kind: str) -> str:
             return "short-body"
         if "empty body" in r:
             return "empty-body"
-        if "episode" in r:
+        if "episode" in r or "season" in r:
             return "wrong-episode"
+        if "year" in r:
+            return "wrong-year"
+        if ("title" in r or "identity" in r or "imdb" in r
+                or "media" in r):
+            return "wrong-title"
         return "not-video"
     if "timeout" in r or "first byte" in r:
         return "timeout"
@@ -173,6 +227,8 @@ class HealthStore:
                     name TEXT PRIMARY KEY,
                     search_ok REAL NOT NULL DEFAULT 0,
                     search_fail REAL NOT NULL DEFAULT 0,
+                    search_results REAL NOT NULL DEFAULT 0,
+                    search_latency REAL NOT NULL DEFAULT 0,
                     fetch_ok REAL NOT NULL DEFAULT 0,
                     fetch_fail REAL NOT NULL DEFAULT 0,
                     probe_ok REAL NOT NULL DEFAULT 0,
@@ -182,6 +238,15 @@ class HealthStore:
                 );
                 """
             )
+            # Forward-only, idempotent migration for databases created before
+            # search yield/latency became part of adaptive indexer evidence.
+            columns = {str(row[1]) for row in
+                       conn.execute("PRAGMA table_info(indexer_health)")}
+            for column in ("search_results", "search_latency"):
+                if column not in columns:
+                    conn.execute(
+                        f"ALTER TABLE indexer_health ADD COLUMN {column} "
+                        "REAL NOT NULL DEFAULT 0")
             conn.commit()
             self._conn = conn
             self._secure_files()
@@ -214,7 +279,8 @@ class HealthStore:
 
     def _decay(self, row: sqlite3.Row, now: float) -> dict[str, float]:
         fields = ("search_ok", "search_fail", "fetch_ok", "fetch_fail",
-                  "probe_ok", "probe_fail", "probe_transient")
+                  "probe_ok", "probe_fail", "probe_transient",
+                  "search_results", "search_latency")
         if HALF_LIFE <= 0:
             factor = 1.0
         else:
@@ -231,29 +297,49 @@ class HealthStore:
         if row is None:
             vals = {f: 0.0 for f in ("search_ok", "search_fail", "fetch_ok",
                                      "fetch_fail", "probe_ok", "probe_fail",
-                                     "probe_transient")}
+                                     "probe_transient", "search_results",
+                                     "search_latency")}
         else:
             vals = self._decay(row, now)
         vals[field] += amount
         conn.execute(
             """INSERT INTO indexer_health
-               (name,search_ok,search_fail,fetch_ok,fetch_fail,probe_ok,
-                probe_fail,probe_transient,updated)
-               VALUES (?,?,?,?,?,?,?,?,?)
+               (name,search_ok,search_fail,search_results,search_latency,
+                fetch_ok,fetch_fail,probe_ok,probe_fail,probe_transient,updated)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(name) DO UPDATE SET
                  search_ok=excluded.search_ok, search_fail=excluded.search_fail,
+                 search_results=excluded.search_results,
+                 search_latency=excluded.search_latency,
                  fetch_ok=excluded.fetch_ok, fetch_fail=excluded.fetch_fail,
                  probe_ok=excluded.probe_ok, probe_fail=excluded.probe_fail,
                  probe_transient=excluded.probe_transient, updated=excluded.updated""",
-            (name, vals["search_ok"], vals["search_fail"], vals["fetch_ok"],
-             vals["fetch_fail"], vals["probe_ok"], vals["probe_fail"],
-             vals["probe_transient"], now),
+            (name, vals["search_ok"], vals["search_fail"],
+             vals["search_results"], vals["search_latency"],
+             vals["fetch_ok"], vals["fetch_fail"], vals["probe_ok"],
+             vals["probe_fail"], vals["probe_transient"], now),
         )
 
     def record_search(self, name: str, ok: bool, *, results: int = 0,
                       latency: float = 0.0) -> None:
-        del results, latency  # kept in the API for future diagnostic aggregation
-        self._simple_indexer(name, "search_ok" if ok else "search_fail")
+        if not ENABLED:
+            return
+        with self._lock:
+            try:
+                if self._conn is None:
+                    return
+                self._bump_indexer(name, "search_ok" if ok else "search_fail")
+                self._bump_indexer(name, "search_results",
+                                   max(0.0, float(results)) if ok else 0.0)
+                self._bump_indexer(name, "search_latency",
+                                   max(0.0, float(latency)))
+                self._conn.commit()
+                self._secure_files()
+                self._after_write()
+            except Exception:
+                if self._conn:
+                    self._conn.rollback()
+                logger.debug("usenet search health write failed", exc_info=True)
 
     def record_fetch(self, name: str, ok: bool) -> None:
         self._simple_indexer(name, "fetch_ok" if ok else "fetch_fail")
@@ -324,14 +410,20 @@ class HealthStore:
                            hard_failures=?,blocked=?,retry_at=?,last_reason=?
                            WHERE release_key=?""",
                         (_safe_label(label), now, now, hard, blocked,
-                         now + HARD_RETRY, _safe_reason(reason, kind), key),
+                         max(float(row["retry_at"] or 0), now + HARD_RETRY),
+                         _safe_reason(reason, kind), key),
                     )
                 else:
+                    # A transient sibling observation must never shorten an
+                    # existing hard cooldown.  retry_at is monotonic until a
+                    # verified success explicitly rehabilitates the release.
+                    retry_at = max(float(row["retry_at"] or 0),
+                                   now + TRANSIENT_RETRY)
                     conn.execute(
                         """UPDATE release_health SET label=?,last_seen=?,last_failure=?,
                            transient_failures=transient_failures+1,retry_at=?,
                            last_reason=? WHERE release_key=?""",
-                        (_safe_label(label), now, now, now + TRANSIENT_RETRY,
+                        (_safe_label(label), now, now, retry_at,
                          _safe_reason(reason, kind), key),
                     )
 
@@ -339,13 +431,10 @@ class HealthStore:
                     "INSERT INTO probe_evidence VALUES (?,?,?,?)",
                     (key, attempt_hash, now, kind),
                 )
-                # At most eight replay/idempotency markers per release.
-                conn.execute(
-                    """DELETE FROM probe_evidence WHERE release_key=? AND attempt_hash
-                       NOT IN (SELECT attempt_hash FROM probe_evidence
-                               WHERE release_key=? ORDER BY ts DESC LIMIT 8)""",
-                    (key, key),
-                )
+                # Do not evict old attempt markers merely because a release has
+                # accumulated newer probes.  That allowed attempt #1 to become
+                # a fresh strike again after attempt #9.  Global age/storage
+                # compaction below remains the bounded retention mechanism.
                 field = "probe_ok" if ok else (
                     "probe_fail" if kind == "hard" else "probe_transient")
                 for indexer in dict.fromkeys(_safe_indexer(x) for x in indexers):
@@ -476,6 +565,41 @@ class HealthStore:
             except Exception:
                 return 0.5
 
+    def fetch_allowed(self, name: str) -> bool:
+        """False for a persistently proven-dead NZB download endpoint."""
+        name = _safe_indexer(name)
+        with self._lock:
+            try:
+                if self._conn is None or not name:
+                    return True
+                row = self._conn.execute(
+                    "SELECT * FROM indexer_health WHERE name=?", (name,)
+                ).fetchone()
+                if row is None:
+                    return True
+                v = self._decay(row, self._now())
+                return not (v["fetch_ok"] < 0.5
+                            and v["fetch_fail"] >= FETCH_BLOCK_FAILURES)
+            except Exception:
+                return True
+
+    def clear_fetch_health(self, name: str) -> None:
+        """Forget one endpoint's fetch evidence so a repaired account can retry."""
+        name = _safe_indexer(name)
+        if not name:
+            return
+        with self._lock:
+            try:
+                if self._conn is None:
+                    return
+                self._conn.execute(
+                    """UPDATE indexer_health SET fetch_ok=0,fetch_fail=0,
+                       updated=? WHERE name=?""", (self._now(), name))
+                self._conn.commit()
+            except Exception:
+                if self._conn:
+                    self._conn.rollback()
+
     def indexer_samples(self, name: str) -> int:
         name = _safe_indexer(name)
         with self._lock:
@@ -488,7 +612,9 @@ class HealthStore:
                 if row is None:
                     return 0
                 v = self._decay(row, self._now())
-                return int(round(sum(v.values())))
+                events = ("search_ok", "search_fail", "fetch_ok", "fetch_fail",
+                          "probe_ok", "probe_fail", "probe_transient")
+                return int(round(sum(v[field] for field in events)))
             except Exception:
                 return 0
 
@@ -499,8 +625,27 @@ class HealthStore:
                     return []
                 names = [r[0] for r in self._conn.execute(
                     "SELECT name FROM indexer_health ORDER BY name")]
-                rows = [{"name": name, "score": self.indexer_score(name),
-                         "samples": self.indexer_samples(name)} for name in names]
+                rows = []
+                now = self._now()
+                for name in names:
+                    row = self._conn.execute(
+                        "SELECT * FROM indexer_health WHERE name=?", (name,)
+                    ).fetchone()
+                    values = self._decay(row, now) if row is not None else {}
+                    searches = values.get("search_ok", 0) + values.get("search_fail", 0)
+                    successes = values.get("search_ok", 0)
+                    rows.append({
+                        "name": name, "score": self.indexer_score(name),
+                        "samples": self.indexer_samples(name),
+                        "fetch_allowed": self.fetch_allowed(name),
+                        "fetch_ok": round(values.get("fetch_ok", 0), 1),
+                        "fetch_fail": round(values.get("fetch_fail", 0), 1),
+                        "avg_results": round(
+                            values.get("search_results", 0) / max(successes, 1), 1),
+                        "avg_search_ms": round(
+                            1000 * values.get("search_latency", 0) /
+                            max(searches, 1), 0),
+                    })
                 rows.sort(key=lambda r: (r["score"], r["samples"]), reverse=True)
                 return rows
             except Exception:
@@ -593,6 +738,17 @@ def fetch_score(name: str) -> float:
     return store.fetch_score(name) if store else 0.5
 
 
+def fetch_allowed(name: str) -> bool:
+    store = _store()
+    return store.fetch_allowed(name) if store else True
+
+
+def clear_fetch_health(name: str) -> None:
+    store = _store()
+    if store:
+        store.clear_fetch_health(name)
+
+
 def indexer_samples(name: str) -> int:
     store = _store()
     return store.indexer_samples(name) if store else 0
@@ -601,6 +757,15 @@ def indexer_samples(name: str) -> int:
 def indexer_listing() -> list[dict]:
     store = _store()
     return store.indexer_listing() if store else []
+
+
+def close() -> None:
+    """Checkpoint and close the process-wide store during graceful shutdown."""
+    global _default
+    with _default_lock:
+        store, _default = _default, None
+    if store is not None:
+        store.close()
 
 
 def record_search(name: str, ok: bool, *, results: int = 0,

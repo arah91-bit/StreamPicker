@@ -11,6 +11,7 @@ or searches. If the title is already in Radarr/Sonarr it just re-triggers a
 search rather than adding a duplicate.
 """
 
+import asyncio
 import logging
 import os
 import time
@@ -45,6 +46,7 @@ REQUEST_TTL = float(os.environ.get("ACQUIRE_DEDUP_TTL", str(30 * 60)))
 
 _client = httpx.AsyncClient(timeout=30, headers={"User-Agent": "stream-picker"})
 _requested: dict[str, float] = {}
+_inflight: dict[str, asyncio.Task] = {}
 _qp_cache: dict[str, int] = {}
 _rf_cache: dict[str, str] = {}
 
@@ -69,7 +71,7 @@ async def _resolve_qp(base: str, key: str, want: str) -> int:
     pid = next((p["id"] for p in profs
                 if p.get("name", "").lower() == want.lower()), None)
     if pid is None:
-        pid = profs[0]["id"] if profs else 1
+        raise ValueError(f"quality profile {want!r} does not exist at {base}")
     _qp_cache[ck] = pid
     return pid
 
@@ -81,7 +83,9 @@ async def _resolve_rf(base: str, key: str, configured: str | None) -> str:
         return _rf_cache[base]
     rfs = (await _client.get(f"{base}/api/v3/rootfolder",
                              headers={"X-Api-Key": key})).json()
-    path = rfs[0]["path"] if rfs else "/data"
+    if not rfs:
+        raise ValueError(f"no root folder is configured at {base}")
+    path = rfs[0]["path"]
     _rf_cache[base] = path
     return path
 
@@ -130,8 +134,12 @@ async def _radarr(imdb: str) -> bool:
         f"{RADARR_URL}/api/v3/movie?tmdbId={tmdb}", headers=h)).json()
     if existing:
         mid = existing[0]["id"]
-        await _client.post(f"{RADARR_URL}/api/v3/command", headers=h,
-                           json={"name": "MoviesSearch", "movieIds": [mid]})
+        command = await _client.post(
+            f"{RADARR_URL}/api/v3/command", headers=h,
+            json={"name": "MoviesSearch", "movieIds": [mid]})
+        if not 200 <= command.status_code < 300:
+            logger.warning(f"radarr search command failed: HTTP {command.status_code}")
+            return False
         logger.info(f"radarr: '{movie.get('title')}' already in library,"
                     f" triggered search")
         return True
@@ -164,7 +172,11 @@ async def _sonarr(media_id: str) -> bool:
         cmd = ({"name": "SeasonSearch", "seriesId": sid, "seasonNumber": season}
                if season is not None else
                {"name": "SeriesSearch", "seriesId": sid})
-        await _client.post(f"{SONARR_URL}/api/v3/command", headers=h, json=cmd)
+        command = await _client.post(
+            f"{SONARR_URL}/api/v3/command", headers=h, json=cmd)
+        if not 200 <= command.status_code < 300:
+            logger.warning(f"sonarr search command failed: HTTP {command.status_code}")
+            return False
         logger.info(f"sonarr: '{series.get('title')}' already added,"
                     f" search season={season}")
         return True
@@ -206,6 +218,25 @@ async def _jellyseerr(media: str, media_id: str) -> bool:
     return ok
 
 
+async def _perform(media: str, media_id: str, dedup_key: str) -> bool:
+    try:
+        ok = False
+        if JELLYSEERR_URL and JELLYSEERR_KEY:
+            ok = await _jellyseerr(media, media_id)
+        if not ok and _direct_configured(media):
+            ok = await (_radarr(media_id.split(":")[0]) if media == "movie"
+                        else _sonarr(media_id))
+    except Exception:
+        logger.exception(f"acquire {media_id} failed")
+        ok = False
+    if ok:
+        _requested[dedup_key] = time.monotonic()
+        if len(_requested) > 1000:
+            oldest = min(_requested, key=_requested.get)
+            _requested.pop(oldest, None)
+    return ok
+
+
 async def request(media: str, media_id: str) -> bool:
     """Request the title. Prefers Jellyseerr when configured, falling back to a
     direct Sonarr/Radarr add. Deduped per title (per season for series). Returns
@@ -218,17 +249,22 @@ async def request(media: str, media_id: str) -> bool:
     now = time.monotonic()
     if dedup_key in _requested and now - _requested[dedup_key] < REQUEST_TTL:
         return True
-    _requested[dedup_key] = now          # optimistic, so concurrent opens dedup
-    try:
-        ok = False
-        if JELLYSEERR_URL and JELLYSEERR_KEY:
-            ok = await _jellyseerr(media, media_id)
-        if not ok and _direct_configured(media):
-            ok = await (_radarr(media_id.split(":")[0]) if media == "movie"
-                        else _sonarr(media_id))
-    except Exception:
-        logger.exception(f"acquire {media_id} failed")
-        ok = False
-    if not ok:
-        _requested.pop(dedup_key, None)   # let a later open retry
-    return ok
+    task = _inflight.get(dedup_key)
+    if task is None:
+        task = asyncio.create_task(_perform(media, media_id, dedup_key))
+        _inflight[dedup_key] = task
+        task.add_done_callback(lambda done, key=dedup_key:
+                               _inflight.pop(key, None)
+                               if _inflight.get(key) is done else None)
+    # One caller timing out/cancelling must not cancel the shared acquisition.
+    return bool(await asyncio.shield(task))
+
+
+async def shutdown() -> None:
+    tasks = list(_inflight.values())
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    _inflight.clear()
+    await _client.aclose()

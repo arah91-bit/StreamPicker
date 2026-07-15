@@ -62,7 +62,8 @@ class FailureTelemetryTests(unittest.IsolatedAsyncioTestCase):
         fields = record.call_args.kwargs
         self.assertEqual("nzbdav-dav", fields["stage"])
         self.assertEqual("timeout", fields["reason"])
-        self.assertEqual("ReadTimeout", fields["detail"])
+        self.assertIn("ReadTimeout", fields["detail"])
+        self.assertIn("credentialed URL must not be retained", fields["detail"])
         self.assertNotIn("secret", str(fields))
 
     async def test_fetch_http_failure_retains_status_without_url(self) -> None:
@@ -89,7 +90,8 @@ class FailureTelemetryTests(unittest.IsolatedAsyncioTestCase):
         fields = record.call_args.kwargs
         self.assertEqual("nzb-fetch", fields["stage"])
         self.assertEqual("http-403", fields["reason"])
-        self.assertEqual("HTTPStatusError HTTP 403", fields["detail"])
+        self.assertIn("HTTPStatusError HTTP 403", fields["detail"])
+        self.assertIn("body=forbidden", fields["detail"])
         self.assertNotIn("do-not-store", str(fields))
 
     async def test_repeated_put_status_is_one_stable_failure_sample(self) -> None:
@@ -121,7 +123,7 @@ class FailureTelemetryTests(unittest.IsolatedAsyncioTestCase):
         fields = record.call_args.kwargs
         self.assertEqual("nzbdav-put", fields["stage"])
         self.assertEqual("http-503", fields["reason"])
-        self.assertEqual("HTTP 503", fields["detail"])
+        self.assertIn("HTTP 503", fields["detail"])
 
     async def test_mounted_non_video_content_records_a_hard_failure(self) -> None:
         release = _release()

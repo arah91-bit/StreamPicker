@@ -7,8 +7,9 @@
 #   # edit .env: set ADDON_SECRET (openssl rand -hex 24) and ADDON_PUBLIC_URL
 #   docker compose up -d
 #
-# First run: open  http://<host>:8011/  in a browser (LAN only, no secret) to
-# connect your APIs and choose how streams are handled. Everything you set there
+# First run: open http://<host>:8011/ and create the dashboard
+# username/password used from then on.
+# Everything you set there
 # is written to ./data/config.json and applied on the next restart, so the only
 # value this file really needs is ADDON_SECRET.
 #
@@ -21,6 +22,23 @@ services:
     #   build: .
     container_name: stream-picker
     restart: unless-stopped
+    init: true
+    stop_grace_period: 45s
+    read_only: true
+    cap_drop:
+      - ALL
+    # Used only by app.entrypoint to repair fresh/legacy bind-mount ownership
+    # and drop to UID/GID 1000. The serving process retains no capabilities.
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - SETGID
+      - SETUID
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    tmpfs:
+      - /tmp:rw,nosuid,noexec,size=256m
     ports:
       - "8011:8000"          # host:container — change 8011 if it's already taken
     environment:
@@ -35,7 +53,7 @@ services:
     healthcheck:
       # The slim image has no curl; python3 + urllib is always present.
       test: ["CMD", "python3", "-c",
-             "import urllib.request;urllib.request.urlopen('http://localhost:8000/health', timeout=5)"]
+             "import urllib.request;urllib.request.urlopen('http://localhost:8000/health/ready', timeout=5)"]
       interval: 30s
       timeout: 10s
       retries: 3

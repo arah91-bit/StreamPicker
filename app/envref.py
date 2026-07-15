@@ -56,8 +56,9 @@ def _body(value_fn, commented: bool) -> list[str]:
     L: list[str] = []
 
     L.append("# ── required ──")
-    _emit(L, "ADDON_SECRET", "", "The unguessable path segment gating the addon "
-          "and dashboard. Generate: openssl rand -hex 24", commented=commented,
+    _emit(L, "ADDON_SECRET", "", "The unguessable path segment gating addon "
+          "installation. Generate: "
+          "openssl rand -hex 24", commented=commented,
           secret=True)
     L.append("")
 
@@ -82,7 +83,7 @@ def _body(value_fn, commented: bool) -> list[str]:
         if s["key"] in ("ADDON_NAME", "ADDON_PUBLIC_URL"):
             continue                       # already under identity
         _emit(L, s["key"], value_fn(s["key"]), s.get("desc") or s["label"],
-              commented=commented, secret=False)
+              commented=commented, secret=config.is_secret(s["key"]))
     L.append("")
 
     L.append("# ── advanced tuning ──")

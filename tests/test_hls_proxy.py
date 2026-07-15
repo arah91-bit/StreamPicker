@@ -139,6 +139,113 @@ class SegmentCacheTests(unittest.TestCase):
             self.assertIsNotNone(hlsproxy._cache_get("u1"))
             self.assertIsNotNone(hlsproxy._cache_get("u3"))
 
+    def test_cache_isolated_by_headers_and_candidate(self):
+        url = "https://cdn.example/seg.ts"
+        hlsproxy._cache_put(url, b"private-a", "video/mp2t",
+                            {"Cookie": "session=a"}, "cand-a")
+        self.assertEqual(
+            (b"private-a", "video/mp2t"),
+            hlsproxy._cache_get(url, {"Cookie": "session=a"}, "cand-a"))
+        self.assertIsNone(
+            hlsproxy._cache_get(url, {"Cookie": "session=b"}, "cand-a"))
+        self.assertIsNone(
+            hlsproxy._cache_get(url, {"Cookie": "session=a"}, "cand-b"))
+
+    def test_expired_cache_entry_is_removed(self):
+        with patch.object(hlsproxy, "CACHE_TTL", -1):
+            hlsproxy._cache_put("u", b"x", "video/mp2t")
+        self.assertIsNone(hlsproxy._cache_get("u"))
+        self.assertEqual(0, hlsproxy._seg_cache_bytes)
+
+
+class HlsRangeTests(unittest.TestCase):
+    class Resp:
+        def __init__(self, status, cr=""):
+            self.status_code = status
+            self.headers = {"content-range": cr} if cr else {}
+
+    def test_range_never_accepts_full_body_200(self):
+        self.assertFalse(hlsproxy._range_ok(self.Resp(200), "bytes=10-"))
+        self.assertTrue(hlsproxy._range_ok(
+            self.Resp(206, "bytes 10-19/100"), "bytes=10-19"))
+
+
+class CandidateBoundResourceTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        hlsproxy._seg_cache.clear()
+        hlsproxy._seg_cache_bytes = 0
+
+    tearDown = setUp
+
+    @staticmethod
+    def request(token, url, candidate_key):
+        from starlette.requests import Request
+        import base64
+        u = base64.urlsafe_b64encode(url.encode()).decode().rstrip("=")
+        sig = hlsproxy._sign(token, url, candidate_key)
+        q = f"u={u}&c={candidate_key}&s={sig}"
+        return Request({"type": "http", "method": "GET", "path": "/",
+                        "query_string": q.encode(), "headers": []})
+
+    async def test_bound_resource_uses_its_candidates_headers(self):
+        class FakeResp:
+            status_code = 200
+            headers = {"content-type": "application/octet-stream",
+                       "content-length": "3"}
+            url = "https://cdn.example/key"
+
+            async def aiter_bytes(self):
+                yield b"key"
+
+            async def aclose(self):
+                pass
+
+        class FakeClient:
+            def __init__(self):
+                self.headers = None
+
+            def build_request(self, method, url, headers=None):
+                self.headers = dict(headers or {})
+                return object()
+
+            async def send(self, req, stream=False):
+                return FakeResp()
+
+        client = FakeClient()
+        token, url = "tok-bound", "https://cdn.example/key"
+        entry = {"picker": "fast", "id": "tt1", "cands": [
+            {"key": "one", "u": "master1", "rh": {"Cookie": "one"}},
+            {"key": "two", "u": "master2", "rh": {"Cookie": "two"}},
+        ]}
+        st = hlsproxy._st(token, entry)
+        st["cand"] = entry["cands"][0]
+        with patch.object(hlsproxy, "_client", client):
+            resp = await hlsproxy.serve_resource(
+                token, entry, self.request(token, url, "two"))
+        hlsproxy._active.pop(token, None)
+        self.assertEqual(200, resp.status_code)
+        self.assertEqual("two", client.headers["Cookie"])
+
+    async def test_keys_do_not_count_as_played_segments(self):
+        token = "tok-credit"
+        cand = {"key": "one", "u": "master", "rh": {}}
+        entry = {"picker": "fast", "id": "tt1", "cands": [cand]}
+        st = hlsproxy._st(token, entry)
+        st["cand"] = cand
+        seg = "https://cdn.example/seg.ts"
+        key = "https://cdn.example/key.bin"
+        entry["_hlsseqs"] = {"one|playlist": [seg]}
+        hlsproxy._cache_put(key, b"key", "application/octet-stream", {}, "one")
+        hlsproxy._cache_put(seg, b"segment", "video/mp2t", {}, "one")
+        with patch.object(hlsproxy, "_note_segment") as note:
+            await hlsproxy.serve_resource(
+                token, entry, self.request(token, key, "one"))
+            note.assert_not_called()
+            await hlsproxy.serve_resource(
+                token, entry, self.request(token, seg, "one"))
+            note.assert_called_once()
+        hlsproxy._active.pop(token, None)
+
 
 class WrapIntegrationTests(unittest.TestCase):
     """With the HLS proxy on, playlists wrap like files (and credentialed ones
@@ -221,6 +328,14 @@ class SessionRegistryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(200_000_000, rec.call_args.kwargs["served"])
         self.assertNotIn("tok-played", hlsproxy._active)
 
+    async def test_resumed_flushed_session_reregisters(self):
+        entry = {"picker": "fast", "id": "tt1"}
+        st = hlsproxy._st("tok-resume", entry)
+        st["flushed"] = True
+        hlsproxy._active.pop("tok-resume", None)
+        self.assertIs(st, hlsproxy._st("tok-resume", entry))
+        self.assertIs(entry, hlsproxy._active["tok-resume"])
+
 
 class SegmentFailureTests(unittest.TestCase):
     def test_three_failures_strike_the_release_once(self):
@@ -282,14 +397,16 @@ class LargeBodyStreamingTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(hlsproxy, "_client", FakeClient()):
             with patch.object(hlsproxy, "_MAX_SEG_BUF", 4 * 1024 * 1024):
                 resp = await hlsproxy.serve_resource(token, entry, req)
-        hlsproxy._active.pop(token, None)
         self.assertIsInstance(resp, StreamingResponse)
+        self.assertEqual(1, entry["_hls"]["active"])
         self.assertNotIn(url, hlsproxy._seg_cache)        # too big to cache
         # drain the generator to prove pass-through works end to end
         total = 0
         async for chunk in resp.body_iterator:
             total += len(chunk)
         self.assertEqual(80 * 1024 * 1024, total)
+        self.assertEqual(0, entry["_hls"]["active"])
+        hlsproxy._active.pop(token, None)
 
 
 if __name__ == "__main__":

@@ -44,8 +44,8 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from app import (acquire, decode_health, library, meta, probe, reputation,
-                 sources, telemetry, usenet as nzb_lane, vprobe)
+from app import (acquire, content_identity, decode_health, library, meta, probe,
+                 reputation, sources, telemetry, usenet as nzb_lane, vprobe)
 
 logger = logging.getLogger("stream-picker")
 
@@ -79,7 +79,7 @@ GOOD_TTFB = float(os.environ.get("GOOD_TTFB", "4.0"))
 # Two verified encodes whose bitrates land within this relative band count as
 # the same quality, so measured delivery speed — not a rounding-error of size —
 # decides between them. See _qbps_bucket.
-QUALITY_BAND = float(os.environ.get("QUALITY_BAND", "0.15"))
+QUALITY_BAND = max(0.01, float(os.environ.get("QUALITY_BAND", "0.15")))
 VERIFIED_WANT = int(os.environ.get("VERIFIED_WANT", "2"))
 MAX_PROBES = int(os.environ.get("MAX_PROBES", "6"))
 # A host that keeps failing probes within one pick (a scraper addon's dead
@@ -100,6 +100,13 @@ PROBE_BATCH = int(os.environ.get("FAST_PROBE_BATCH", "3"))
 # Safety cap only; the normal stop condition is the first good verified source.
 FAST_RACE_DEADLINE = float(os.environ.get("FAST_RACE_DEADLINE", "55"))
 CACHE_TTL = float(os.environ.get("CACHE_TTL", str(6 * 3600)))
+# Release catalogs can live for hours, but a signed playback URL must not be
+# treated as freshly verified for that long. Result lists get a short TTL and
+# their leader is re-probed after the still-shorter freshness window.
+RESULT_CACHE_TTL = min(CACHE_TTL, float(os.environ.get("RESULT_CACHE_TTL", "900")))
+CACHE_REVERIFY_AFTER = min(
+    RESULT_CACHE_TTL, float(os.environ.get("CACHE_REVERIFY_AFTER", "120")))
+CACHE_REVERIFY_TTFB = float(os.environ.get("CACHE_REVERIFY_TTFB", "8"))
 # How long a background finisher waits for the (slow) usenet search to finish.
 USENET_FINISH_WAIT = float(os.environ.get("USENET_FINISH_WAIT", "3600"))
 
@@ -137,7 +144,7 @@ SLOW_CONCURRENCY = int(os.environ.get("SLOW_CONCURRENCY", "16"))
 # Reserve a small part of the foreground probe wave for usable direct-Usenet
 # candidates.  Otherwise a healthy 1080p NZB can sit forever below a dense page
 # of nominal 4K debrid results and never get its one chance to prove itself.
-SLOW_NZB_PROBES = max(0, int(os.environ.get("SLOW_NZB_PROBES", "2")))
+SLOW_NZB_PROBES = max(0, int(os.environ.get("SLOW_NZB_PROBES", "4")))
 # The background finisher is off Nuvio's clock, so it digs a little deeper (past
 # the foreground slice) and refines the cached best-quality answer for the retry.
 SLOW_FINISH_MAX_PROBES = int(os.environ.get("SLOW_FINISH_MAX_PROBES", "24"))
@@ -162,6 +169,7 @@ NOTICE_TTL = float(os.environ.get("NOTICE_TTL_SECONDS", str(20 * 60)))
 # finisher dies silently a later open re-checks from scratch. A cached verified
 # result always overrides it sooner.
 CHECKING_NOTICE_TTL = float(os.environ.get("CHECKING_NOTICE_TTL", "180"))
+ACQUIRE_FOREGROUND_WAIT = float(os.environ.get("ACQUIRE_FOREGROUND_WAIT", "3"))
 
 # Files some of the household's players can't decode. 10-bit is fine.
 _12BIT_RE = re.compile(r"12[\s._-]?bit", re.IGNORECASE)
@@ -175,7 +183,7 @@ PROFILES = {
 _client = httpx.AsyncClient(timeout=None, headers={"User-Agent": "Stremio"})
 
 _cache: dict[str, tuple[float, list[dict]]] = {}
-_runtime_cache: dict[str, float] = {}
+_runtime_cache: dict[str, tuple[float, float]] = {}
 _background: dict[str, asyncio.Task] = {}
 # slow cache_key -> (monotonic deadline, kind) for a pending notice, where kind
 # is one of "theatrical" (not out yet), "added" (downloading via *arr), or
@@ -207,10 +215,12 @@ def _publish_fast_verified(
         return
     merged: dict[str, tuple[dict, probe.ProbeResult]] = {}
     prev = _fast_verified.get(cache_key)
-    if prev and time.monotonic() - prev[0] < CACHE_TTL:
+    if prev and time.monotonic() - prev[0] < RESULT_CACHE_TTL:
         for s, r in prev[1]:
             merged[s.get("url")] = (s, r)
     for s, r in verified:
+        if not _identity_leader(s):
+            continue
         clean = _ingested_stream(s)
         merged[clean.get("url")] = (clean, r)
     _fast_verified[cache_key] = (time.monotonic(), list(merged.values()))
@@ -225,9 +235,10 @@ def _take_fast_verified(cache_key: str, profile: dict, runtime: float,
     against the caller's profile so a full-fat 4K verified for the desktop addon
     can't leak into a bandwidth-capped mobile answer. Empty if none/expired."""
     hit = _fast_verified.get(cache_key)
-    if not hit or time.monotonic() - hit[0] >= CACHE_TTL:
+    if not hit or time.monotonic() - hit[0] >= RESULT_CACHE_TTL:
         return []
-    return [(s, r) for s, r in hit[1] if _usable(s, profile, runtime)]
+    return [(s, r) for s, r in hit[1]
+            if _identity_leader(s) and _usable(s, profile, runtime)]
 
 
 def _combine_verified(
@@ -242,7 +253,7 @@ def _combine_verified(
     for tier in tiers:
         for s, r in tier:
             u = s.get("url")
-            if not u or u in seen:
+            if not u or u in seen or not _identity_leader(s):
                 continue
             seen.add(u)
             out.append((s, r))
@@ -279,14 +290,14 @@ _SRC_RES = [
     (re.compile(r"web-?rip|web-?mux", re.I), 30),
     (re.compile(r"hdtv", re.I), 20),
     (re.compile(r"dvd-?rip|\bdvd\b", re.I), 15),
-    (re.compile(r"\bcam\b|telesync|\bts\b|telecine|screener|\bscr\b", re.I), 0),
+    (re.compile(r"\bcam\b|telesync|\b(?:hd|hq)[\s._-]?ts\b|telecine|screener|\bscr\b", re.I), 0),
 ]
 
 # Cam / telesync / telecine / screener / workprint — never served (a theatrical
 # rip is never good enough). Hard-rejected in _usable; their presence also flags
 # the "digital release not out yet" case.
 _CAMTS_RE = re.compile(
-    r"\bcam\b|\bcam-?rip\b|\bhd-?cam\b|telesync|\bts\b|\bhd-?ts\b|telecine|"
+    r"\bcam\b|\bcam-?rip\b|\bhd-?cam\b|telesync|\b(?:hd|hq)[\s._-]?ts\b|telecine|"
     r"\bscreener\b|\bscr\b|\bdvd-?scr\b|workprint|\bpdvd\b", re.I)
 
 
@@ -341,11 +352,15 @@ def _release_ident(s: dict) -> str:
     if sig:
         return sig
     size = (s.get("behaviorHints") or {}).get("videoSize")
-    if size and size >= _SIZE_IDENT_MIN:
-        return f"size:{round(size / 4096)}"
     text = " ".join(filter(None, (s.get("name"), s.get("title"),
                                   s.get("description"))))
     norm = re.sub(r"[^a-z0-9]+", "", text.lower())
+    if size and size >= _SIZE_IDENT_MIN:
+        # Weak, title-local probe identity only. Size is combined with quality
+        # traits so it can collapse scraper copies without ever authorizing
+        # proxy byte reuse (the proxy requires its own strong content identity).
+        traits = f"{_resolution(s)}:{_source_rank(s)}:{_codec_factor(text):.1f}"
+        return f"weak:{round(size / 4096)}:{traits}"
     if len(norm) >= _TEXT_IDENT_MIN:
         return "text:" + hashlib.sha256(norm.encode()).hexdigest()
     return ""
@@ -361,6 +376,16 @@ def _probe_host(s: dict) -> str:
         return (urlsplit(s.get("url") or "").hostname or "").lower()
     except ValueError:
         return ""
+
+
+def _systemic_probe_failure(reason: str) -> bool:
+    """True only for evidence reasonably attributable to the whole host."""
+    low = (reason or "").lower()
+    if any(x in low for x in ("connecterror", "connecttimeout", "pooltimeout",
+                              "name or service", "dns", "http 429")):
+        return True
+    m = re.search(r"http\s+(\d{3})", low)
+    return bool(m and int(m.group(1)) >= 500)
 
 
 # ── TRaSH-guides quality scoring (https://trash-guides.info) ─────────────────
@@ -578,8 +603,11 @@ def _apply_probe_quality(s: dict, r, runtime: float) -> None:
     height = getattr(r, "media_height", 0)
     codecs = (getattr(r, "media_codecs", "") or "").lower()
     acodecs = getattr(r, "acodecs", ()) or ()
+    audio_langs = getattr(r, "audio_langs", ()) or ()
     vcodec = (getattr(r, "vcodec", "") or "").lower()
-    if not bps and not height and not acodecs and not vcodec:
+    content_kind = getattr(r, "content_kind", "") or ""
+    if not bps and not height and not acodecs and not audio_langs and not vcodec \
+            and not content_kind:
         return
     if bps:
         # Declared BANDWIDTH is *peak* video+audio — biased high, so it only
@@ -593,10 +621,27 @@ def _apply_probe_quality(s: dict, r, runtime: float) -> None:
         s["_vcodec"] = "av1"
     if acodecs:
         s["_acodecs"] = list(acodecs)
+    if audio_langs:
+        s["_audio_langs"] = list(audio_langs)
     if vcodec:
         s["_vcodec_real"] = vcodec
+    if content_kind:
+        s["_content_kind"] = content_kind
     s["_qbps"] = _video_bps(s, runtime) or 0
     s["_effres"] = _effective_resolution(s, runtime)
+
+
+def _apply_probe_evidence(s: dict, r, runtime: float) -> bool:
+    """Fold transport/media evidence into one candidate and return #1 eligibility.
+
+    Runtime can corroborate an exact, otherwise ambiguous title. It cannot
+    rescue unknown text or an explicit wrong title/year/episode; that one-way
+    rule lives in :func:`content_identity.assess`.
+    """
+    _apply_probe_quality(s, r, runtime)
+    _assess_stream_identity(
+        s, getattr(r, "media_secs", 0.0) or None, record=True)
+    return _identity_leader(s)
 
 
 # Slow picker only: how many of the current best candidates to ffprobe for their
@@ -638,13 +683,28 @@ async def _refine_video_bitrate(verified: list[tuple[dict, probe.ProbeResult]],
 
 _VERIFIED_STATE_KEY = "_picker_verified"
 _NOTICE_STATE_KEY = "_picker_notice"
+_IDENTITY_STATE_KEY = "_identity_state"
+_IDENTITY_RANK_KEY = "_identity_rank"
+_IDENTITY_EVIDENCE_KEY = "_identity_evidence"
+_IDENTITY_TEXT_KEY = "_identity_text"
+_identity_profile_ctx: ContextVar[content_identity.IdentityProfile | None] = \
+    ContextVar("identity_profile", default=None)
+_identity_logged_ctx: ContextVar[set[str] | None] = \
+    ContextVar("identity_logged", default=None)
 # Identity, rather than a truthy value, makes this impossible to forge through
 # an upstream addon's JSON response.  Raw streams are still scrubbed at every
 # ingestion boundary so even a same-named private field cannot linger.
 _VERIFIED_SENTINEL = object()
 _INTERNAL_KEYS = ("_effres", "_vbitrate", "_vheight", "_vcodec", "_vcodec_real",
-                  "_acodecs", "_qbps", "_speed", "_ttfb",
-                  _VERIFIED_STATE_KEY, _NOTICE_STATE_KEY)
+                  "_acodecs", "_audio_langs", "_content_kind", "_qbps",
+                  "_speed", "_ttfb",
+                  _VERIFIED_STATE_KEY, _NOTICE_STATE_KEY,
+                  _IDENTITY_STATE_KEY, _IDENTITY_RANK_KEY,
+                  _IDENTITY_EVIDENCE_KEY, _IDENTITY_TEXT_KEY,
+                  content_identity._AUTO_ELIGIBLE_KEY,
+                  "_source_key", "_source_trust",
+                  "_library_identity_confidence", "_library_identity_trust",
+                  "_library_identity_evidence")
 
 
 def _ingested_stream(s: dict) -> dict:
@@ -652,13 +712,18 @@ def _ingested_stream(s: dict) -> dict:
     out = dict(s)
     out.pop(_VERIFIED_STATE_KEY, None)
     out.pop(_NOTICE_STATE_KEY, None)
+    out.pop(content_identity._AUTO_ELIGIBLE_KEY, None)
     return out
 
 
 def _strip_internal(s: dict) -> dict:
-    if any(k in s for k in _INTERNAL_KEYS) or any(k.startswith("_nzb_") for k in s):
+    private_prefixes = ("_nzb_", "_identity_", "_picker_", "_library_",
+                        "_source_")
+    if any(k in s for k in _INTERNAL_KEYS) or any(
+            str(k).startswith(private_prefixes) for k in s):
         return {k: v for k, v in s.items()
-                if k not in _INTERNAL_KEYS and not k.startswith("_nzb_")}
+                if k not in _INTERNAL_KEYS
+                and not str(k).startswith(private_prefixes)}
     return s
 
 
@@ -666,6 +731,229 @@ def clean_output(streams: list[dict]) -> list[dict]:
     """Strip internal ranking annotations from streams at the HTTP boundary, so
     they never leak to Nuvio but survive internal re-sorts and caching."""
     return [_strip_internal(s) for s in streams]
+
+
+# ── semantic content identity ───────────────────────────────────────────────
+# A byte probe answers "does this URL play?".  It cannot answer "is this the
+# requested movie/episode?".  These helpers keep that independent identity gate
+# beside the transport gate and make its evidence the first ranking dimension.
+_IMDB_TAG_RE = re.compile(r"(?<![A-Za-z0-9])(tt\d{7,10})(?!\d)", re.I)
+_LEADING_BRACKETS_RE = re.compile(r"^\s*(?:\[[^\]\r\n]{0,100}\]\s*)+")
+_LEADING_RANK_RE = re.compile(r"^\s*(?:[\W_]*\d+\s*[·|:]\s*)", re.UNICODE)
+_FIELD_LINE_RE = re.compile(
+    r"^\s*(?:source|size|audio|language|subtitles?|seeders?|verified)\s*:", re.I)
+_RELEASEISH_RE = re.compile(
+    r"(?:\.(?:mkv|mp4|m4v|avi|mov|m2ts|ts)\b|\b(?:19|20)\d{2}\b|"
+    r"\bS\d{1,3}E\d{1,4}\b|\b\d{3,4}p\b|\b(?:4k|uhd|remux|web-?dl|"
+    r"web-?rip|blu-?ray)\b)", re.I)
+
+
+def _set_identity_profile(profile: content_identity.IdentityProfile | None) -> None:
+    """Install one immutable request identity for all child/background tasks."""
+    _identity_profile_ctx.set(profile)
+    _identity_logged_ctx.set(set())
+
+
+def _clean_identity_line(value: str) -> str:
+    """Remove addon decorations before asking for an exact title boundary."""
+    line = str(value or "").strip()
+    line = _LEADING_BRACKETS_RE.sub("", line)
+    line = _LEADING_RANK_RE.sub("", line)
+    # Emoji/icons often precede the actual filename.  ``[^\w]`` is Unicode
+    # aware, so native-script title letters are retained.
+    line = re.sub(r"^[^\w]+", "", line, flags=re.UNICODE)
+    line = re.sub(r"^(?:release|filename|file|title)\s*:\s*", "", line,
+                  flags=re.I)
+    # A few addons prefix the release with a quality badge and a delimiter.
+    line = re.sub(
+        r"^(?:(?:4320|2160|1440|1080|720|480)p|4k|8k|uhd|hdr(?:10\+?)?)"
+        r"\s*(?:[|:·-]\s*)+", "", line, flags=re.I)
+    return line.strip()
+
+
+def _identity_evidence_strings(s: dict) -> tuple[str, str]:
+    """Return (mounted/declared filename, best independent release label).
+
+    The filename is strongest and any explicit contradiction in it wins.  For
+    addons that omit ``behaviorHints.filename`` (the real wrong-Ghost-in-the-
+    Shell case did), select the most release-like description/title line rather
+    than the addon brand or its Size/Source fields.
+    """
+    filename = _clean_identity_line(
+        ((s.get("behaviorHints") or {}).get("filename") or ""))
+    if s.get("_source_key") == sources.NZB:
+        label = _clean_identity_line(s.get("_nzb_label") or "")
+        return filename, label
+
+    groups: list[list[str]] = []
+    for field in (s.get("description"), s.get("title"), s.get("name")):
+        lines = []
+        for raw in str(field or "").splitlines():
+            if _FIELD_LINE_RE.search(raw):
+                continue
+            # Structured addon descriptions often put seed/size badges before
+            # the release on the same line, separated with | or ·. Consider
+            # each segment so the badge cannot turn a correct title into a
+            # false contradiction.
+            for segment in re.split(r"\s+[|·]\s+", raw):
+                cleaned = _clean_identity_line(segment)
+                if cleaned:
+                    lines.append(cleaned)
+        if lines:
+            groups.append(lines)
+    if not groups:
+        return filename, ""
+    # Prefer the first field that supplied content (description, then title,
+    # then name), and within it the line that most resembles a release name.
+    lines = groups[0]
+    profile = _identity_profile_ctx.get()
+    aliases = tuple(re.sub(r"[^\w]+", "", a.casefold(), flags=re.UNICODE)
+                    for a in (profile.aliases if profile else ()) if a)
+
+    def label_key(value: str) -> tuple[bool, bool, int]:
+        folded = re.sub(r"[^\w]+", "", value.casefold(), flags=re.UNICODE)
+        has_alias = any(alias and alias in folded for alias in aliases)
+        return has_alias, bool(_RELEASEISH_RE.search(value)), len(value)
+
+    label = max(lines, key=label_key)
+    return filename, label
+
+
+def _identity_from_text(profile: content_identity.IdentityProfile,
+                        filename: str, label: str,
+                        measured_runtime_seconds: float | None = None
+                        ) -> content_identity.IdentityAssessment:
+    """Combine filename/label assessments with contradiction dominance."""
+    assessments = [
+        content_identity.assess(
+            profile, value, measured_runtime_seconds=measured_runtime_seconds)
+        for value in (filename, label) if value
+    ]
+    if not assessments:
+        return content_identity.IdentityAssessment(
+            content_identity.UNKNOWN, content_identity.EVIDENCE_UNKNOWN, 1)
+    contradiction = next((a for a in assessments
+                          if a.state == content_identity.CONTRADICTION), None)
+    if contradiction:
+        return contradiction
+    best = max(assessments, key=lambda a: a.rank)
+
+    # A visible exact IMDb tag is useful semantic evidence but is weaker than a
+    # validated Newznab attribute/Jellyfin ProviderId.  It can resolve an
+    # otherwise compatible/unknown label at canonical rank, never override a
+    # title/year/episode contradiction (already handled above).
+    tagged = {m.lower() for value in (filename, label)
+              for m in _IMDB_TAG_RE.findall(value)}
+    if tagged:
+        if tagged != {profile.imdb_id}:
+            return content_identity.IdentityAssessment(
+                content_identity.CONTRADICTION,
+                content_identity.EVIDENCE_CONTRADICTION, 0)
+        if best.state == content_identity.COMPATIBLE:
+            return content_identity.IdentityAssessment(
+                content_identity.STRONG,
+                content_identity.EVIDENCE_CANONICAL,
+                content_identity.EVIDENCE_RANKS[
+                    content_identity.EVIDENCE_CANONICAL])
+    return best
+
+
+def _record_identity_once(s: dict,
+                          assessment: content_identity.IdentityAssessment,
+                          evidence_text: str) -> None:
+    seen = _identity_logged_ctx.get()
+    digest = hashlib.sha256(
+        f"{s.get('_source_key', '')}\0{assessment.state}\0{evidence_text}".encode()
+    ).hexdigest()[:24]
+    if seen is not None:
+        if digest in seen:
+            return
+        seen.add(digest)
+    observed = tuple(sorted({int(y) for y in re.findall(
+        r"(?<!\d)((?:19|20)\d{2})(?!\d)", evidence_text)}))
+    profile = _identity_profile_ctx.get()
+    telemetry.record_identity(
+        s, state=assessment.state, reason=assessment.evidence,
+        source=str(s.get("_source_key") or ""), evidence=evidence_text,
+        expected_years=tuple(sorted(profile.years)) if profile else (),
+        observed_years=observed)
+
+
+def _assess_stream_identity(
+        s: dict, measured_runtime_seconds: float | None = None,
+        *, record: bool = True) -> content_identity.IdentityAssessment:
+    """Classify one candidate, honoring only in-process trusted provenance."""
+    profile = _identity_profile_ctx.get()
+    # Helper-level unit tests and legacy callers that deliberately do not set a
+    # request profile retain their old behavior. Production pick paths always
+    # install a profile before ingesting candidates.
+    if profile is None:
+        result = content_identity.IdentityAssessment(
+            content_identity.STRONG,
+            content_identity.EVIDENCE_TRUSTED_IMDB,
+            content_identity.EVIDENCE_RANKS[
+                content_identity.EVIDENCE_TRUSTED_IMDB])
+        filename, label = _identity_evidence_strings(s)
+    else:
+        filename, label = _identity_evidence_strings(s)
+        source = s.get("_source_key")
+        if (source == sources.NZB and sources.trusted_nzb(s)
+                and s.get("_nzb_identity_confidence") == content_identity.STRONG):
+            evidence = tuple(s.get("_nzb_identity_evidence") or ())
+            trusted_imdb = "newznab-imdb" in evidence
+            tier = (content_identity.EVIDENCE_TRUSTED_IMDB if trusted_imdb
+                    else content_identity.EVIDENCE_CANONICAL)
+            result = content_identity.IdentityAssessment(
+                content_identity.STRONG, tier,
+                content_identity.EVIDENCE_RANKS[tier])
+        elif (source == "library" and library.identity_trusted(s)
+              and s.get("_library_identity_confidence")
+              == content_identity.STRONG):
+            result = content_identity.IdentityAssessment(
+                content_identity.STRONG,
+                content_identity.EVIDENCE_TRUSTED_IMDB,
+                content_identity.EVIDENCE_RANKS[
+                    content_identity.EVIDENCE_TRUSTED_IMDB])
+        else:
+            # ``compatible``/``unknown`` from the trusted Usenet validator are
+            # lower fallbacks.  The common parser may still promote compatible
+            # exact-title evidence after a measured runtime match.
+            result = _identity_from_text(
+                profile, filename, label, measured_runtime_seconds)
+            nzb_state = (s.get("_nzb_identity_confidence")
+                         if source == sources.NZB and sources.trusted_nzb(s)
+                         else None)
+            if nzb_state == content_identity.UNKNOWN:
+                result = content_identity.IdentityAssessment(
+                    content_identity.UNKNOWN,
+                    content_identity.EVIDENCE_UNKNOWN, 1)
+            elif nzb_state == content_identity.COMPATIBLE \
+                    and result.state == content_identity.STRONG \
+                    and result.evidence != content_identity.EVIDENCE_RUNTIME:
+                result = content_identity.IdentityAssessment(
+                    content_identity.COMPATIBLE,
+                    content_identity.EVIDENCE_COMPATIBLE, 2)
+
+    s[_IDENTITY_STATE_KEY] = result.state
+    s[_IDENTITY_RANK_KEY] = result.rank
+    s[_IDENTITY_EVIDENCE_KEY] = result.evidence
+    s[_IDENTITY_TEXT_KEY] = filename or label
+    if record:
+        _record_identity_once(s, result, " | ".join(filter(None, (filename, label))))
+    return result
+
+
+def _annotate_identity(streams: list[dict],
+                       measured_runtime_seconds: float | None = None) -> None:
+    for stream in streams:
+        _assess_stream_identity(stream, measured_runtime_seconds)
+
+
+def _identity_leader(s: dict) -> bool:
+    """Whether this item has enough semantic evidence for automatic playback."""
+    if _identity_profile_ctx.get() is None and _IDENTITY_STATE_KEY not in s:
+        return True
+    return s.get(_IDENTITY_STATE_KEY) == content_identity.STRONG
 
 
 # Hard-coded (burned-in) foreign subtitles — Chinese/Korean-market WEB rips
@@ -700,6 +988,7 @@ def _hardsub(s: dict) -> bool:
 # set ({en, original}) is resolved once per request via TMDB and held here.
 AUDIO_GATE = _env_bool("AUDIO_GATE")
 _accept_langs: ContextVar[frozenset | None] = ContextVar("accept_langs", default=None)
+_original_lang_known: ContextVar[bool] = ContextVar("original_lang_known", default=True)
 
 # Flag emoji (by country) → spoken language (ISO-639-1); addons tag audio tracks
 # with country flags after a 🎙️/🗣️ marker.
@@ -756,6 +1045,10 @@ def _audio_langs(s: dict) -> tuple[set[str], bool]:
     desc = s.get("description") or s.get("title") or ""
     name = s.get("name") or ""
     fname = (s.get("behaviorHints") or {}).get("filename") or ""
+    # A successful ffprobe is stronger than filename/display heuristics.
+    measured = {str(x).lower() for x in (s.get("_audio_langs") or ()) if x}
+    if measured:
+        return measured, len(measured) > 1
     langs: set[str] = set()
     # Subtitle descriptions often say "Multi Subs".  That is not evidence of
     # multilingual *audio*, so use release-name tags plus the structured audio
@@ -786,14 +1079,18 @@ def _audio_langs(s: dict) -> tuple[set[str], bool]:
 
 
 def _audio_ok(s: dict) -> int:
-    """1 if the stream's audio is acceptable (English/original, multi/dual, or
-    simply undetectable → benefit of the doubt), 0 if it provably carries only
-    unacceptable languages. Top rank component so wrong-audio can't lead."""
+    """Audio confidence: 2 confirmed acceptable, 1 unknown, 0 confirmed wrong."""
     accept = _accept_langs.get()
     if not AUDIO_GATE or not accept:
         return 1
     langs, multi = _audio_langs(s)
-    if multi or not langs or (langs & accept):
+    if langs & accept:
+        return 2
+    if not langs or multi:
+        return 1
+    # When TMDB could not tell us the original language, explicit non-English
+    # may itself be the original; demote it below confirmed English, do not drop.
+    if not _original_lang_known.get():
         return 1
     return 0
 
@@ -809,7 +1106,11 @@ async def _resolve_accept_langs(media: str, media_id: str) -> None:
             orig = await meta.original_language(media, media_id)
     except Exception:
         orig = None
-    _accept_langs.set(frozenset({"en", orig}) if orig else None)
+    # English remains positive evidence even if TMDB is unavailable. In that
+    # case _audio_ok keeps other explicit languages in the unknown tier because
+    # one of them may be the title's original language.
+    _original_lang_known.set(bool(orig))
+    _accept_langs.set(frozenset({"en", orig}) if orig else frozenset({"en"}))
 
 
 def _decode_ok(s: dict) -> int:
@@ -824,7 +1125,8 @@ def _decode_ok(s: dict) -> int:
 
 
 def _quality_key(s: dict):
-    # Order: decode-ok, clean-first, then effective resolution, then bitrate,
+    # Order: identity evidence, audio, decode-ok, clean-first, then resolution,
+    # bitrate,
     # then source tier, then custom-format score, then size. Deliberate
     # departures from Radarr's resolution→source→size order, all from the
     # household's feedback:
@@ -847,7 +1149,11 @@ def _quality_key(s: dict):
     # audio_ok is the very top key: a wrong-language dub (no English, no original)
     # sorts below everything acceptable, whatever its resolution — you can't watch
     # a 4K you don't understand.
-    return (_audio_ok(s), _decode_ok(s), clean, res, qbps, _source_rank(s),
+    identity_rank = s.get(_IDENTITY_RANK_KEY)
+    if identity_rank is None:
+        identity_rank = 5 if _identity_profile_ctx.get() is None else 1
+    return (identity_rank, _audio_ok(s), _decode_ok(s), clean, res, qbps,
+            _source_rank(s),
             _cf_score(s), _size_bytes(s) or 0)
 
 
@@ -883,10 +1189,10 @@ def _delivery_key(qkey: tuple, ttfb: float, speed: float):
     tie, then source tier and custom-format score) and only then fall to
     throughput, so 'when quality is similar, pick the faster-streaming one'.
     Exact bitrate and size are last, purely deterministic tie-breaks."""
-    audio, decode, clean, res, qbps, srank, cf, size = qkey
+    identity, audio, decode, clean, res, qbps, srank, cf, size = qkey
     good_start = 1 if ttfb <= GOOD_TTFB else 0
-    return (audio, decode, clean, good_start, res, _qbps_bucket(qbps), srank,
-            cf, speed, qbps, size)
+    return (identity, audio, decode, clean, good_start, res,
+            _qbps_bucket(qbps), srank, cf, speed, qbps, size)
 
 
 def _verified_key(vr: tuple):
@@ -900,12 +1206,14 @@ def _verified_key(vr: tuple):
 
 
 def _verified_quality_key(vr: tuple):
-    """Pure-quality order for the *slow* / best-quality picker. Once a link is
-    confirmed to play, this picker cares only about picking the single highest
-    quality among the verified ones — start-time and throughput are irrelevant,
-    so it ranks on resolution/bitrate alone. That keeps the best-quality verified
-    stream at #1 instead of letting a prompt-but-lower-res one jump ahead."""
-    return _quality_key(vr[0])
+    """Best-all-around slow order: hard quality first, delivery inside a band."""
+    s, r = vr
+    identity, audio, decode, clean, res, qbps, srank, cf, size = _quality_key(s)
+    ttfb = 0.0 if r is None else r.ttfb
+    speed = LIBRARY_SPEED if r is None else r.speed_bps
+    good_start = 1 if ttfb <= GOOD_TTFB else 0
+    return (identity, audio, decode, clean, res, _qbps_bucket(qbps),
+            good_start, speed, srank, cf, qbps, size)
 
 
 def _marked_key(s: dict):
@@ -917,6 +1225,10 @@ def _marked_key(s: dict):
 
 def _usable(s: dict, profile: dict, runtime: float) -> bool:
     if not s.get("url"):          # infoHash-only p2p entries can't be probed
+        return False
+    # An explicit title/year/episode mismatch is not a low-quality fallback; it
+    # is different media and must never be probed, cached, or served.
+    if s.get(_IDENTITY_STATE_KEY) == content_identity.CONTRADICTION:
         return False
     # Dropped for real: a release the proxy watched deliver badly (see
     # app.reputation) — 'never used again' until the strike decays or is
@@ -960,21 +1272,51 @@ def _eligible_library(lib: list[dict], profile: dict,
                       runtime: float) -> list[dict]:
     """Annotate trusted local files, but keep the same content/language gate."""
     lib = [_ingested_stream(s) for s in lib]
+    _annotate_identity(lib)
     _annotate_quality(lib, runtime)
     return [s for s in lib if _usable(s, profile, runtime)]
 
 
 # ── metadata ────────────────────────────────────────────────────────────────
 
+async def _resolve_identity_profile(
+        media: str, media_id: str,
+        timeout: float | None = None) -> content_identity.IdentityProfile:
+    """Resolve and install the authoritative request profile, failing closed."""
+    try:
+        operation = meta.identity_profile(media, media_id)
+        profile = (await asyncio.wait_for(operation, timeout)
+                   if timeout is not None else await operation)
+    except Exception:
+        parts = media_id.split(":")
+        season = episode = None
+        if media != "movie" and len(parts) == 3 \
+                and parts[1].isdigit() and parts[2].isdigit():
+            season, episode = int(parts[1]), int(parts[2])
+        profile = content_identity.IdentityProfile(
+            media=media, imdb_id=parts[0], aliases=(),
+            season=season, episode=episode)
+    _set_identity_profile(profile)
+    return profile
+
 async def _runtime_seconds(media: str, media_id: str) -> float:
-    """Title runtime via Cinemeta (public, keyless); episode ids use the
-    show's typical runtime. Fallbacks are deliberately generous so bitrate
-    requirements err strict rather than lenient."""
+    """Exact OMDb movie/episode runtime, then Cinemeta, then strict fallback.
+
+    The exact episode key is retained in the cache: using a show's typical
+    runtime as if it described every episode weakens both bitrate estimation and
+    same-name runtime corroboration.
+    """
     base_id = media_id.split(":")[0]
-    key = f"{media}:{base_id}"
-    if key in _runtime_cache:
-        return _runtime_cache[key]
+    key = f"{media}:{media_id}"
+    hit = _runtime_cache.get(key)
+    if hit and time.monotonic() - hit[0] < CACHE_TTL:
+        return hit[1]
     fallback = 6600.0 if media == "movie" else 2400.0
+    exact = await meta.expected_runtime(media, media_id)
+    if exact:
+        seconds = float(exact)
+        _runtime_cache[key] = (time.monotonic(), seconds)
+        return seconds
     try:
         r = await _client.get(
             f"https://v3-cinemeta.strem.io/meta/{media}/{base_id}.json",
@@ -984,7 +1326,9 @@ async def _runtime_seconds(media: str, media_id: str) -> float:
         seconds = int(m.group(1)) * 60 if m else fallback
     except Exception:
         seconds = fallback
-    _runtime_cache[key] = seconds
+    _runtime_cache[key] = (time.monotonic(), seconds)
+    if len(_runtime_cache) > 1000:
+        _runtime_cache.pop(next(iter(_runtime_cache)))
     return seconds
 
 
@@ -993,13 +1337,20 @@ async def _runtime_seconds(media: str, media_id: str) -> float:
 def _mark(s: dict, rank: int, r: probe.ProbeResult | None) -> dict:
     out = _ingested_stream(s)
     out[_VERIFIED_STATE_KEY] = _VERIFIED_SENTINEL
+    # This is the only handoff that authorizes proxy failover.  _assemble feeds
+    # us only transport-passed, strong-identity candidates; the unforgeable
+    # sentinel is applied after _ingested_stream deliberately scrubbed any
+    # upstream attempt to spell the same private key.
+    if _identity_leader(s):
+        content_identity.mark_auto_eligible(out)
     if r is None:        # local library file — reliable, but no probe speed
         out["_ttfb"], out["_speed"] = 0.0, LIBRARY_SPEED
         label = (s.get("name") or "Library").replace("📚", "").strip()
         out["name"] = f"📚 {rank} · {label}"
         return out
     out["_ttfb"], out["_speed"] = r.ttfb, r.speed_bps
-    out["name"] = f"✅ {rank} · " + (s.get("name") or "Stream")
+    icon = "📚" if "📚" in (s.get("name") or "") else "✅"
+    out["name"] = f"{icon} {rank} · " + (s.get("name") or "Stream")
     speed = f"verified {r.speed_bps / 1e6:.0f} MB/s, {r.ttfb:.1f}s start"
     if s.get("description"):
         out["description"] = f"{speed}\n{s['description']}"
@@ -1017,11 +1368,14 @@ def _twins_first(picks: list[dict], rest: list[dict]) -> list[dict]:
     want: dict[str, set[str]] = {}
     for s in picks:
         svc = telemetry.debrid_tag(s.get("name") or "").rstrip("+")
-        want.setdefault(telemetry.signature(s), set()).add(svc)
+        sig = telemetry.signature(s)
+        if sig:
+            want.setdefault(sig, set()).add(svc)
     twins, others = [], []
     for s in rest:
         svc = telemetry.debrid_tag(s.get("name") or "").rstrip("+")
-        services = want.get(telemetry.signature(s))
+        sig = telemetry.signature(s)
+        services = want.get(sig) if sig else None
         if services and svc and svc not in services:
             twins.append(s)          # same release, a debrid/node we aren't serving
         else:
@@ -1037,15 +1391,24 @@ def _assemble(verified: list[tuple[dict, probe.ProbeResult | None]],
     The invariant the pickers rely on: #1 is always a confirmed-working link, and
     no unverified stream ever sits above a verified one. `key` picks the verified
     sort — delivery-aware for the fast picker, pure quality for the slow one."""
+    # Defense in depth: callers may accidentally hand us a transport success
+    # with only compatible/unknown identity.  Keep it as a manual fallback, but
+    # never stamp it verified or place it above the checking/result leader.
+    had_transport_success = bool(verified)
+    identity_fallbacks = [s for s, _ in verified if not _identity_leader(s)]
+    verified = [(s, r) for s, r in verified if _identity_leader(s)]
     verified = sorted(verified, key=key, reverse=True)
     vset = [v for v, _ in verified]
     vurls = {s.get("url") for s in vset}
     streams = [_mark(s, i + 1, r) for i, (s, r) in enumerate(verified)]
     # Twins of the verified picks jump the queue so they survive the [:15] cut
     # and reach the proxy as splice ammo.
-    rest = _twins_first(vset, [_ingested_stream(s) for s in leftovers
+    rest = _twins_first(vset, [_ingested_stream(s) for s in
+                               (identity_fallbacks + leftovers)
                                if s.get("url") not in vurls])
     streams += rest[:15]
+    if had_transport_success and not verified:
+        streams.insert(0, _notice_stream("checking"))
     if fallback:
         streams.append(fallback)
     return streams
@@ -1110,6 +1473,71 @@ def _renumber(s: dict, rank: int) -> dict:
     return out
 
 
+def _cached_candidate(key: str) -> tuple[float, list[dict]] | None:
+    """Fresh cache entry, re-filtered against current release health."""
+    hit = _cache.get(key)
+    if not hit:
+        return None
+    age = time.monotonic() - hit[0]
+    if age >= RESULT_CACHE_TTL:
+        _cache.pop(key, None)
+        return None
+    had_verified = any(_is_ranked(s) for s in hit[1])
+    live: list[dict] = []
+    for stream in hit[1]:
+        sig = telemetry.signature(stream)
+        if sig and (reputation.blocked(sig) or reputation.cooled(sig)):
+            continue
+        live.append(stream)
+    if had_verified and not any(_is_ranked(s) for s in live):
+        _cache.pop(key, None)
+        return None
+    rank = 0
+    normalized: list[dict] = []
+    for stream in live:
+        if _is_ranked(stream):
+            rank += 1
+            stream = _renumber(stream, rank)
+        normalized.append(stream)
+    return age, normalized
+
+
+async def _cached_pick(key: str, media: str, media_id: str, profile: dict,
+                       slow: bool = False) -> list[dict] | None:
+    """Serve a recent result instantly; periodically re-probe its verified #1."""
+    hit = _cached_candidate(key)
+    if not hit:
+        return None
+    age, streams = hit
+    if age < CACHE_REVERIFY_AFTER or not streams or not _is_ranked(streams[0]):
+        return streams
+    await _resolve_identity_profile(media, media_id)
+    runtime = await _runtime_seconds(media, media_id)
+    await _resolve_accept_langs(media, media_id)
+    top = streams[0]
+    if not _usable(top, profile, runtime):
+        invalidate(media_id)
+        return None
+    deadline = time.monotonic() + (min(SLOW_TTFB_MAX, 20) if slow
+                                   else CACHE_REVERIFY_TTFB)
+    passed = await probe.probe_race(
+        [top], _need_bps_fn(runtime),
+        min(SLOW_TTFB_MAX, 20) if slow else CACHE_REVERIFY_TTFB,
+        want=1, concurrency=1, deadline=deadline, expect_secs=runtime,
+        deep_check_of=(lambda s: _size_bytes(s)
+                       if slow and _is_direct_nzb(s) else None))
+    if not passed:
+        logger.info(f"cache leader failed revalidation for {key}; repicking")
+        invalidate(media_id)
+        return None
+    if not _apply_probe_evidence(top, passed[0][1], runtime):
+        logger.info(f"cache leader lost identity eligibility for {key}; repicking")
+        invalidate(media_id)
+        return None
+    _cache[key] = (time.monotonic(), streams)
+    return streams
+
+
 def _prepend_library(lib: list[dict], streams: list[dict]) -> list[dict]:
     """Fast picker only. Fold the local library copy in with the verified online
     results and rank by quality, keeping the library ahead of anything of equal
@@ -1127,6 +1555,21 @@ def _prepend_library(lib: list[dict], streams: list[dict]) -> list[dict]:
     lead = sorted(lib_marked + ranked, key=_marked_key, reverse=True)
     lead = [_renumber(s, i + 1) for i, s in enumerate(lead)]
     return lead + tail
+
+
+def _prepend_probed(verified: list[tuple[dict, probe.ProbeResult]],
+                    streams: list[dict]) -> list[dict]:
+    """Fold newly probed library streams into an already assembled response."""
+    verified = [(s, r) for s, r in verified if _identity_leader(s)]
+    if not verified:
+        return streams
+    urls = {s.get("url") for s, _ in verified}
+    existing = [s for s in streams if s.get("url") not in urls]
+    lead = [_mark(s, 0, r) for s, r in verified]
+    lead += [s for s in existing if _is_ranked(s)]
+    tail = [s for s in existing if not _is_ranked(s)]
+    lead.sort(key=_marked_key, reverse=True)
+    return [_renumber(s, i + 1) for i, s in enumerate(lead)] + tail
 
 
 def _has_camts(lists: list[list[dict]]) -> bool:
@@ -1210,7 +1653,12 @@ def _fast_checking_notice(cache_key: str, media: str, media_id: str,
                                   runtime, list(pool)))
     logger.info(f"{cache_key}: no verified link in fast budget — 'checking' "
                 f"notice, finisher verifying {len(pool)} candidates in background")
-    return [_notice_stream("checking")]
+    # Ambiguous candidates remain visible as lower manual fallbacks, but the
+    # auto-picker sees the safe notice first until one earns strong identity +
+    # transport evidence.
+    lower = [_ingested_stream(s) for s in pool
+             if s.get(_IDENTITY_STATE_KEY) != content_identity.CONTRADICTION]
+    return [_notice_stream("checking"), *lower[:15]]
 
 
 # ── fast picker ─────────────────────────────────────────────────────────────
@@ -1230,33 +1678,35 @@ async def _finish_in_background(cache_key: str, media: str, media_id: str,
         complete_nzb = await nzb_lane.wait_complete(
             media, media_id, USENET_FINISH_WAIT)
         if complete_nzb is not None:
-            nzb = complete_nzb
+            nzb = sources.normalize_nzb(complete_nzb)
         ok, _ = _merge_rank(list(extra) + list(fast), stremthru,
                             mediafusion, nzb, profile, runtime, extras=extras)
         inherited = _take_fast_verified(cache_key, profile, runtime)
         inherited_urls = {s.get("url") for s, _ in inherited}
         inherited_idents = {i for i in (_release_ident(s) for s, _ in inherited)
                             if i}
+        lib = await library.streams(media, media_id) if library.enabled() else []
+        if lib:
+            lib = _eligible_library(lib, profile, runtime)
+        unprobed = [s for s in ok + lib if s.get("url") not in inherited_urls]
+        unprobed.sort(key=_quality_key, reverse=True)
         finish_slice = _slow_probe_slice(
-            [s for s in ok if s.get("url") not in inherited_urls],
+            unprobed,
             SLOW_FINISH_MAX_PROBES, skip_idents=inherited_idents)
         probed = await _probe_bounded(
             finish_slice, runtime, USENET_TTFB_MAX, len(finish_slice),
             time.monotonic() + SLOW_FINISH_DEADLINE)
-        lib = await library.streams(media, media_id) if library.enabled() else []
-        if lib:
-            lib = _eligible_library(lib, profile, runtime)
-        verified = _combine_verified(_as_verified(lib), inherited, probed)
+        verified = _combine_verified(inherited, probed)
         if verified:
-            if probed:
-                _publish_fast_verified(cache_key, probed)
             # Off-clock, so measure true video bitrate of the leaders too: the
             # cached answer a retry gets should be compression-honest, not
             # label-trusting (matters most for size-less free-addon streams).
             await _refine_video_bitrate(probed, runtime, 45)
+            if probed:
+                _publish_fast_verified(cache_key, probed)
             vurls = {s.get("url") for s, _ in verified}
             streams = _assemble(
-                verified, [s for s in ok if s.get("url") not in vurls], None,
+                verified, [s for s in ok + lib if s.get("url") not in vurls], None,
                 key=_verified_key)
             _store(cache_key, streams)
             logger.info(f"{cache_key}: background verification cached "
@@ -1304,7 +1754,7 @@ async def _race_fast(media: str, media_id: str, profile: dict, runtime: float,
                     for s in srcs}
     pending_sources = set(source_tasks)
     pending_library = lib_task if lib_task and not lib_task.done() else None
-    running_probes: dict[asyncio.Task, dict] = {}
+    running_probes: dict[asyncio.Task, tuple[dict, list]] = {}
     pool: list[dict] = []
     pool_urls: set[str] = set()
     probed: set[str] = set()
@@ -1318,6 +1768,7 @@ async def _race_fast(media: str, media_id: str, profile: dict, runtime: float,
     def _add_streams(streams: list[dict]) -> None:
         changed = False
         streams = [_ingested_stream(s) for s in streams]
+        _annotate_identity(streams)
         _annotate_quality(streams, runtime)
         for stream in streams:
             url = stream.get("url")
@@ -1342,10 +1793,10 @@ async def _race_fast(media: str, media_id: str, profile: dict, runtime: float,
             streams = task.result() or []
         except Exception:
             streams = []
-        streams = [_ingested_stream(s) for s in streams]
-        _annotate_quality(streams, runtime)
-        verified.extend((s, None) for s in streams
-                        if _usable(s, profile, runtime))
+        # Local is usually excellent, but stale Jellyfin/Jellio URLs still
+        # happen. Put library files through the same byte gate as every other
+        # source before allowing one to become the automatic first result.
+        _add_streams(streams)
 
     if lib_task and lib_task.done():
         _ingest_library(lib_task)
@@ -1366,30 +1817,40 @@ async def _race_fast(media: str, media_id: str, profile: dict, runtime: float,
             # Keep probe slots full in current quality order, but let source and
             # probe completions share one event loop. A hanging early candidate
             # can no longer hide a good source that arrived a moment later.
-            # Duplicate copies of one release (several addons scraping the same
-            # upstream) get at most one probe at a time and none once any copy
-            # has verified; a host that keeps failing is benched for this pick.
-            for stream in (s for s in pool if s.get("url") not in probed):
+            # Duplicate releases get one probe at a time. Fill with distinct
+            # hosts first so one wrapper/provider cannot monopolize all slots;
+            # a second pass fills any capacity left when diversity is impossible.
+            active_hosts = {_probe_host(s) for s, _ in running_probes.values()}
+            for diverse_only in (True, False):
+                for stream in (s for s in pool if s.get("url") not in probed):
+                    if len(running_probes) >= PROBE_BATCH:
+                        break
+                    ident = _release_ident(stream)
+                    if ident and ident in ident_ok:
+                        probed.add(stream["url"])
+                        continue
+                    if ident and ident in ident_inflight:
+                        continue
+                    host = _probe_host(stream)
+                    if diverse_only and host and host in active_hosts:
+                        continue
+                    if (PROBE_HOST_BENCH and host and host not in host_ok
+                            and host_fails.get(host, 0) >= PROBE_HOST_BENCH):
+                        probed.add(stream["url"])
+                        continue
+                    probed.add(stream["url"])
+                    if ident:
+                        ident_inflight.add(ident)
+                    if host:
+                        active_hosts.add(host)
+                    outcomes: list = []
+                    task = asyncio.create_task(probe.probe_race(
+                        [stream], need_bps, PROBE_TTFB_MAX, want=1,
+                        concurrency=1, deadline=deadline, expect_secs=runtime,
+                        outcomes=outcomes))
+                    running_probes[task] = (stream, outcomes)
                 if len(running_probes) >= PROBE_BATCH:
                     break
-                ident = _release_ident(stream)
-                if ident and ident in ident_ok:
-                    probed.add(stream["url"])     # a copy already verified
-                    continue
-                if ident and ident in ident_inflight:
-                    continue                      # same release being probed now
-                host = _probe_host(stream)
-                if (PROBE_HOST_BENCH and host and host not in host_ok
-                        and host_fails.get(host, 0) >= PROBE_HOST_BENCH):
-                    probed.add(stream["url"])     # benched host: skip this pick
-                    continue
-                probed.add(stream["url"])
-                if ident:
-                    ident_inflight.add(ident)
-                task = asyncio.create_task(probe.probe_race(
-                    [stream], need_bps, PROBE_TTFB_MAX, want=1,
-                    concurrency=1, deadline=deadline, expect_secs=runtime))
-                running_probes[task] = stream
 
             active = set(pending_sources) | set(running_probes)
             if pending_library:
@@ -1410,7 +1871,7 @@ async def _race_fast(media: str, media_id: str, profile: dict, runtime: float,
                 _ingest_library(pending_library)
                 pending_library = None
             for task in done & set(running_probes):
-                stream = running_probes.pop(task, None) or {}
+                stream, outcomes = running_probes.pop(task, ({}, []))
                 ident = _release_ident(stream)
                 ident_inflight.discard(ident)
                 try:
@@ -1419,14 +1880,17 @@ async def _race_fast(media: str, media_id: str, profile: dict, runtime: float,
                     passed = []
                 host = _probe_host(stream)
                 if passed:
+                    identity_passed = []
                     for vs, vr in passed:
-                        _apply_probe_quality(vs, vr, runtime)
-                    verified.extend(passed)
-                    if ident:
+                        if _apply_probe_evidence(vs, vr, runtime):
+                            identity_passed.append((vs, vr))
+                    verified.extend(identity_passed)
+                    if ident and identity_passed:
                         ident_ok.add(ident)
                     if host:
                         host_ok.add(host)
-                elif host:
+                elif host and any(_systemic_probe_failure(r.reason)
+                                  for _, r in outcomes):
                     host_fails[host] = host_fails.get(host, 0) + 1
                     if (PROBE_HOST_BENCH and host not in host_ok
                             and host_fails[host] == PROBE_HOST_BENCH):
@@ -1479,9 +1943,21 @@ async def pick(media: str, media_id: str, profile_name: str = "full") -> list[di
             lib = []
         if lib:
             runtime = await _runtime_seconds(media, media_id)
+            if _identity_profile_ctx.get() is None:
+                await _resolve_identity_profile(media, media_id)
             await _resolve_accept_langs(media, media_id)
             lib = _eligible_library(lib, PROFILES[profile_name], runtime)
-        streams = _prepend_library(lib, streams)
+            present = {s.get("url") for s in streams}
+            lib = [s for s in lib if s.get("url") not in present]
+            budget = max(TOTAL_DEADLINE - (time.monotonic() - started), 0)
+            if lib and budget > 0.1:
+                checked = await probe.probe_race(
+                    lib, _need_bps_fn(runtime), min(PROBE_TTFB_MAX, budget),
+                    want=len(lib), concurrency=min(len(lib), PROBE_BATCH),
+                    deadline=time.monotonic() + budget, expect_secs=runtime)
+                checked = [(stream, result) for stream, result in checked
+                           if _apply_probe_evidence(stream, result, runtime)]
+                streams = _prepend_probed(checked, streams)
     return streams
 
 
@@ -1490,10 +1966,10 @@ async def _pick_online(media: str, media_id: str,
                        lib_task: asyncio.Task | None = None) -> list[dict]:
     profile = PROFILES[profile_name]
     cache_key = f"{profile_name}:{media}:{media_id}"
-    hit = _cache.get(cache_key)
-    if hit and time.monotonic() - hit[0] < CACHE_TTL:
+    hit = await _cached_pick(cache_key, media, media_id, profile)
+    if hit is not None:
         logger.info(f"cache hit for {cache_key}")
-        return hit[1]
+        return hit
 
     t0 = time.monotonic()
 
@@ -1511,11 +1987,19 @@ async def _pick_online(media: str, media_id: str,
     # in flight. Bound cold metadata so it cannot consume the whole fast budget.
     runtime_task = asyncio.create_task(_runtime_seconds(media, media_id))
     _accept_langs.set(None)
+    _original_lang_known.set(False)
     try:
         async with asyncio.timeout(max(min(left(), 8.5), 0.05)):
             await _resolve_accept_langs(media, media_id)
     except (TimeoutError, asyncio.TimeoutError):
         _accept_langs.set(None)
+        _original_lang_known.set(False)
+    # Semantic identity is a hard prerequisite for an automatic result. Resolve
+    # it while the already-started sources search; a timeout installs an exact-
+    # request but alias-empty fail-closed profile, under which only validated
+    # Newznab/Jellyfin IMDb evidence may lead.
+    await _resolve_identity_profile(
+        media, media_id, timeout=max(min(left(), 8.5), 0.05))
     try:
         runtime = await asyncio.wait_for(
             runtime_task, timeout=max(min(left(), 6.5), 0.05))
@@ -1572,6 +2056,15 @@ async def _gather_extras(media: str, media_id: str, wait: float) -> list[dict]:
     return out
 
 
+async def _latest_nzb_snapshot(media: str, media_id: str,
+                               current: list[dict], wait: float) -> list[dict]:
+    """Refresh a progressive Usenet snapshot whether its lane runs or finished."""
+    newer = await nzb_lane.wait_for_more(
+        media, media_id, len(current), wait if nzb_lane.in_progress(
+            media, media_id) else 0)
+    return sources.normalize_nzb(newer) if newer is not None else current
+
+
 def _merge_rank(fast: list[dict], stremthru: list[dict],
                 mediafusion: list[dict], nzb: list[dict], profile: dict,
                 runtime: float,
@@ -1581,6 +2074,7 @@ def _merge_rank(fast: list[dict], stremthru: list[dict],
     everything = [_ingested_stream(s) for s in (
         list(fast) + list(stremthru) + list(mediafusion) + list(nzb)
         + list(extras or []))]
+    _annotate_identity(everything)
     _annotate_quality(everything, runtime)
     seen: set[str] = set()
     merged: list[dict] = []
@@ -1687,10 +2181,13 @@ async def _probe_bounded(ok: list[dict], runtime: float, ttfb_max: float,
         cands, _need_bps_fn(runtime), ttfb_max,
         want=len(cands),               # collect all that pass, no early bail
         concurrency=SLOW_CONCURRENCY, deadline=hard_deadline,
-        expect_secs=runtime)
-    for s, r in results:               # fold in HLS-declared quality evidence
-        _apply_probe_quality(s, r, runtime)
-    return results
+        expect_secs=runtime,
+        deep_check_of=lambda s: (_size_bytes(s) if _is_direct_nzb(s) else None))
+    # Transport success is necessary but not sufficient. Only candidates whose
+    # identity was already strong, or became strong through a measured-runtime
+    # corroboration, enter the verified tier.
+    return [(s, r) for s, r in results
+            if _apply_probe_evidence(s, r, runtime)]
 
 
 async def _finish_slow(cache_key: str, media: str, media_id: str,
@@ -1708,41 +2205,42 @@ async def _finish_slow(cache_key: str, media: str, media_id: str,
         complete_nzb = await nzb_lane.wait_complete(
             media, media_id, USENET_FINISH_WAIT)
         if complete_nzb is not None:
-            nzb = complete_nzb
+            nzb = sources.normalize_nzb(complete_nzb)
         ok, fallback = _merge_rank(fast, stremthru, mediafusion, nzb,
                                    profile, runtime, extras=extras)
         fast_verified = _take_fast_verified(cache_key[len("slow:"):], profile, runtime)
         fast_urls = {s.get("url") for s, _ in fast_verified}
         fast_idents = {i for i in (_release_ident(s) for s, _ in fast_verified) if i}
+        lib = await library.streams(media, media_id) if library.enabled() else []
+        if lib:
+            lib = _eligible_library(lib, profile, runtime)
+        unprobed = [s for s in ok + lib if s.get("url") not in fast_urls]
+        unprobed.sort(key=_quality_key, reverse=True)
         # Off Nuvio's clock, so dig deeper by quality than the foreground slice
         # AND wait patiently (SLOW_FINISH_TTFB_MAX) for slow-to-start high-quality
         # sources, so they survive verification and can take #1 on the retry.
         finish_slice = _slow_probe_slice(
-            [s for s in ok if s.get("url") not in fast_urls],
+            unprobed,
             SLOW_FINISH_MAX_PROBES, skip_idents=fast_idents)
         verified = await _probe_bounded(
             finish_slice, runtime, SLOW_FINISH_TTFB_MAX, len(finish_slice),
             time.monotonic() + SLOW_FINISH_DEADLINE)
-        lib = await library.streams(media, media_id) if library.enabled() else []
-        if lib:
-            lib = _eligible_library(lib, profile, runtime)
-        all_verified = _combine_verified(_as_verified(lib), fast_verified, verified)
+        await _refine_video_bitrate(verified, runtime, 45)
+        all_verified = _combine_verified(fast_verified, verified)
         if all_verified:
-            await _refine_video_bitrate(verified, runtime, 45)
             vurls = {v.get("url") for v, _ in all_verified}
             streams = _assemble(all_verified,
-                                [s for s in ok if s.get("url") not in vurls],
+                                [s for s in ok + lib if s.get("url") not in vurls],
                                 fallback, key=_verified_quality_key)
             _store(cache_key, streams)
             logger.info(f"{cache_key}: background best-quality cached"
                         f" ({len(verified)} verified, +{len(fast_verified)} fast,"
                         f" {len(lib)} library of {len(ok)})")
             return
-        # Exhausted the full search and nothing plays, and it's not in the
-        # library. If a proper release should exist — real usable candidates
-        # were there but none probed OK, or TMDB confirms one — acquire it; if
-        # nothing is out yet (no candidates and TMDB/cam say not released), set
-        # the "not out yet" notice and download nothing.
+        # Exhausted the full search and nothing plays. Raw library URLs do not
+        # count here: they went through the same probe gate and may be stale.
+        # If a proper release should exist, acquire it; otherwise set the
+        # "not out yet" notice and download nothing.
         if not ok and not await _release_expected(
                 media, media_id, [fast, stremthru, mediafusion, nzb]):
             _notice_until[cache_key] = (time.monotonic() + NOTICE_TTL, "theatrical")
@@ -1768,7 +2266,10 @@ async def _release_expected(media: str, media_id: str,
     released = await meta.has_release(media, media_id)
     if released is not None:
         return released
-    return not _has_camts(raw_lists)
+    # An upstream outage and a genuinely empty unreleased search both look
+    # empty to older source adapters. Unknown metadata plus no positive release
+    # evidence must fail closed: never auto-add a title merely because APIs died.
+    return any(raw_lists) and not _has_camts(raw_lists)
 
 
 async def _no_source(cache_key: str, media: str, media_id: str,
@@ -1782,11 +2283,21 @@ async def _no_source(cache_key: str, media: str, media_id: str,
         logger.info(f"{cache_key}: no proper release out yet — 'not out' notice")
         return [_notice_stream("theatrical")]
     if acquire.enabled_for(media):
-        _spawn(acquire.request(media, media_id))
-        _notice_until[cache_key] = (time.monotonic() + NOTICE_TTL, "added")
-        logger.info(f"{cache_key}: release should exist but none found — "
-                    f"requested via {'radarr' if media == 'movie' else 'sonarr'}")
-        return [_notice_stream("added")]
+        task = asyncio.create_task(acquire.request(media, media_id))
+        try:
+            ok = await asyncio.wait_for(asyncio.shield(task),
+                                        timeout=ACQUIRE_FOREGROUND_WAIT)
+        except asyncio.TimeoutError:
+            _acquire_tasks.add(task)
+            task.add_done_callback(_acquire_tasks.discard)
+            logger.info(f"{cache_key}: acquisition request still pending")
+            return [_notice_stream("checking")]
+        if ok:
+            _notice_until[cache_key] = (time.monotonic() + NOTICE_TTL, "added")
+            logger.info(f"{cache_key}: release should exist but none found — "
+                        f"accepted by {'radarr' if media == 'movie' else 'sonarr'}")
+            return [_notice_stream("added")]
+        logger.warning(f"{cache_key}: acquisition request was not accepted")
     logger.info(f"{cache_key}: no source found (acquire disabled)")
     return []
 
@@ -1795,10 +2306,10 @@ async def pick_slow(media: str, media_id: str,
                     profile_name: str = "full") -> list[dict]:
     profile = PROFILES[profile_name]
     cache_key = f"slow:{profile_name}:{media}:{media_id}"
-    hit = _cache.get(cache_key)
-    if hit and time.monotonic() - hit[0] < CACHE_TTL:
+    hit = await _cached_pick(cache_key, media, media_id, profile, slow=True)
+    if hit is not None:
         logger.info(f"cache hit for {cache_key}")
-        return hit[1]
+        return hit
 
     # Local library (Jellio) — a fast, reliable source; fire it now, use later.
     lib_task = (asyncio.create_task(library.streams(media, media_id))
@@ -1812,14 +2323,23 @@ async def pick_slow(media: str, media_id: str,
         lib = (await lib_task) if lib_task else []
         if lib:
             runtime = await _runtime_seconds(media, media_id)
+            await _resolve_identity_profile(media, media_id)
             await _resolve_accept_langs(media, media_id)
             lib = _eligible_library(lib, profile, runtime)
             if lib:
-                _notice_until.pop(cache_key, None)
-                streams = _assemble(_as_verified(lib), [], None)
-                _store(cache_key, streams)
-                logger.info(f"{cache_key}: download landed, serving library")
-                return streams
+                checked = await probe.probe_race(
+                    lib, _need_bps_fn(runtime), CACHE_REVERIFY_TTFB,
+                    want=len(lib), concurrency=min(len(lib), PROBE_BATCH),
+                    deadline=time.monotonic() + CACHE_REVERIFY_TTFB,
+                    expect_secs=runtime)
+                checked = [(stream, result) for stream, result in checked
+                           if _apply_probe_evidence(stream, result, runtime)]
+                if checked:
+                    _notice_until.pop(cache_key, None)
+                    streams = _assemble(checked, [], None)
+                    _store(cache_key, streams)
+                    logger.info(f"{cache_key}: download landed, serving library")
+                    return streams
         logger.info(f"{cache_key}: still pending ({nu[1]}), showing notice")
         return [_notice_stream(nu[1])]
 
@@ -1839,6 +2359,7 @@ async def pick_slow(media: str, media_id: str,
         sources.start(src, media, media_id)
 
     runtime = await _runtime_seconds(media, media_id)
+    await _resolve_identity_profile(media, media_id)
     await _resolve_accept_langs(media, media_id)
 
     # Wait for every source to run its course, holding back SLOW_PROBE_RESERVE
@@ -1856,13 +2377,12 @@ async def pick_slow(media: str, media_id: str,
     # one mount while the rest keep materializing.  Spend only the source-side
     # portion of the remaining foreground budget waiting for one more, leaving
     # the probe reserve intact.  The full tail continues in _finish_slow.
-    if nzb_lane.in_progress(media, media_id):
-        more_wait = max(left() - SLOW_PROBE_RESERVE, 0)
-        if more_wait > 0:
-            newer = await nzb_lane.wait_for_more(
-                media, media_id, len(nzb), more_wait)
-            if newer is not None:
-                nzb = newer
+    # ``sources.get`` is intentionally an early progressive snapshot. By the
+    # time slower HTTP addons settle, the detached lane may already have added
+    # several mounts *and finished*. Always refresh its current output; gating
+    # this on in_progress() used to freeze the one-item early snapshot forever.
+    nzb = await _latest_nzb_snapshot(
+        media, media_id, nzb, max(left() - SLOW_PROBE_RESERVE, 0))
 
     ok, fallback = _merge_rank(fast, stremthru, mediafusion, nzb,
                                profile, runtime, extras=extras)
@@ -1871,19 +2391,6 @@ async def pick_slow(media: str, media_id: str,
     fast_verified = _take_fast_verified(cache_key[len("slow:"):], profile, runtime)
     fast_urls = {s.get("url") for s, _ in fast_verified}
     fast_idents = {i for i in (_release_ident(s) for s, _ in fast_verified) if i}
-    unprobed = [s for s in ok if s.get("url") not in fast_urls]
-    inherited_nzb = sum(_is_direct_nzb(s) for s, _ in fast_verified)
-    probe_slice = _slow_probe_slice(
-        unprobed, SLOW_MAX_PROBES,
-        max(SLOW_NZB_PROBES - inherited_nzb, 0), skip_idents=fast_idents)
-    verified = await _probe_bounded(
-        probe_slice,
-        runtime, min(SLOW_TTFB_MAX, max(left(), 5)),
-        len(probe_slice), resp_deadline - 3)
-    # Share what we just verified so the background finisher (always spawned
-    # below) inherits it and can never fire Radarr for a title we're serving.
-    _publish_fast_verified(cache_key[len("slow:"):], verified)
-
     lib = []
     if lib_task:
         try:
@@ -1892,6 +2399,16 @@ async def pick_slow(media: str, media_id: str,
             lib = []
     if lib:
         lib = _eligible_library(lib, profile, runtime)
+    unprobed = [s for s in ok + lib if s.get("url") not in fast_urls]
+    unprobed.sort(key=_quality_key, reverse=True)
+    inherited_nzb = sum(_is_direct_nzb(s) for s, _ in fast_verified)
+    probe_slice = _slow_probe_slice(
+        unprobed, SLOW_MAX_PROBES,
+        max(SLOW_NZB_PROBES - inherited_nzb, 0), skip_idents=fast_idents)
+    verified = await _probe_bounded(
+        probe_slice,
+        runtime, min(SLOW_TTFB_MAX, max(left(), 5)),
+        len(probe_slice), resp_deadline - 3)
     distinct = len({_release_ident(s) or s.get("url") for s in ok})
     logger.info(f"{cache_key}: merged fast {len(fast)} / stremthru {len(stremthru)} /"
                 f" mf {len(mediafusion)} / nzb {len(nzb)} / extras {len(extras)}"
@@ -1904,14 +2421,16 @@ async def pick_slow(media: str, media_id: str,
     # genuine best quality bubbles up rather than a fat-but-audio-heavy or a
     # starved fake-4K encode. Bounded to a handful so it stays within budget.
     await _refine_video_bitrate(verified, runtime, left())
+    # Publish only finalized quality/audio evidence; copied pre-refinement
+    # streams can otherwise overwrite a correct later slow-cache order.
+    _publish_fast_verified(cache_key[len("slow:"):], verified)
 
-    # Library copies are reliable, so they join the verified tier; fast-inherited
-    # probes are real verifications too. All get quality-ranked together — never
-    # pinned first — so a higher-res online source outranks a lower-res library
-    # or fast-picker copy.
-    all_verified = _combine_verified(_as_verified(lib), fast_verified, verified)
+    # Library copies passed through the same probe wave, so every member of the
+    # leading tier has current playback evidence.
+    all_verified = _combine_verified(fast_verified, verified)
     vurls = {v.get("url") for v, _ in all_verified}
-    streams = _assemble(all_verified, [s for s in ok if s.get("url") not in vurls],
+    streams = _assemble(all_verified,
+                        [s for s in ok + lib if s.get("url") not in vurls],
                         fallback, key=_verified_quality_key)
 
     # The slow picker's whole job is the *best* source, so whenever candidates
@@ -1927,10 +2446,9 @@ async def pick_slow(media: str, media_id: str,
         _store(cache_key, streams)
         return streams
 
-    # No playable source anywhere online AND not in the library. Let TMDB decide
-    # whether a proper release should exist (acquire it) or not (show the "not
-    # out yet" notice and download nothing). Don't cache the notice — a later
-    # open re-checks the library and plays it once any download lands.
+    # No playable source anywhere. A raw library URL is not proof of playback:
+    # it may be stale and has already failed the byte gate above. Let Usenet
+    # finish mounting or let the normal no-source/acquisition path decide.
     if not ok and nzb_lane.in_progress(media, media_id):
         logger.info(f"{cache_key}: direct usenet still mounting; showing "
                     "checking notice instead of acquiring prematurely")
@@ -1947,7 +2465,9 @@ async def pick_slow(media: str, media_id: str,
     _notice_until[cache_key] = (time.monotonic() + CHECKING_NOTICE_TTL, "checking")
     logger.info(f"{cache_key}: {len(ok)} candidates, none verified yet — "
                 f"showing 'checking' notice while the finisher verifies")
-    return [_notice_stream("checking")]
+    lower = [_ingested_stream(s) for s in ok
+             if s.get(_IDENTITY_STATE_KEY) != content_identity.CONTRADICTION]
+    return [_notice_stream("checking"), *lower[:15]]
 
 
 # ── next-episode prefetch ────────────────────────────────────────────────────
@@ -2003,12 +2523,27 @@ async def prefetch_next(media: str, media_id: str, picker_label: str) -> None:
             kind = streams[0].get(_NOTICE_STATE_KEY, "notice")
             logger.info(f"prefetch: next episode {nxt} still {kind}; not caching")
             return
-        # Prime both lists so the prepared result leads whichever addon opens it.
-        _store(f"{profile}:{media}:{nxt}", streams)
-        _store(f"slow:{profile}:{media}:{nxt}", streams)
+        # Preserve picker semantics: a fast prefetch must not freeze its early
+        # delivery-ranked answer into the slow best-quality cache (or vice
+        # versa). Raw source and verification evidence are already shared.
+        target = (f"slow:{profile}:{media}:{nxt}" if slow
+                  else f"{profile}:{media}:{nxt}")
+        _store(target, streams)
         top = " ".join((streams[0].get("name") or "").split())[:40]
         logger.info(f"prefetch: cached next episode {nxt} — #1 {top!r}")
     except Exception:
         logger.exception(f"prefetch: failed for {media_id}")
     finally:
         _prefetching.discard(nxt)
+
+
+async def shutdown() -> None:
+    """Cancel picker-owned background work and close its metadata client."""
+    tasks = list(_background.values()) + list(_acquire_tasks)
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    _background.clear()
+    _acquire_tasks.clear()
+    await _client.aclose()

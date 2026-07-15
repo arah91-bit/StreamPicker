@@ -51,15 +51,24 @@ like any other self-hosted service's web UI:
 http://<host>:8011/
 ```
 
+On the first visit, the dashboard shows a one-time account-creation page. Choose
+your own username and a password of at least 12 characters. Later visits use
+that account through the browser's normal sign-in prompt. For unattended deployment, preseed
+`ADMIN_USERNAME` and `ADMIN_PASSWORD` in `.env` to skip enrollment.
+
 It's one site with three tabs you click between — **Overview**, **Settings**,
 **Source health**. On Settings, each service has a **Test** button that checks
 your URL/key before you save; hit **Save**, then **Restart addon** to apply.
 Settings live in `./data/config.json` and survive rebuilds.
 
-The dashboard is **local-only by default** — it answers to loopback/LAN/Docker
-clients but not to requests coming through a public reverse proxy, so keep the
-port on your LAN (like Radarr/Sonarr). To lift that (only behind your own auth),
-set `DASHBOARD_LOCAL_ONLY=0`.
+The dashboard is **authenticated and local-only by default** — it answers to
+loopback/LAN/Docker clients but not to requests coming through a public reverse
+proxy, so keep the port on your LAN (like Radarr/Sonarr). First-run enrollment
+always remains local even if you later expose the authenticated dashboard. To
+use a reverse proxy, set `DASHBOARD_LOCAL_ONLY=0` and use HTTPS. Forwarding
+headers are ignored unless the immediate
+peer is listed narrowly in `TRUSTED_PROXIES` (IP/CIDR); never trust
+`0.0.0.0/0`.
 
 ## Install in your player
 
@@ -163,11 +172,15 @@ reachable URL for each.
 
 ## Notes
 
-- `ADDON_SECRET` gates both the addon and the dashboard — anyone who has it can
-  install your addon and change your settings. Keep it secret; rotate it by
-  changing `.env` and restarting.
-- The container writes `./data` as root (it runs as root, like most
-  self-hosted media tooling). That directory holds your config and telemetry.
+- `ADDON_SECRET` gates addon installation and is not accepted as the dashboard
+  password. Dashboard credentials are stored as a salted scrypt verifier in
+  `./data/admin-auth.json`, never as the chosen plaintext password.
+- To reset a forgotten dashboard account, stop the container, delete
+  `data/admin-auth.json` and `data/admin-auth.initialized`, then start it and
+  enroll again from the LAN.
+- The supplied Compose service uses a read-only root filesystem, drops Linux
+  capabilities, and confines writable persistent state to `./data` (plus a
+  bounded temporary filesystem at `/tmp`).
 - Already running this via a larger Compose file? This standalone
   `docker-compose.yml` uses the same container name and port, so don't
   `docker compose up` it on that same host — it's the copy you hand to someone

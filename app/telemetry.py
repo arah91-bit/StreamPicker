@@ -100,6 +100,38 @@ def record_usenet_failure(*, release_key: str = "", label: str = "",
     _append(rec)
 
 
+def record_identity(stream: dict, *, state: str, reason: str,
+                    source: str = "", evidence: str = "",
+                    expected_years: list[int] | tuple[int, ...] = (),
+                    observed_years: list[int] | tuple[int, ...] = ()) -> None:
+    """Persist why a candidate was accepted, held back, or rejected by identity.
+
+    This deliberately stores no URL and only a short, sanitized release label.
+    It is diagnostic evidence for improving the parser: transport failures tell
+    us whether bytes play, while these records tell us what a wrong-title/year/
+    episode result looked like before it was allowed near automatic #1.
+    """
+    allowed = {"strong", "compatible", "unknown", "contradiction"}
+    state = state if state in allowed else "unknown"
+    safe_evidence = sanitize_failure_detail(evidence, 240)
+    rec = _base({k: v for k, v in stream.items() if k != "url"})
+    rec.update({
+        "kind": "identity",
+        "state": state,
+        "reason": re.sub(r"[^a-z0-9_-]", "", (reason or "").lower())[:60],
+        "source_key": re.sub(r"[^A-Za-z0-9:._+-]", "", source or "")[:80],
+        "evidence": safe_evidence,
+        "evidence_hash": (hashlib.sha256(safe_evidence.encode()).hexdigest()[:20]
+                          if safe_evidence else ""),
+        "expected_years": [int(y) for y in expected_years
+                           if isinstance(y, int)][:6],
+        "observed_years": [int(y) for y in observed_years
+                           if isinstance(y, int)][:6],
+        "sig": signature(stream),
+    })
+    _append(rec)
+
+
 # ── label parsing (the source identity we bucket on) ─────────────────────────
 _DEBRID_RE = re.compile(r"\[([A-Za-z]{2,3})([^\]]*)\]")
 _SOURCE_RE = re.compile(r"Source:\s*([^\n]+)", re.I)
@@ -233,7 +265,14 @@ def signature(stream: dict) -> str:
     fname = (stream.get("behaviorHints", {}) or {}).get("filename") or ""
     norm = re.sub(r"[^a-z0-9]+", "", _EXT_RE.sub("", fname).lower())
     if len(norm) >= 12:
-        return "file:" + hashlib.sha256(norm.encode()).hexdigest()
+        # Reputation is title-scoped.  A generic/yearless filename can be reused
+        # by remakes or regional editions; evidence learned while serving one
+        # IMDb id must never block or rehabilitate the other.  Background picker
+        # tasks inherit this ContextVar, and the scoped signature is persisted in
+        # the proxy token before playback leaves the request context.
+        media_id = str(request_ctx.get().get("media_id") or "")
+        return "file:" + hashlib.sha256(
+            f"{media_id}\0{norm}".encode()).hexdigest()
     return ""
 
 

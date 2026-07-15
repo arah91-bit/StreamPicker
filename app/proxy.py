@@ -4,13 +4,13 @@ The picker rewrites each online stream URL it returns into a `/proxy/<token>`
 URL on this server. When the player opens it we stream the real bytes through,
 which does two things the direct URL can't:
 
-  1. Auto-switch on a bad source. The token maps to the *ranked list* from that
-     position, not one URL. On the opening request we try the first candidate;
-     if it's dead (4xx/5xx), never sends a byte, or delivers below the file's
-     bitrate, we transparently fall through to the next and *pin* the winner —
-     the player's URL never changes. This is the "drop to next priority on a
-     failed/slow stream" behaviour, done in the first moment before any picture
-     has shown, so it's seamless.
+  1. Auto-switch on a bad source. For picker results that passed both semantic
+     identity and transport verification, the token maps to the identity-safe
+     ranked tail from that position. On the opening request we try the first
+     candidate; if it's dead (4xx/5xx), never sends a byte, or delivers below
+     the file's bitrate, we transparently fall through to the next and *pin*
+     the winner. Unverified leftovers get a single-candidate token and can
+     still be opened explicitly, but can never become a silent substitute.
   2. Measure real delivery. We record actual throughput to the device, stalls,
      mid-stream drops and watched fraction per source — the ground truth the
      server-side probe can only approximate.
@@ -25,6 +25,7 @@ the signal to pre-demote it next time.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -37,7 +38,7 @@ from urllib.parse import urlsplit
 import httpx
 from starlette.responses import Response, StreamingResponse
 
-from app import (decode_health, hlsproxy, reputation, telemetry,
+from app import (content_identity, decode_health, hlsproxy, reputation, telemetry,
                  usenet_health, vprobe)
 
 logger = logging.getLogger("stream-picker")
@@ -53,6 +54,7 @@ SESS_FILE = os.path.join(os.environ.get("TELEMETRY_DIR", "/data"), "sessions.jso
 # stream-list request and previously only compacted at startup — weeks of uptime
 # let it grow into the hundreds of MB).
 SESS_MAX_BYTES = int(os.environ.get("PROXY_SESSION_MAX_BYTES", str(20 * 1024 * 1024)))
+SESS_MAX = int(os.environ.get("PROXY_SESSION_MAX", "5000"))
 
 # start-of-play evaluation
 EVAL_BYTES = 2 * 1024 * 1024
@@ -69,7 +71,7 @@ PREFER_FILE_CONTAINERS = os.environ.get("PREFER_FILE_CONTAINERS", "1") not in ("
 _DEFER_CONTAINERS = {"ts", "m2ts"}
 
 # ── mid-stream twin-splice ───────────────────────────────────────────────────
-# A byte-identical *twin* is the same release (same telemetry.signature) served
+# A byte-identical *twin* is the same torrent+file identity served
 # by a *different* debrid (TorBox<->Real-Debrid) — i.e. the same file cached on
 # genuinely separate infrastructure, so a different delivery node. Because the
 # bytes are identical, we can splice to it mid-stream at the current offset with
@@ -97,11 +99,11 @@ _client = httpx.AsyncClient(
 # token -> (created_ts, entry). entry = {"cands":[...], "id":.., "picker":.., "pin":int|None}
 _sessions: dict[str, tuple[float, dict]] = {}
 _sess_compact_after = SESS_MAX_BYTES
+_start_locks: dict[str, asyncio.Lock] = {}
 
-# Only cryptographic release identities are safe for byte-cache reuse.  Older
-# sessions may contain truncated filenames or metadata fallbacks such as
-# ``gr0s0``; preserve their playback URLs across a restart, but strip those
-# unsafe identities so they cannot alias a new cache entry.
+# Keep only current full-length release identities for reputation. Byte-cache
+# reuse uses the separate candidate ``cid`` created by _cand(), never this
+# filename-derived value.
 _STRONG_SIG_RE = re.compile(r"^(?:file|nzb):[0-9a-f]{64}$")
 
 
@@ -120,10 +122,57 @@ def _scrub_legacy_sigs(entry: dict) -> int:
             if sig and not _STRONG_SIG_RE.fullmatch(sig):
                 cand["sig"] = ""
                 scrubbed += 1
+            # Session JSON may contain only the serializable eligibility fact,
+            # never content_identity's process-local sentinel.  Normalize old
+            # or malformed values instead of accepting generic truthiness.
+            cand["auto"] = cand.get("auto") is True
+    _sanitize_auto_pool(entry)
     # Buffer entries are intentionally wiped at startup, so a persisted mapping
     # is stale even when its signature is otherwise valid.
     entry.pop("bufsig", None)
+    entry.pop("bufcid", None)
+    # These contain process-local monotonic timestamps, task flags, and request
+    # accounting. Candidate selection is durable; runtime playback state is not.
+    for key in ("_hls", "_hlsseqs", "_hlscodecs", "_playfail"):
+        entry.pop(key, None)
     return scrubbed
+
+
+def _sanitize_auto_pool(entry: dict) -> None:
+    """Reassert the semantic-failover boundary on persisted session data.
+
+    New marked sessions may contain only marked candidates.  An unmarked or
+    legacy session is deliberately single-candidate.  For a pinned legacy
+    session preserve that selected candidate so an in-progress playback can
+    resume without reviving its old cross-release failover tail.
+    """
+    marked = entry.get("auto") is True
+    entry["auto"] = marked
+    cands = [c for c in (entry.get("cands") or []) if isinstance(c, dict)]
+    pool = [c for c in (entry.get("pool") or []) if isinstance(c, dict)]
+    if marked:
+        entry["cands"] = [c for c in cands if c.get("auto") is True]
+        entry["pool"] = [c for c in pool if c.get("auto") is True]
+        return
+
+    selected = None
+    wanted = entry.get("sel") or ""
+    if wanted:
+        selected = next((c for c in cands if _candidate_key(c) == wanted), None)
+    pin = entry.get("pin")
+    if selected is None and isinstance(pin, int) and 0 <= pin < len(cands):
+        selected = cands[pin]
+    if selected is None and cands:
+        selected = cands[0]
+    if selected is None and pool:
+        selected = pool[0]
+    if selected is not None:
+        selected["auto"] = False
+        entry["cands"] = [selected]
+        entry["pool"] = [selected]
+        entry["pin"] = 0
+    else:
+        entry["cands"], entry["pool"] = [], []
 
 
 # ── session store (disk-persisted so a restart mid-movie doesn't break) ──────
@@ -184,7 +233,10 @@ def load() -> None:
                 except Exception:
                     pass
     except FileNotFoundError:
-        return
+        # A fresh install still needs cache/HLS maintenance.  The old early
+        # return left HLS accounting and the buffer directory uninitialised
+        # until a sessions file happened to exist.
+        pass
     try:
         with open(SESS_FILE, "w") as f:
             for t, (ts, e) in _sessions.items():
@@ -207,29 +259,58 @@ def _lookup(token: str) -> dict | None:
     ts, entry = hit
     if time.time() - ts > SESS_TTL:
         _sessions.pop(token, None)
+        _start_locks.pop(token, None)
         return None
+    # Treat TTL/cap order as idle/LRU time so a currently playing token is not
+    # evicted merely because many catalogue results were wrapped afterwards.
+    _sessions[token] = (time.time(), entry)
     return entry
 
 
 def _mint(cands: list[dict], pool: list[dict], media: str, media_id: str,
           picker: str, hls: bool = False) -> str:
     token = secrets.token_urlsafe(9)
+    # Defense in depth: wrap() builds these pools, but _mint is the persistence
+    # boundary and must never serialize a marked leader beside an unverified
+    # fallback.  Unmarked results remain individually playable with one URL.
+    auto = bool(cands and cands[0].get("auto") is True)
+    if auto:
+        cands = [c for c in cands if c.get("auto") is True]
+        pool = [c for c in pool if c.get("auto") is True]
+    else:
+        cands = cands[:1]
+        pool = cands[:]
     # pool = every proxyable candidate for this title (the whole ranked list), so
     # a twin of whatever ends up playing can be found even if it sits outside this
     # token's short failover window. total = the file's byte-length, learned on
     # the opening request and used to prove a twin is byte-identical before we
     # splice to it.
     entry = {"cands": cands, "pool": pool, "id": media_id, "picker": picker,
-             "pin": None, "total": None}
+             "pin": None, "total": None, "auto": auto}
     if hls:
         entry["hls"] = True
     _sessions[token] = (time.time(), entry)
     _persist(token, entry)
-    if len(_sessions) > 5000:                     # opportunistic prune
-        cutoff = time.time() - SESS_TTL
-        for t in [t for t, (ts, _) in _sessions.items() if ts < cutoff]:
-            _sessions.pop(t, None)
+    _prune_sessions()
     return token
+
+
+def _prune_sessions() -> None:
+    """Enforce both age and a hard session bound.
+
+    The previous implementation only removed expired sessions after crossing
+    5,000; a busy server with fresh tokens could therefore grow without bound.
+    """
+    cutoff = time.time() - SESS_TTL
+    for t in [t for t, (ts, _) in _sessions.items() if ts < cutoff]:
+        _sessions.pop(t, None)
+        _start_locks.pop(t, None)
+    overflow = len(_sessions) - max(SESS_MAX, 1)
+    if overflow > 0:
+        oldest = sorted(_sessions, key=lambda t: _sessions[t][0])[:overflow]
+        for t in oldest:
+            _sessions.pop(t, None)
+            _start_locks.pop(t, None)
 
 
 # ── URL rewriting (called by the picker before it answers) ───────────────────
@@ -267,21 +348,49 @@ def _is_hls(url: str) -> bool:
     return path.endswith((".m3u8", ".m3u"))
 
 
+def _stream_is_hls(stream: dict) -> bool:
+    """Honor probe evidence for extensionless playlist endpoints."""
+    kind = stream.get("_content_kind")
+    if kind in ("hls", "file"):
+        return kind == "hls"
+    return _is_hls(stream.get("url") or "")
+
+
 def _cand(s: dict) -> dict:
+    auto = content_identity.auto_eligible(s)
     ident = telemetry.identity(s)
     lbl = f"{ident['res']}p {ident['src']} {ident['grp']}".strip()
-    return {"u": s["url"], "need": (s.get("_qbps") or 0) / 8,   # bytes/s the file needs
+    url_key = hashlib.sha256(s["url"].encode()).hexdigest()
+    info_hash = str(s.get("infoHash") or "").strip().lower()
+    file_idx = s.get("fileIdx")
+    # Cache/splice identity is deliberately separate from reputation identity.
+    # A hashed filename is useful evidence about a release, but it is not proof
+    # that two URLs contain identical bytes.  Torrent hash + file identity is;
+    # otherwise only the exact upstream URL may reuse its own cached bytes.
+    if (auto and re.fullmatch(r"[0-9a-f]{32,64}", info_hash)
+            and isinstance(file_idx, (int, str)) and str(file_idx) != ""):
+        content_id = "torrent:" + hashlib.sha256(
+            f"{info_hash}|{file_idx}".encode()).hexdigest() + ":auto"
+    else:
+        # Unmarked candidates are intentionally URL-local even if they expose a
+        # torrent hash: their single-candidate token may not silently reuse a
+        # buffer or twin opened through another, semantically unverified URL.
+        content_id = "url:" + url_key + (":auto" if auto else "")
+    return {"u": s["url"], "key": url_key, "cid": content_id,
+            "need": (s.get("_qbps") or 0) / 8,   # bytes/s the file needs
             "src": ident["src"], "dbr": ident["debrid"], "grp": ident["grp"],
             "res": ident["res"], "size": ident["size"],
             "codec": ident["codec"], "hdr": ident["hdr"],
             "sig": telemetry.signature(s), "lbl": lbl,
             "rh": hlsproxy.request_headers(s),   # upstream request headers
-            "nzb_indexers": list(s.get("_nzb_indexers") or [])}
+            "nzb_indexers": list(s.get("_nzb_indexers") or []),
+            "auto": bool(auto)}
 
 
 def wrap(streams: list[dict], media: str, media_id: str, picker: str) -> list[dict]:
     """Return a copy of the list with online stream URLs replaced by proxy URLs
-    whose token carries the failover tail from each position. Library and notice
+    whose token carries the identity-eligible failover tail from each position.
+    Unmarked entries receive an isolated one-candidate token. Library and notice
     entries are left untouched. Never mutates the input dicts (they're cached).
 
     The top WRAP_MAX proxyable streams are wrapped for the auto-switch/telemetry
@@ -295,23 +404,30 @@ def wrap(streams: list[dict], media: str, media_id: str, picker: str) -> list[di
         # URLs pass through untouched.
         return [s for s in streams
                 if not (_proxyable(s) and _must_wrap(s["url"]))]
-    tail = [s for s in streams if _proxyable(s) and not _is_hls(s["url"])]
-    pool = [_cand(x) for x in tail]          # every proxyable candidate, once
-    hls_tail = [s for s in streams if _proxyable(s) and _is_hls(s["url"])]
-    hls_pool = [_cand(x) for x in hls_tail]
+    tail = [s for s in streams if _proxyable(s) and not _stream_is_hls(s)]
+    marked_tail = [s for s in tail if content_identity.auto_eligible(s)]
+    marked_pool = [_cand(x) for x in marked_tail]
+    hls_tail = [s for s in streams if _proxyable(s) and _stream_is_hls(s)]
+    marked_hls_tail = [s for s in hls_tail
+                       if content_identity.auto_eligible(s)]
+    marked_hls_pool = [_cand(x) for x in marked_hls_tail]
     made = 0
     out = []
     for s in streams:
-        if _proxyable(s) and _is_hls(s["url"]):
+        if _proxyable(s) and _stream_is_hls(s):
             if hlsproxy.ENABLED:
                 # Playlist-rewriting proxy (app.hlsproxy): the player fetches
                 # everything from us, we fetch upstream with the declared
                 # headers from one IP — fixes referer-gated/IP-locked hosts
                 # and makes credentialed playlists servable. Failover
                 # candidates are the other HLS releases for this title.
-                pos = hls_tail.index(s)
-                token = _mint(hls_pool[pos:pos + MAXFAIL], hls_pool,
-                              media, media_id, picker, hls=True)
+                if content_identity.auto_eligible(s):
+                    pos = marked_hls_tail.index(s)
+                    cands = marked_hls_pool[pos:pos + MAXFAIL]
+                    pool = marked_hls_pool
+                else:
+                    cands = pool = [_cand(s)]
+                token = _mint(cands, pool, media, media_id, picker, hls=True)
                 ns = dict(s)
                 ns["url"] = f"{PUBLIC}/proxy/{token}"
                 bh = dict(ns.get("behaviorHints") or {})
@@ -329,8 +445,12 @@ def wrap(streams: list[dict], media: str, media_id: str, picker: str) -> list[di
                 out.append(s)
             continue
         if _proxyable(s) and (made < WRAP_MAX or _must_wrap(s["url"])):
-            pos = tail.index(s)
-            cands = pool[pos:pos + MAXFAIL]
+            if content_identity.auto_eligible(s):
+                pos = marked_tail.index(s)
+                cands = marked_pool[pos:pos + MAXFAIL]
+                pool = marked_pool
+            else:
+                cands = pool = [_cand(s)]
             token = _mint(cands, pool, media, media_id, picker)
             ns = dict(s)
             ns["url"] = f"{PUBLIC}/proxy/{token}"
@@ -408,6 +528,49 @@ def _suffix_length(h: str | None) -> int | None:
     return int(m.group(1)) if m else None
 
 
+def _candidate_key(c: dict) -> str:
+    return c.get("key") or hashlib.sha256((c.get("u") or "").encode()).hexdigest()
+
+
+def _cache_id(c: dict) -> str:
+    """Exact byte identity for cache/reconnect use.
+
+    The sig fallback exists only for sparse legacy/unit-test candidates. New
+    wrapped candidates always have a URL- or torrent-bound cid.
+    """
+    return c.get("cid") or c.get("sig") or ""
+
+
+def _pin_selection(token: str, entry: dict, cands: list[dict], cand: dict) -> None:
+    """Persist the exact release selected by start evaluation.
+
+    A numeric rank alone is insufficient once the in-memory buffer disappears;
+    ``sel`` lets restart/seek resolve the same candidate and fail closed if the
+    saved pool no longer contains it.
+    """
+    try:
+        idx = next(i for i, c in enumerate(cands)
+                   if c is cand or _candidate_key(c) == _candidate_key(cand))
+    except StopIteration:
+        return
+    entry["pin"] = idx
+    entry["sel"] = _candidate_key(cand)
+    entry["selected_cid"] = _cache_id(cand)
+    _persist(token, entry)
+
+
+def _selected_candidate(entry: dict, cands: list[dict]) -> dict | None:
+    selected = entry.get("sel") or ""
+    if selected:
+        return next((c for c in cands if _candidate_key(c) == selected), None)
+    # Legacy pass-through sessions persisted a valid pin. Buffered sessions did
+    # not, so an absent pin must not silently become candidate zero on a seek.
+    pin = entry.get("pin")
+    if isinstance(pin, int) and 0 <= pin < len(cands):
+        return cands[pin]
+    return None
+
+
 def _content_range(resp) -> tuple[int, int, int | None] | None:
     m = _CONTENT_RANGE_RE.fullmatch((resp.headers.get("content-range") or "").strip())
     if not m:
@@ -427,7 +590,10 @@ def _range_response_ok(resp, range_header: str | None,
     accepting a full-file 200 would append byte zero at the seek/reconnect point.
     """
     if not range_header:
-        return resp.status_code in (200, 206)
+        if resp.status_code == 200:
+            return True
+        parsed = _content_range(resp) if resp.status_code == 206 else None
+        return bool(parsed is not None and parsed[0] == 0)
     value = range_header.strip()
     suffix = _SUFFIX_RANGE_RE.fullmatch(value)
     explicit = _RANGE_RE.fullmatch(value)
@@ -457,8 +623,18 @@ def _range_response_ok(resp, range_header: str | None,
     return start == wanted_start and (wanted_end is None or end <= wanted_end)
 
 
-async def _send(url: str, range_header: str | None):
-    headers = {}
+async def _send(cand: dict | str, range_header: str | None):
+    """Open a streamed upstream GET with the candidate's safe declared headers.
+
+    Probing already honored behaviorHints.proxyHeaders, but playback formerly
+    dropped them, making a Referer/Cookie-gated URL pass verification and fail
+    for the player. All proxy paths go through this helper.
+    """
+    if isinstance(cand, dict):
+        url = cand["u"]
+        headers = dict(cand.get("rh") or {})
+    else:                         # compatibility for direct internal callers
+        url, headers = cand, {}
     if range_header:
         headers["Range"] = range_header
     req = _client.build_request("GET", url, headers=headers)
@@ -476,10 +652,24 @@ def _fwd_headers(resp) -> dict:
     return out
 
 
+def _response_span(resp, expected_total: int | None = None) -> tuple[int, int | None]:
+    """Absolute response start and promised body length, when knowable."""
+    cr = _content_range(resp)
+    if cr is not None:
+        start, end, _ = cr
+        return start, end - start + 1
+    length = resp.headers.get("content-length") or ""
+    if length.isdigit():
+        return 0, int(length)
+    return 0, expected_total
+
+
 async def _head(entry: dict) -> Response:
-    for c in entry["cands"]:
+    available = [c for c in entry["cands"]
+                 if not reputation.blocked(c.get("sig") or "")]
+    for c in available:
         try:
-            resp = await _send(c["u"], "bytes=0-0")
+            resp = await _send(c, "bytes=0-0")
             if resp.status_code in (200, 206):
                 cr = resp.headers.get("content-range", "")
                 total = cr.split("/")[-1] if "/" in cr else None
@@ -506,11 +696,20 @@ async def _select_start(cands: list[dict], range_header: str | None,
     # Skip releases in short-term cooldown (one just delivered badly) so 'hit
     # play again' lands on the next source — unless they're ALL cooled, in which
     # case serve the best of them rather than nothing.
-    skip_cooled = not all(reputation.cooled(c["sig"]) for c in cands)
+    cands = [c for c in cands
+             if not reputation.blocked(c.get("sig") or "")
+             and not _candidate_rejected(c)]
+    if not cands:
+        return None
+    skip_cooled = not all(reputation.cooled(c.get("sig") or "") for c in cands)
 
-    def _bad(c, reason, node="", extreme=False):
+    def _bad(c, reason, node="", extreme=False, detail=""):
         reputation.observe(c["sig"], token, reason, c["lbl"], node=node, extreme=extreme)
         reputation.cooldown(c["sig"])
+        telemetry.record_buffer(
+            "start_error", sig=c.get("sig", ""),
+            source=c.get("lbl", ""), dbr=c.get("dbr", ""), node=node,
+            reason=detail or reason)
         if c["sig"].startswith("nzb:"):
             usenet_health.record_failure(
                 c["sig"], c["lbl"], c.get("nzb_indexers") or [], reason,
@@ -529,10 +728,10 @@ async def _select_start(cands: list[dict], range_header: str | None,
         failure recorded)."""
         t0 = time.monotonic()
         try:
-            resp = await _send(c["u"], range_header)
+            resp = await _send(c, range_header)
         except Exception as e:
             logger.info(f"proxy start: cand {idx} connect fail ({type(e).__name__})")
-            _bad(c, "connect-fail")
+            _bad(c, "connect-fail", detail=f"connect-fail:{type(e).__name__}")
             return None
         node = telemetry.netinfo(resp).get("node", "")
         if not _range_response_ok(resp, range_header):
@@ -558,7 +757,8 @@ async def _select_start(cands: list[dict], range_header: str | None,
         except Exception as e:
             logger.info(f"proxy start: cand {idx} read fail ({type(e).__name__})")
             await resp.aclose()
-            _bad(c, "read-fail", node=node)
+            _bad(c, "read-fail", node=node,
+                 detail=f"read-fail:{type(e).__name__}")
             return None
         # A 200/206 that isn't actually a media container = an error page / wrong
         # file from an expired or uncached debrid link. Serving it gives the player
@@ -591,7 +791,7 @@ async def _select_start(cands: list[dict], range_header: str | None,
     # otherwise pass are held back — real video, but our players can't demux them.
     deferred: list[tuple[int, dict]] = []
     for idx, c in enumerate(cands):
-        if skip_cooled and reputation.cooled(c["sig"]):
+        if skip_cooled and reputation.cooled(c.get("sig") or ""):
             logger.info(f"proxy start: cand {idx} in cooldown, skipping")
             continue
         res = await _attempt(idx, c)
@@ -632,16 +832,20 @@ def _total_of(resp) -> int | None:
 
 
 def _twin_cands(entry: dict, cand: dict) -> list[dict]:
-    """Byte-identical twins of `cand`: same release signature, different debrid
+    """Byte-identical twins of `cand`: same strong content identity, different debrid
     (so a different node). Drawn from the whole ranked pool, not just this
     token's failover window."""
-    sig = cand.get("sig")
-    if not sig:
+    cid = _cache_id(cand)
+    if not cid or not cid.startswith("torrent:"):
+        # Exact-URL cache identities are safe for reconnecting that URL, but do
+        # not prove a different delivery URL contains identical bytes.
         return []
     pool = entry.get("pool") or entry.get("cands") or []
+    auto = entry.get("auto") is True
     return [c for c in pool
-            if c.get("sig") == sig and c.get("dbr") != cand.get("dbr")
-            and c.get("u") != cand.get("u")]
+            if _cache_id(c) == cid and c.get("dbr") != cand.get("dbr")
+            and c.get("u") != cand.get("u")
+            and (c.get("auto") is True) == auto]
 
 
 async def _open_twin(entry, cand, cur, end, tried):
@@ -661,7 +865,7 @@ async def _open_twin(entry, cand, cur, end, tried):
         tried.add(tw["u"])
         rh = f"bytes={cur}-" + (str(end) if end is not None else "")
         try:
-            resp = await _send(tw["u"], rh)
+            resp = await _send(tw, rh)
         except Exception:
             continue
         if not _range_response_ok(resp, rh, expected_total=want_total):
@@ -785,7 +989,7 @@ def _arm_reject_timer(e: "_Entry", token: str) -> None:
             if (state.get("rejected") or state.get("real_play")
                     or e.consumers > 0):
                 return                 # reattached or resolved meanwhile
-            _mark_rejected(state, sig=e.sig,
+            _mark_rejected(state, sig=_release_sig(e),
                            label=(e.source or {}).get("lbl", ""), node=e.node,
                            token=token, picker=e.picker, media_id=e.media_id,
                            detail=f"{state.get('false_starts', 0)} false starts"
@@ -843,7 +1047,7 @@ def _note_recovery(e: "_Entry", token: str) -> None:
         return
     logger.info(f"proxy: auto-recovery — {(e.source or {}).get('lbl', '')!r} "
                 f"plays after a rejected release on the same token")
-    telemetry.record_buffer("recovery_ok", sig=e.sig, picker=e.picker,
+    telemetry.record_buffer("recovery_ok", sig=_release_sig(e), picker=e.picker,
                             media_id=e.media_id,
                             source=(e.source or {}).get("lbl", ""), node=e.node,
                             reason="played after player-rejected swap")
@@ -903,6 +1107,16 @@ async def _body(entry, idx, cand, resp, it, prebuf, offset, end, ttfb, token, ne
                     except StopAsyncIteration:
                         chunk = None
                     if chunk is None:
+                        expected_stop = entry.get("total")
+                        if end is not None:
+                            expected_stop = min(end + 1, expected_stop) \
+                                if expected_stop is not None else end + 1
+                        if expected_stop is not None and cur < expected_stop:
+                            # A clean iterator end is still a truncated transfer
+                            # when Content-Length/Content-Range promised more.
+                            # Route it through the normal reconnect/twin logic.
+                            raise httpx.RemoteProtocolError(
+                                f"premature EOF at {cur}, expected {expected_stop}")
                         reason = "eof"
                         break
                     up_time += time.monotonic() - r0
@@ -946,7 +1160,7 @@ async def _body(entry, idx, cand, resp, it, prebuf, offset, end, ttfb, token, ne
                         pass
                     rh = f"bytes={cur}-" + (str(end) if end is not None else "")
                     try:
-                        r2 = await _send(cand["u"], rh)
+                        r2 = await _send(cand, rh)
                     except Exception:
                         r2 = None
                     if r2 is not None and _range_response_ok(
@@ -1016,7 +1230,8 @@ async def _body(entry, idx, cand, resp, it, prebuf, offset, end, ttfb, token, ne
 # TorBox<->Real-Debrid twin switch then happens on the producer side and is
 # invisible to the player as long as the buffer has runway — so it stabilises
 # single-source streams too, not just twinned ones. Cache entries are keyed by
-# release signature (twins and re-watches share one download), retained up to
+# strong content identity (proven twins and exact-URL re-watches share one),
+# retained up to
 # BUFFER_TTL / BUFFER_CACHE_BYTES (LRU), and wiped on restart (pure optimisation,
 # never authoritative). Seeks ahead of the write head fall through to a direct
 # pass-through; seeks behind it are served instantly from cache.
@@ -1049,7 +1264,7 @@ class _Entry:
                  "content_type", "picker", "media_id", "node", "playfail")
 
     def __init__(self, sig, path, cands, source, content_type, total, picker, media_id):
-        self.sig = sig
+        self.sig = sig                    # exact cache id (not reputation signature)
         self.playfail: dict = {}      # player-rejected detector state (_note_consumer_close)
         self.path = path
         self.total = total            # full byte length (Content-Range), or None
@@ -1069,10 +1284,19 @@ class _Entry:
         self.node = ""                # delivery node of the current feeding source
 
 
+def _release_sig(e: _Entry) -> str:
+    return (e.source or {}).get("sig") or ""
+
+
 _entries: dict[str, _Entry] = {}
 _entries_start_lock = asyncio.Lock()
 _reaper_task = None            # module ref so the reaper isn't GC'd mid-run
 _bg_tasks: set = set()         # strong refs for fire-and-forget prefetch tasks
+
+
+def _candidate_rejected(c: dict) -> bool:
+    e = _entries.get(_cache_id(c))
+    return bool(e and e.playfail.get("rejected"))
 
 
 def active_streams() -> int:
@@ -1157,20 +1381,24 @@ async def _reaper() -> None:
         await asyncio.sleep(BUFFER_REAP_INTERVAL)
         try:
             await hlsproxy.flush_idle()   # HLS sessions account per-session
-            now = time.time()
-            for e in list(_entries.values()):
-                if e.consumers <= 0 and now - e.last > BUFFER_TTL:
-                    logger.info(f"bufcache: TTL-evict {e.sig} ({e.avail // 1024 // 1024} MB)")
-                    _evict(e)
-            total = sum(e.avail for e in _entries.values())
-            if total > BUFFER_CACHE_BYTES:
-                for e in sorted(_entries.values(), key=lambda x: x.last):
-                    if total <= BUFFER_CACHE_BYTES:
-                        break
-                    if e.consumers <= 0:
-                        logger.info(f"bufcache: size-evict {e.sig} ({e.avail // 1024 // 1024} MB)")
-                        total -= e.avail
+            _prune_sessions()
+            if PROXY_BUFFER:
+                now = time.time()
+                for e in list(_entries.values()):
+                    if e.consumers <= 0 and now - e.last > BUFFER_TTL:
+                        logger.info(f"bufcache: TTL-evict {e.sig} "
+                                    f"({e.avail // 1024 // 1024} MB)")
                         _evict(e)
+                total = sum(e.avail for e in _entries.values())
+                if total > BUFFER_CACHE_BYTES:
+                    for e in sorted(_entries.values(), key=lambda x: x.last):
+                        if total <= BUFFER_CACHE_BYTES:
+                            break
+                        if e.consumers <= 0:
+                            logger.info(f"bufcache: size-evict {e.sig} "
+                                        f"({e.avail // 1024 // 1024} MB)")
+                            total -= e.avail
+                            _evict(e)
         except Exception:
             logger.exception("bufcache reaper error")
 
@@ -1181,29 +1409,57 @@ def _bufcache_startup() -> None:
     app startup. Deletes only our own *.bin files, never the whole directory, so a
     misconfigured BUFFER_DIR can't wipe unrelated data."""
     global _reaper_task
-    if not PROXY_BUFFER:
-        return
+    if PROXY_BUFFER:
+        try:
+            os.makedirs(BUFFER_DIR, exist_ok=True)
+            os.chmod(BUFFER_DIR, 0o700)
+            for name in os.listdir(BUFFER_DIR):
+                if name.endswith(".bin"):
+                    try:
+                        os.remove(os.path.join(BUFFER_DIR, name))
+                    except Exception:
+                        pass
+        except Exception:
+            logger.exception("bufcache: could not prepare cache dir")
+            return
+    # HLS session flushing is maintenance too and must run even when the file
+    # read-ahead buffer is disabled.
+    if _reaper_task is None or _reaper_task.done():
+        _reaper_task = asyncio.create_task(_reaper())
+    if PROXY_BUFFER:
+        logger.info(f"bufcache: ready at {BUFFER_DIR} "
+                    f"(cap {BUFFER_CACHE_BYTES // 1024 ** 3}GB, "
+                    f"ttl {BUFFER_TTL / 3600:.0f}h, "
+                    f"ahead {BUFFER_AHEAD_BYTES // 1024 ** 3}GB)")
+    else:
+        logger.info("proxy: HLS/session maintenance ready (file buffer disabled)")
+
+
+async def shutdown() -> None:
+    """Gracefully stop producers/maintenance, flush state, and close clients."""
+    global _reaper_task
+    tasks = list(_bg_tasks)
+    if _reaper_task is not None:
+        tasks.append(_reaper_task)
+    tasks.extend(e.producer for e in _entries.values() if e.producer is not None)
+    for task in dict.fromkeys(tasks):
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*dict.fromkeys(tasks), return_exceptions=True)
+    _bg_tasks.clear()
+    _reaper_task = None
     try:
-        os.makedirs(BUFFER_DIR, exist_ok=True)
-        os.chmod(BUFFER_DIR, 0o700)
-        for name in os.listdir(BUFFER_DIR):
-            if name.endswith(".bin"):
-                try:
-                    os.remove(os.path.join(BUFFER_DIR, name))
-                except Exception:
-                    pass
+        _compact()
     except Exception:
-        logger.exception("bufcache: could not prepare cache dir")
-        return
-    _reaper_task = asyncio.create_task(_reaper())
-    logger.info(f"bufcache: ready at {BUFFER_DIR} (cap {BUFFER_CACHE_BYTES // 1024 ** 3}GB, "
-                f"ttl {BUFFER_TTL / 3600:.0f}h, ahead {BUFFER_AHEAD_BYTES // 1024 ** 3}GB)")
+        logger.debug("session shutdown compact failed", exc_info=True)
+    await hlsproxy.shutdown()
+    await _client.aclose()
 
 
 async def _connect_resume(e: _Entry, tried: set, prefer_new: bool = False) -> tuple | None:
     """(Re)connect a feeding source at the current write head e.avail — the same
     source first (transient blip) unless prefer_new, then byte-identical twins /
-    other same-signature sources on different nodes. Requires a 206 at the exact
+    other same-content sources on different nodes. Requires a 206 at the exact
     offset and, when known, a matching total length, so we never resume from a
     different file. Returns (cand, resp, iterator) or None."""
     offset = e.avail
@@ -1216,7 +1472,7 @@ async def _connect_resume(e: _Entry, tried: set, prefer_new: bool = False) -> tu
             continue                              # no byte-identity proof for a twin
         rh = f"bytes={offset}-"
         try:
-            resp = await _send(c["u"], rh)
+            resp = await _send(c, rh)
         except Exception:
             continue
         if not _range_response_ok(resp, rh, expected_total=e.total):
@@ -1243,6 +1499,7 @@ async def _produce(e: _Entry, token: str, resp, it, prebuf: list) -> None:
     f = None
     win: deque = deque()               # (t, up_bytes) for slow-source detection
     up_bytes = 0
+    resume_failures = 0
     node = telemetry.netinfo(resp).get("node", "") if resp else ""
     e.node = node
     try:
@@ -1268,7 +1525,7 @@ async def _produce(e: _Entry, token: str, resp, it, prebuf: list) -> None:
                 logger.info(f"bufcache {e.sig}: source drop at {e.avail} "
                             f"({type(ex).__name__}), reconnecting")
                 telemetry.record_buffer(
-                    "drop", sig=e.sig, picker=e.picker, media_id=e.media_id,
+                    "drop", sig=_release_sig(e), picker=e.picker, media_id=e.media_id,
                     source=(e.source or {}).get("lbl", ""),
                     dbr=(e.source or {}).get("dbr", ""), node=node,
                     offset=e.avail, total=e.total, reason=type(ex).__name__)
@@ -1277,21 +1534,24 @@ async def _produce(e: _Entry, token: str, resp, it, prebuf: list) -> None:
                 except Exception:
                     pass
                 if e.avail > 0 and e.source:
-                    reputation.observe(e.source.get("sig", e.sig), token,
+                    reputation.observe(e.source.get("sig", ""), token,
                                        "mid-stream-dead", e.source.get("lbl", ""))
-                    sig = e.source.get("sig", e.sig)
+                    sig = e.source.get("sig", "")
+                    reputation.cooldown(sig)
                     if sig.startswith("nzb:"):
                         usenet_health.record_failure(
                             sig, e.source.get("lbl", ""),
                             e.source.get("nzb_indexers") or [], "mid-stream-dead",
                             f"buffer:{token}:{sig}")
-                nxt = await _connect_resume(e, tried)
+                resume_failures += 1
+                nxt = (await _connect_resume(e, tried)
+                       if resume_failures <= RECONNECT_MAX else None)
                 if nxt is None:
                     async with e.cond:
                         e.failed = True
                         e.cond.notify_all()
                     telemetry.record_buffer(
-                        "failed", sig=e.sig, picker=e.picker, media_id=e.media_id,
+                        "failed", sig=_release_sig(e), picker=e.picker, media_id=e.media_id,
                         offset=e.avail, total=e.total,
                         reason="all sources exhausted")
                     logger.info(f"bufcache {e.sig}: all sources failed at {e.avail}")
@@ -1300,14 +1560,56 @@ async def _produce(e: _Entry, token: str, resp, it, prebuf: list) -> None:
                 node = telemetry.netinfo(resp).get("node", "")
                 e.node = node
                 telemetry.record_buffer(
-                    "reconnect", sig=e.sig, picker=e.picker, media_id=e.media_id,
+                    "reconnect", sig=_release_sig(e), picker=e.picker, media_id=e.media_id,
                     source=(e.source or {}).get("lbl", ""),
                     dbr=(e.source or {}).get("dbr", ""), node=node,
                     offset=e.avail, total=e.total)
                 win.clear()
                 up_bytes = 0
                 continue
-            if chunk is None:                     # clean EOF: whole file cached
+            if chunk is None and e.total is not None and e.avail < e.total:
+                # Some CDNs close cleanly after a truncated body. Treat the
+                # declared total as authoritative and reconnect at the exact
+                # write head; declaring this entry complete would permanently
+                # cache a partial movie as a healthy source.
+                logger.info(f"bufcache {e.sig}: premature EOF at {e.avail}/"
+                            f"{e.total}, reconnecting")
+                telemetry.record_buffer(
+                    "drop", sig=_release_sig(e), picker=e.picker,
+                    media_id=e.media_id, source=(e.source or {}).get("lbl", ""),
+                    dbr=(e.source or {}).get("dbr", ""), node=node,
+                    offset=e.avail, total=e.total, reason="premature-eof")
+                if e.source:
+                    sig = e.source.get("sig", "")
+                    reputation.observe(sig, token, "premature-eof",
+                                       e.source.get("lbl", ""), node=node)
+                    reputation.cooldown(sig)
+                    if sig.startswith("nzb:"):
+                        usenet_health.record_failure(
+                            sig, e.source.get("lbl", ""),
+                            e.source.get("nzb_indexers") or [], "premature-eof",
+                            f"buffer-eof:{token}:{sig}")
+                try:
+                    await resp.aclose()
+                except Exception:
+                    pass
+                resume_failures += 1
+                nxt = (await _connect_resume(e, tried)
+                       if resume_failures <= RECONNECT_MAX else None)
+                if nxt is None:
+                    async with e.cond:
+                        e.failed = True
+                        e.cond.notify_all()
+                    telemetry.record_buffer(
+                        "failed", sig=_release_sig(e), picker=e.picker,
+                        media_id=e.media_id, offset=e.avail, total=e.total,
+                        reason="premature EOF; all sources exhausted")
+                    break
+                _, resp, it = nxt
+                node = telemetry.netinfo(resp).get("node", "")
+                e.node = node
+                continue
+            if chunk is None:                     # verified clean EOF: whole file cached
                 async with e.cond:
                     e.complete = True
                     if e.total is None:
@@ -1315,12 +1617,13 @@ async def _produce(e: _Entry, token: str, resp, it, prebuf: list) -> None:
                     e.cond.notify_all()
                 logger.info(f"bufcache {e.sig}: complete ({e.avail} bytes)")
                 telemetry.record_buffer(
-                    "complete", sig=e.sig, picker=e.picker, media_id=e.media_id,
+                    "complete", sig=_release_sig(e), picker=e.picker, media_id=e.media_id,
                     source=(e.source or {}).get("lbl", ""),
                     dbr=(e.source or {}).get("dbr", ""), node=node,
                     avail=e.avail, total=e.total)
                 break
             f.write(chunk)
+            resume_failures = 0
             async with e.cond:
                 e.avail += len(chunk)
                 e.cond.notify_all()
@@ -1344,7 +1647,7 @@ async def _produce(e: _Entry, token: str, resp, it, prebuf: list) -> None:
                     logger.info(f"bufcache {e.sig}: source slow "
                                 f"({rate} MB/s < need), twin-switch")
                     telemetry.record_buffer(
-                        "slow", sig=e.sig, picker=e.picker, media_id=e.media_id,
+                        "slow", sig=_release_sig(e), picker=e.picker, media_id=e.media_id,
                         source=(e.source or {}).get("lbl", ""),
                         dbr=(e.source or {}).get("dbr", ""), node=node,
                         offset=e.avail, total=e.total, mbps=rate,
@@ -1359,7 +1662,7 @@ async def _produce(e: _Entry, token: str, resp, it, prebuf: list) -> None:
                         node = telemetry.netinfo(resp).get("node", "")
                         e.node = node
                         telemetry.record_buffer(
-                            "twin", sig=e.sig, picker=e.picker, media_id=e.media_id,
+                            "twin", sig=_release_sig(e), picker=e.picker, media_id=e.media_id,
                             source=(e.source or {}).get("lbl", ""),
                             dbr=(e.source or {}).get("dbr", ""), node=node,
                             offset=e.avail, total=e.total, mbps=rate)
@@ -1373,7 +1676,7 @@ async def _produce(e: _Entry, token: str, resp, it, prebuf: list) -> None:
             e.failed = True
             e.cond.notify_all()
         telemetry.record_buffer(
-            "failed", sig=e.sig, picker=e.picker, media_id=e.media_id,
+            "failed", sig=_release_sig(e), picker=e.picker, media_id=e.media_id,
             offset=e.avail, total=e.total, reason=f"producer crash: {type(ex).__name__}")
     finally:
         if f:
@@ -1389,29 +1692,43 @@ async def _produce(e: _Entry, token: str, resp, it, prebuf: list) -> None:
         e.producer = None
 
 
-async def _get_or_start_entry(token: str, session: dict, cands: list) -> _Entry | None:
+async def _get_or_start_entry_once(token: str, session: dict,
+                                   cands: list) -> _Entry | None:
     """Find the cache entry this token's release maps to (twins and re-watches
     reuse an existing one), or select a working source at offset 0 and start a
     producer. Returns the entry, or None if no source could even start."""
     retired: list[_Entry] = []
     reuse = None
+    available = [c for c in cands
+                 if not reputation.blocked(c.get("sig") or "")
+                 and not _candidate_rejected(c)]
+    skip_cooled = bool(available) and not all(
+        reputation.cooled(c.get("sig") or "") for c in available)
+    reusable_ids = [_cache_id(c) for c in available
+                    if not (skip_cooled and reputation.cooled(c.get("sig") or ""))]
     async with _entries_start_lock:
-        sigs = [session.get("bufsig")] + [c.get("sig") for c in cands]
-        for sig in dict.fromkeys(s for s in sigs if s):
-            existing = _entries.get(sig)
+        sticky = session.get("bufcid") or session.get("bufsig")
+        cache_ids = ([sticky] if sticky in reusable_ids else []) + reusable_ids
+        for cache_id in dict.fromkeys(s for s in cache_ids if s):
+            existing = _entries.get(cache_id)
             if existing is None:
                 continue
             if existing.failed:
-                if _entries.get(sig) is existing:
-                    _entries.pop(sig, None)
+                if _entries.get(cache_id) is existing:
+                    _entries.pop(cache_id, None)
                 retired.append(existing)
-                if session.get("bufsig") == sig:
+                if (session.get("bufcid") == cache_id
+                        or session.get("bufsig") == cache_id):
                     session.pop("bufsig", None)
+                    session.pop("bufcid", None)
                 continue
             if existing.playfail.get("rejected"):
                 continue        # player can't open it — pick a different release
             reuse = existing
-            session["bufsig"] = sig
+            session["bufcid"] = cache_id
+            session["bufsig"] = cache_id       # legacy observability/tests
+            if existing.source:
+                _pin_selection(token, session, cands, existing.source)
             break
     for old in retired:
         _retire_failed(old)
@@ -1425,42 +1742,58 @@ async def _get_or_start_entry(token: str, session: dict, cands: list) -> _Entry 
     if sel is None:
         return None
     _, cand, resp, it, prebuf, _, _ = sel
-    sig = cand.get("sig") or secrets.token_urlsafe(8)
+    cache_id = _cache_id(cand) or ("session:" + token)
+    _pin_selection(token, session, cands, cand)
     reuse = None
     retired = []
     async with _entries_start_lock:
-        existing = _entries.get(sig)
+        existing = _entries.get(cache_id)
         if existing is not None and existing.failed:
-            _entries.pop(sig, None)
+            _entries.pop(cache_id, None)
             retired.append(existing)
             existing = None
         if existing is not None:                    # another cold start won the race
             reuse = existing
-            session["bufsig"] = sig
+            session["bufcid"] = cache_id
+            session["bufsig"] = cache_id
         else:
             pool = session.get("pool") or cands
-            srcs = [c for c in pool if c.get("sig") == sig] or [cand]
+            srcs = [c for c in pool if _cache_id(c) == cache_id] or [cand]
             # A generation suffix lets a retired entry finish serving an already
             # open file descriptor while its replacement starts cleanly.
             path = os.path.join(
-                BUFFER_DIR, f"{_safe_name(sig)}.{secrets.token_hex(4)}.bin")
-            e = _Entry(sig, path, srcs, cand,
+                BUFFER_DIR, f"{_safe_name(cache_id)}.{secrets.token_hex(4)}.bin")
+            e = _Entry(cache_id, path, srcs, cand,
                        resp.headers.get("content-type", ""), _total_of(resp),
                        session.get("picker", ""), session.get("id", ""))
-            _entries[sig] = e
-            session["bufsig"] = sig
+            _entries[cache_id] = e
+            session["bufcid"] = cache_id
+            session["bufsig"] = cache_id
             e.producer = asyncio.create_task(_produce(e, token, resp, it, prebuf))
     for old in retired:
         _retire_failed(old)
     if reuse is not None:
         await resp.aclose()
         return reuse
-    logger.info(f"bufcache {sig}: start (source {cand.get('lbl')!r}, total {e.total})")
-    telemetry.record_buffer("start", sig=sig, picker=e.picker, media_id=e.media_id,
+    logger.info(f"bufcache {cache_id}: start (source {cand.get('lbl')!r}, total {e.total})")
+    telemetry.record_buffer("start", sig=cand.get("sig", ""), picker=e.picker,
+                            media_id=e.media_id,
                             source=cand.get("lbl", ""), dbr=cand.get("dbr", ""),
                             node=telemetry.netinfo(resp).get("node", ""),
                             total=e.total)
     return e
+
+
+async def _get_or_start_entry(token: str, session: dict,
+                              cands: list) -> _Entry | None:
+    """Token-scoped single-flight around cold selection and producer creation.
+
+    Two simultaneous opens of one token must never independently select two
+    different releases. Unrelated titles still evaluate concurrently.
+    """
+    lock = _start_locks.setdefault(token, asyncio.Lock())
+    async with lock:
+        return await _get_or_start_entry_once(token, session, cands)
 
 
 async def _fire_prefetch(media_id: str, picker_label: str) -> None:
@@ -1478,6 +1811,8 @@ def _cache_headers(e: _Entry, start: int, end: int | None, had_range: bool):
     h = {"Accept-Ranges": "bytes", "Content-Type": e.content_type}
     if had_range:
         last = end if end is not None else ((total - 1) if total else None)
+        if total is not None and last is not None:
+            last = min(last, total - 1)
         if total is not None and last is not None:
             h["Content-Range"] = f"bytes {start}-{last}/{total}"
             h["Content-Length"] = str(last - start + 1)
@@ -1557,7 +1892,7 @@ async def _consume(e: _Entry, offset: int, end: int | None, token: str):
                                   reason=reason, session=token,
                                   net={"node": e.node})
             _note_consumer_close(
-                e.playfail, sig=e.sig, label=(e.source or {}).get("lbl", ""),
+                e.playfail, sig=_release_sig(e), label=(e.source or {}).get("lbl", ""),
                 node=e.node, token=token, picker=e.picker,
                 media_id=e.media_id, served=served,
                 dur=time.monotonic() - t0, offset=offset)
@@ -1579,11 +1914,15 @@ def _skip_rejected(source: dict | None, cands: list) -> dict | None:
     release still serves its own seeks: a viewer mid-file must keep getting
     byte-identical data."""
     def ok(c):
-        ent = _entries.get(c.get("sig") or "")
+        ent = _entries.get(_cache_id(c))
         return not (ent and ent.playfail.get("rejected"))
     if source is None or ok(source):
         return source
-    return next((c for c in cands if ok(c)), source)
+    cid = _cache_id(source)
+    # A tail/seek may only move to a byte-identical delivery twin. Switching to
+    # an unrelated "clean" release here corrupts the file the player parsed.
+    return next((c for c in cands if c is not source and ok(c)
+                 and cid and _cache_id(c) == cid), None)
 
 
 async def _serve_direct(session: dict, cands: list, request, token: str,
@@ -1591,57 +1930,127 @@ async def _serve_direct(session: dict, cands: list, request, token: str,
                         expected_total: int | None = None) -> Response:
     """Pass-through for a byte range we can't (yet) serve from cache — a seek ahead
     of the write head, or a session that never cached.  A nonzero/suffix seek is
-    locked to one release; only byte-identical same-signature delivery twins may
+    locked to one release; only byte-identical same-content delivery twins may
     be tried after its preferred source."""
     rh = request.headers.get("range")
     offset, _, had_range = _parse_range(rh)
     seek = _suffix_length(rh) is not None or (had_range and offset > 0)
     anchor = source or (cands[0] if cands else None)
+    if seek and source is None:
+        # A seek-first request without a persisted selection has no safe release
+        # identity. Candidate zero is only a ranking position, not proof that it
+        # is the file whose header the player parsed before restart.
+        return Response(status_code=409, headers={"Accept-Ranges": "bytes"})
     order = ([anchor] if anchor else []) + [c for c in cands if c is not anchor]
     if seek and anchor is not None:
-        sig = anchor.get("sig") or ""
+        cid = _cache_id(anchor)
         order = [c for c in order
-                 if c is anchor or (sig and c.get("sig") == sig)]
+                 if c is anchor or (cid and _cache_id(c) == cid)]
     for c in order:
         try:
-            resp = await _send(c["u"], rh)
-        except Exception:
+            resp = await _send(c, rh)
+        except Exception as exc:
+            telemetry.record_buffer(
+                "direct_error", sig=c.get("sig", ""),
+                picker=session.get("picker", ""), media_id=session.get("id", ""),
+                source=c.get("lbl", ""), dbr=c.get("dbr", ""),
+                reason=f"connect:{type(exc).__name__}")
             continue
         if _range_response_ok(resp, rh, expected_total=expected_total):
-            async def gen(resp=resp):
+            if not seek:
+                _pin_selection(token, session, session.get("cands") or cands, c)
+            async def gen(resp=resp, cand=c):
+                current = resp
+                base, promised = _response_span(current, expected_total)
+                sent, retries = 0, 0
                 try:
-                    async for chunk in resp.aiter_raw():
-                        yield chunk
+                    while True:
+                        failed = False
+                        try:
+                            async for chunk in current.aiter_raw():
+                                sent += len(chunk)
+                                yield chunk
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            failed = True
+                        if not failed and (promised is None or sent >= promised):
+                            break
+                        if retries >= RECONNECT_MAX:
+                            sig = cand.get("sig") or ""
+                            reputation.observe(sig, token, "premature-eof",
+                                               cand.get("lbl", ""))
+                            reputation.cooldown(sig)
+                            telemetry.record_buffer(
+                                "direct_error", sig=sig,
+                                picker=session.get("picker", ""),
+                                media_id=session.get("id", ""),
+                                source=cand.get("lbl", ""),
+                                dbr=cand.get("dbr", ""),
+                                reason=f"premature-eof:{sent}/{promised}")
+                            break
+                        retries += 1
+                        try:
+                            await current.aclose()
+                        except Exception:
+                            pass
+                        absolute = base + sent
+                        last = base + promised - 1 if promised is not None else None
+                        resume = f"bytes={absolute}-" + (str(last) if last is not None else "")
+                        try:
+                            nxt = await _send(cand, resume)
+                        except Exception:
+                            continue
+                        if not _range_response_ok(
+                                nxt, resume, expected_total=expected_total):
+                            await nxt.aclose()
+                            continue
+                        current = nxt
                 except asyncio.CancelledError:
                     raise
                 finally:
                     try:
-                        await resp.aclose()
+                        await current.aclose()
                     except Exception:
                         pass
             return StreamingResponse(gen(), status_code=resp.status_code,
                                      headers=_fwd_headers(resp))
+        telemetry.record_buffer(
+            "direct_error", sig=c.get("sig", ""),
+            picker=session.get("picker", ""), media_id=session.get("id", ""),
+            source=c.get("lbl", ""), dbr=c.get("dbr", ""),
+            reason=(f"http-{resp.status_code}" if resp.status_code not in (200, 206)
+                    else "bad-content-range"))
         await resp.aclose()
     return Response(status_code=502)
 
 
 async def _serve_buffered(token: str, session: dict, cands: list, offset: int,
                           end: int | None, had_range: bool, request) -> Response:
-    sig = session.get("bufsig")
-    e = _entries.get(sig) if sig else None
+    cache_id = session.get("bufcid") or session.get("bufsig")
+    e = _entries.get(cache_id) if cache_id else None
     if e is not None and offset == 0 and e.playfail.get("rejected"):
         # The player provably can't open this release (see _note_consumer_close)
         # — a fresh open must select a different one, not re-serve the cache.
         session.pop("bufsig", None)
+        session.pop("bufcid", None)
         e = None
     if (e is None or e.failed) and offset == 0:         # opening/retry starts a clean fill
         e = await _get_or_start_entry(token, session, cands)
     if e is None:                                       # seek-first, or no source at all
-        pin = min(session.get("pin") or 0, len(cands) - 1) if cands else 0
-        source = cands[pin] if cands and offset > 0 else None
+        if offset == 0:
+            return Response(status_code=502)
+        source = _selected_candidate(session, cands) if offset > 0 else None
         source = _skip_rejected(source, cands)
         return await _serve_direct(session, cands, request, token, source=source)
     e.last = time.time()
+    if e.total is not None and (offset >= e.total or
+                                (end is not None and end < offset)):
+        return Response(status_code=416,
+                        headers={"Accept-Ranges": "bytes",
+                                 "Content-Range": f"bytes */{e.total}"})
+    if e.total is not None and end is not None:
+        end = min(end, e.total - 1)
     # Seek ahead of what's cached (and not done): pass through directly rather than
     # block waiting for the sequential fill to reach it.
     if offset >= e.avail and not e.complete:
@@ -1670,6 +2079,16 @@ async def serve(token: str, request) -> Response:
 
     if range_header and not had_range:
         return Response(status_code=416, headers={"Accept-Ranges": "bytes"})
+    if had_range and end is not None and end < offset:
+        headers = {"Accept-Ranges": "bytes"}
+        if entry.get("total") is not None:
+            headers["Content-Range"] = f"bytes */{entry['total']}"
+        return Response(status_code=416, headers=headers)
+    if (had_range and entry.get("total") is not None
+            and offset >= entry["total"] and _suffix_length(range_header) is None):
+        return Response(status_code=416,
+                        headers={"Accept-Ranges": "bytes",
+                                 "Content-Range": f"bytes */{entry['total']}"})
 
     # Suffix ranges address the tail of the file, so they cannot be represented
     # by the byte-zero sequential cache until the total is known.  Forward them
@@ -1679,16 +2098,18 @@ async def serve(token: str, request) -> Response:
     if suffix is not None:
         if suffix <= 0:
             return Response(status_code=416, headers={"Accept-Ranges": "bytes"})
-        sig = entry.get("bufsig")
-        cached = _entries.get(sig) if sig else None
+        cache_id = entry.get("bufcid") or entry.get("bufsig")
+        cached = _entries.get(cache_id) if cache_id else None
         if cached is not None:
             return await _serve_direct(entry, cached.cands, request, token,
                                        source=cached.source,
                                        expected_total=cached.total)
-        pin = min(entry.get("pin") or 0, len(cands) - 1) if cands else 0
-        source = cands[pin] if cands else None
+        source = _selected_candidate(entry, cands)
         source = _skip_rejected(source, cands)
-        pool = entry.get("pool") or cands
+        if source is None:
+            return Response(status_code=409, headers={"Accept-Ranges": "bytes"})
+        pool = [c for c in (entry.get("pool") or cands)
+                if _cache_id(c) == _cache_id(source)]
         return await _serve_direct(entry, pool, request, token, source=source)
 
     # A series episode just started playing: search-and-cache the next episode
@@ -1718,12 +2139,14 @@ async def serve(token: str, request) -> Response:
                                   reason="all_failed", session=token)
             return Response(status_code=502)
         idx, cand, resp, it, prebuf, ttfb, net = sel
-        entry["pin"] = idx
+        _pin_selection(token, entry, cands, cand)
     else:                                          # seek: locked to pinned source
-        idx = min(entry.get("pin") or 0, len(cands) - 1)
-        cand = cands[idx]
+        cand = _selected_candidate(entry, cands)
+        if cand is None:
+            return Response(status_code=409, headers={"Accept-Ranges": "bytes"})
+        idx = cands.index(cand)
         try:
-            resp = await _send(cand["u"], range_header)
+            resp = await _send(cand, range_header)
         except Exception:
             return Response(status_code=502)
         if not _range_response_ok(resp, range_header,

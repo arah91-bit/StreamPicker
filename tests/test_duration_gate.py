@@ -124,12 +124,12 @@ class ProbeDurationGateTests(unittest.TestCase):
                                [b"\x00\x00\x00 ftypisom"
                                 + b"\x00" * (4 * 1024 * 1024)], url)})
 
-        async def fake_codecs(target, timeout=5.0):
-            return ["aac"], "h264", 185.0
+        async def fake_info(target, timeout=5.0):
+            return ["aac"], "h264", 185.0, ["en"]
 
         with (patch.object(probe, "CODEC_SNIFF", True),
               patch("app.probe.vprobe.enabled", return_value=True),
-              patch("app.probe.vprobe.codecs_of", side_effect=fake_codecs)):
+              patch("app.probe.vprobe.media_info_of", side_effect=fake_info)):
             r = self._run(probe.probe(url, 1_000_000, ttfb_max=10,
                                       expect_secs=1440))
         self.assertFalse(r.ok)
@@ -141,16 +141,17 @@ class ProbeDurationGateTests(unittest.TestCase):
             url: _FakeResponse(200, {}, [b"\x1aE\xdf\xa3"
                                          + b"\x00" * (4 * 1024 * 1024)], url)})
 
-        async def fake_codecs(target, timeout=5.0):
-            return ["aac"], "h264", 1420.0
+        async def fake_info(target, timeout=5.0):
+            return ["aac"], "h264", 1420.0, ["en"]
 
         with (patch.object(probe, "CODEC_SNIFF", True),
               patch("app.probe.vprobe.enabled", return_value=True),
-              patch("app.probe.vprobe.codecs_of", side_effect=fake_codecs)):
+              patch("app.probe.vprobe.media_info_of", side_effect=fake_info)):
             r = self._run(probe.probe(url, 1_000_000, ttfb_max=10,
                                       expect_secs=1440))
         self.assertTrue(r.ok, r.reason)
         self.assertEqual(("aac",), r.acodecs)
+        self.assertEqual(("en",), r.audio_langs)
 
 
 class CooledExcludedFromPicksTests(unittest.TestCase):

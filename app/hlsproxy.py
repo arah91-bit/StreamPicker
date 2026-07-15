@@ -47,6 +47,7 @@ logger = logging.getLogger("stream-picker")
 ENABLED = os.environ.get("PROXY_HLS", "1") not in ("0", "false", "")
 PUBLIC = os.environ.get("ADDON_PUBLIC_URL", "http://localhost:8011").rstrip("/")
 CACHE_BYTES = int(float(os.environ.get("HLS_SEG_CACHE_MB", "64")) * 1e6)
+CACHE_TTL = float(os.environ.get("HLS_SEG_CACHE_TTL_SECONDS", "300"))
 REJECT_COOLDOWN = float(os.environ.get("PLAYER_REJECT_COOLDOWN_HOURS",
                                        "24")) * 3600
 _PREFETCH = 2                      # segments fetched ahead of the player
@@ -55,6 +56,7 @@ _MAX_SEG_BUF = 32 * 1024 * 1024    # buffer/cache segments up to this size
 _REJECT_SILENCE = 15.0             # playlist(s) fetched, no segment, quiet
 _FLUSH_IDLE = 300.0                # idle seconds before a play record flushes
 _PLAYLIST_MAX = 2 * 1024 * 1024
+_BUFFER_CONCURRENCY = max(1, int(os.environ.get("HLS_BUFFER_CONCURRENCY", "4")))
 
 _KEY = hashlib.sha256(
     ("hls:" + os.environ.get("ADDON_SECRET", "")).encode()).digest()
@@ -82,14 +84,16 @@ def request_headers(s: dict) -> dict:
 
 # ── signed resource URLs ─────────────────────────────────────────────────────
 
-def _sign(token: str, url: str) -> str:
-    return hmac.new(_KEY, f"{token}|{url}".encode(), hashlib.sha256) \
+def _sign(token: str, url: str, candidate_key: str = "") -> str:
+    return hmac.new(_KEY, f"{token}|{candidate_key}|{url}".encode(), hashlib.sha256) \
                .hexdigest()[:32]
 
 
-def _res_url(token: str, url: str) -> str:
+def _res_url(token: str, url: str, candidate_key: str = "") -> str:
     u = base64.urlsafe_b64encode(url.encode()).decode().rstrip("=")
-    return f"{PUBLIC}/proxy/{token}/hls?u={u}&s={_sign(token, url)}"
+    c = f"&c={candidate_key}" if candidate_key else ""
+    return (f"{PUBLIC}/proxy/{token}/hls?u={u}{c}"
+            f"&s={_sign(token, url, candidate_key)}")
 
 
 def _decode_u(u: str) -> str:
@@ -105,7 +109,8 @@ def is_playlist(body: bytes) -> bool:
     return body.lstrip()[:7] == b"#EXTM3U"
 
 
-def rewrite(text: str, base_url: str, token: str) -> str:
+def rewrite(text: str, base_url: str, token: str,
+            candidate_key: str = "") -> str:
     """Every URI in the playlist — plain URI lines (variants/segments) and
     URI="…" attributes (EXT-X-KEY, EXT-X-MAP, EXT-X-MEDIA, …) — resolved
     against the playlist's own URL and replaced with a signed proxy URL."""
@@ -119,10 +124,10 @@ def rewrite(text: str, base_url: str, token: str) -> str:
             if 'URI="' in s:
                 s = _URI_ATTR_RE.sub(
                     lambda m: 'URI="%s"' % _res_url(
-                        token, urljoin(base_url, m.group(1))), s)
+                        token, urljoin(base_url, m.group(1)), candidate_key), s)
             out.append(s)
             continue
-        out.append(_res_url(token, urljoin(base_url, s)))
+        out.append(_res_url(token, urljoin(base_url, s), candidate_key))
     return "\n".join(out) + "\n"
 
 
@@ -161,27 +166,48 @@ def declared_codecs(master_text: str) -> tuple[list[str], str]:
 
 # ── segment cache (read-ahead) ───────────────────────────────────────────────
 
-_seg_cache: OrderedDict[str, tuple[bytes, str]] = OrderedDict()
+_seg_cache: OrderedDict[str, tuple[bytes, str, float]] = OrderedDict()
 _seg_cache_bytes = 0
 _prefetching: set[str] = set()
 _bg: set = set()
+_buffer_slots = asyncio.Semaphore(_BUFFER_CONCURRENCY)
 
 
-def _cache_get(url: str) -> tuple[bytes, str] | None:
-    hit = _seg_cache.get(url)
-    if hit is not None:
-        _seg_cache.move_to_end(url)
-    return hit
+def _cache_key(url: str, rh: dict | None = None,
+               candidate_key: str = "") -> str:
+    if not rh and not candidate_key:             # keeps the small test/debug API legible
+        return url
+    headers = "\n".join(f"{str(k).lower()}:{v}" for k, v in
+                         sorted((rh or {}).items(), key=lambda kv: str(kv[0]).lower()))
+    return hashlib.sha256(f"{candidate_key}|{url}|{headers}".encode()).hexdigest()
 
 
-def _cache_put(url: str, body: bytes, ct: str) -> None:
+def _cache_get(url: str, rh: dict | None = None,
+               candidate_key: str = "") -> tuple[bytes, str] | None:
     global _seg_cache_bytes
-    if len(body) > _MAX_SEG_BUF or url in _seg_cache:
+    key = _cache_key(url, rh, candidate_key)
+    hit = _seg_cache.get(key)
+    if hit is not None:
+        body, ct, expires = hit
+        if expires <= time.monotonic():
+            _seg_cache.pop(key, None)
+            _seg_cache_bytes -= len(body)
+            return None
+        _seg_cache.move_to_end(key)
+        return body, ct
+    return None
+
+
+def _cache_put(url: str, body: bytes, ct: str, rh: dict | None = None,
+               candidate_key: str = "") -> None:
+    global _seg_cache_bytes
+    key = _cache_key(url, rh, candidate_key)
+    if len(body) > _MAX_SEG_BUF or key in _seg_cache:
         return
-    _seg_cache[url] = (body, ct)
+    _seg_cache[key] = (body, ct, time.monotonic() + CACHE_TTL)
     _seg_cache_bytes += len(body)
     while _seg_cache_bytes > CACHE_BYTES and _seg_cache:
-        _, (old, _ct) = _seg_cache.popitem(last=False)
+        _, (old, _ct, _expires) = _seg_cache.popitem(last=False)
         _seg_cache_bytes -= len(old)
 
 
@@ -197,31 +223,52 @@ def _spawn(coro) -> None:
     t.add_done_callback(_reap_task)
 
 
-async def _prefetch_one(url: str, rh: dict) -> None:
+async def _prefetch_one(url: str, rh: dict, candidate_key: str) -> None:
     try:
-        r = await _client.get(url, headers=rh)
-        if r.status_code == 200 and not is_playlist(r.content[:16]):
-            _cache_put(url, r.content,
-                       r.headers.get("content-type", "video/mp2t"))
+        async with _buffer_slots:
+            req = _client.build_request("GET", url, headers=rh)
+            r = await _client.send(req, stream=True)
+            try:
+                length = r.headers.get("content-length") or ""
+                if (r.status_code != 200
+                        or (length.isdigit() and int(length) > _MAX_SEG_BUF)):
+                    return
+                chunks, got = [], 0
+                async for chunk in r.aiter_bytes():
+                    got += len(chunk)
+                    if got > _MAX_SEG_BUF:
+                        return
+                    chunks.append(chunk)
+                body = b"".join(chunks)
+                if not is_playlist(body[:16]):
+                    _cache_put(url, body,
+                               r.headers.get("content-type", "video/mp2t"),
+                               rh, candidate_key)
+            finally:
+                await r.aclose()
     except Exception:
         pass
     finally:
-        _prefetching.discard(url)
+        _prefetching.discard(_cache_key(url, rh, candidate_key))
 
 
-def _prefetch_next(entry: dict, url: str, rh: dict) -> None:
+def _prefetch_next(entry: dict, url: str, rh: dict,
+                   candidate_key: str = "") -> None:
     # Per-variant sequences: an ABR player that just switched bitrates must
     # get read-ahead on the variant it is *on*, not the one it left.
-    for seq in (entry.get("_hlsseqs") or {}).values():
+    for seq_key, seq in (entry.get("_hlsseqs") or {}).items():
+        if candidate_key and not str(seq_key).startswith(candidate_key + "|"):
+            continue
         try:
             i = seq.index(url)
         except ValueError:
             continue
         for nxt in seq[i + 1:i + 1 + _PREFETCH]:
-            if nxt in _seg_cache or nxt in _prefetching:
+            key = _cache_key(nxt, rh, candidate_key)
+            if key in _seg_cache or key in _prefetching:
                 continue
-            _prefetching.add(nxt)
-            _spawn(_prefetch_one(nxt, rh))
+            _prefetching.add(key)
+            _spawn(_prefetch_one(nxt, rh, candidate_key))
         return
 
 
@@ -238,7 +285,9 @@ def _st(token: str, entry: dict) -> dict:
                               "cand": None, "cand_idx": 0, "rejected": False,
                               "timer": False, "credited": False,
                               "seg_fails": 0, "struck": False}
-        _active[token] = entry
+    # flush_idle removes quiet sessions from the registry but intentionally
+    # leaves their counters on the token. A later resume must register again.
+    _active[token] = entry
     return st
 
 
@@ -246,6 +295,11 @@ def _mark_rejected(token: str, entry: dict, st: dict) -> None:
     cand = st.get("cand") or {}
     sig, lbl = cand.get("sig") or "", cand.get("lbl", "")
     st["rejected"] = True
+    if cand:
+        rejected = entry.setdefault("_hls_rejected", [])
+        key = _cand_key(cand)
+        if key not in rejected:
+            rejected.append(key)
     logger.info(f"hls: player rejected {lbl!r} — playlists fetched, no "
                 f"segment ever pulled, then silence; cooling release")
     if sig:
@@ -310,16 +364,25 @@ def _note_segment(token: str, entry: dict, st: dict, size: int) -> None:
                 reason="played after player-rejected swap")
 
 
-def _note_seg_failure(token: str, entry: dict, st: dict) -> None:
+def _note_seg_failure(token: str, entry: dict, st: dict,
+                      reason: str = "segment-fetch-failed",
+                      cand_override: dict | None = None) -> None:
     """Segments dying under a playing session = the host is failing mid-stream.
     Strike the release once per session so a repeat offender cools and the next
     open serves a different one — the HLS analog of 'mid-stream-dead'."""
+    cand = cand_override or st.get("cand") or {}
+    sig, lbl = cand.get("sig") or "", cand.get("lbl", "")
+    telemetry.record_buffer("segment_error", sig=sig,
+                            picker=entry.get("picker", ""),
+                            media_id=entry.get("id", ""), source=lbl,
+                            reason=reason)
+    current = st.get("cand") or {}
+    if cand_override and _cand_key(cand_override) != _cand_key(current):
+        return                      # a late old-variant request cannot strike the new pick
     st["seg_fails"] += 1
     if st["struck"] or st["seg_fails"] < 3:
         return
     st["struck"] = True
-    cand = st.get("cand") or {}
-    sig, lbl = cand.get("sig") or "", cand.get("lbl", "")
     logger.info(f"hls: segments failing for {lbl!r} "
                 f"({st['seg_fails']} fetch failures) — cooling release")
     if sig:
@@ -327,7 +390,7 @@ def _note_seg_failure(token: str, entry: dict, st: dict) -> None:
         reputation.cooldown(sig)
     telemetry.record_buffer("failed", sig=sig, picker=entry.get("picker", ""),
                             media_id=entry.get("id", ""), source=lbl,
-                            reason=f"{st['seg_fails']} segment fetch failures")
+                            reason=f"{st['seg_fails']} segment fetch failures; {reason}")
 
 
 async def flush_idle() -> None:
@@ -357,7 +420,74 @@ async def flush_idle() -> None:
             logger.debug("hls play-record flush failed", exc_info=True)
 
 
+async def shutdown() -> None:
+    """Stop HLS workers, flush completed session accounting, and close HTTP."""
+    global _seg_cache_bytes
+    tasks = list(_bg)
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    _bg.clear()
+    # Lifespan shutdown happens after request draining. Make completed plays
+    # eligible for the same idempotent ledger flush used by maintenance.
+    for entry in _active.values():
+        st = entry.get("_hls") or {}
+        if st.get("active", 0) <= 0:
+            st["last"] = time.monotonic() - _FLUSH_IDLE - 1
+    await flush_idle()
+    _active.clear()
+    _prefetching.clear()
+    _seg_cache.clear()
+    _seg_cache_bytes = 0
+    await _client.aclose()
+
+
 # ── serving ──────────────────────────────────────────────────────────────────
+
+_RANGE_RE = re.compile(r"^bytes=(\d+)-(\d*)$", re.I)
+_SUFFIX_RE = re.compile(r"^bytes=-(\d+)$", re.I)
+_CONTENT_RANGE_RE = re.compile(r"^bytes\s+(\d+)-(\d+)/(\d+|\*)$", re.I)
+
+
+def _range_ok(resp, requested: str | None) -> bool:
+    if not requested:
+        if resp.status_code == 200:
+            return True
+        match = _CONTENT_RANGE_RE.fullmatch(
+            (resp.headers.get("content-range") or "").strip()) \
+            if resp.status_code == 206 else None
+        return bool(match and int(match.group(1)) == 0)
+    explicit = _RANGE_RE.fullmatch(requested.strip())
+    suffix = _SUFFIX_RE.fullmatch(requested.strip())
+    if not explicit and not suffix:
+        return False
+    if resp.status_code != 206:
+        return False
+    match = _CONTENT_RANGE_RE.fullmatch(
+        (resp.headers.get("content-range") or "").strip())
+    if not match:
+        return False
+    start, end = int(match.group(1)), int(match.group(2))
+    total = int(match.group(3)) if match.group(3).isdigit() else None
+    if end < start or (total is not None and end >= total):
+        return False
+    if suffix:
+        wanted = int(suffix.group(1))
+        return bool(wanted > 0 and total is not None and end == total - 1
+                    and end - start + 1 == min(wanted, total))
+    wanted_start = int(explicit.group(1))
+    wanted_end = int(explicit.group(2)) if explicit.group(2) else None
+    return start == wanted_start and (wanted_end is None or end <= wanted_end)
+
+
+def _range_request_valid(requested: str) -> bool:
+    explicit = _RANGE_RE.fullmatch(requested.strip())
+    if explicit:
+        return not explicit.group(2) or int(explicit.group(2)) >= int(explicit.group(1))
+    suffix = _SUFFIX_RE.fullmatch(requested.strip())
+    return bool(suffix and int(suffix.group(1)) > 0)
+
 
 def _safe_raw(url: str) -> bool:
     """True when the upstream URL may be handed to the player directly (public
@@ -368,11 +498,22 @@ def _safe_raw(url: str) -> bool:
     return "." in host and "@" not in (parts.netloc or "")
 
 
+def _cand_key(cand: dict) -> str:
+    return cand.get("key") or hashlib.sha256((cand.get("u") or "").encode()).hexdigest()
+
+
+def _is_media_segment(entry: dict, url: str, candidate_key: str) -> bool:
+    prefix = candidate_key + "|"
+    return any(url in seq for key, seq in (entry.get("_hlsseqs") or {}).items()
+               if not candidate_key or str(key).startswith(prefix))
+
+
 def _playlist_response(token: str, entry: dict, st: dict, text: str,
-                       base_url: str) -> Response:
+                       base_url: str, cand: dict | None = None) -> Response:
+    candidate_key = _cand_key(cand or st.get("cand") or {})
     if "#EXTINF" in text:                    # media playlist: remember order
         seqs = entry.setdefault("_hlsseqs", {})
-        seqs[base_url] = segment_urls(text, base_url)
+        seqs[f"{candidate_key}|{base_url}"] = segment_urls(text, base_url)
         while len(seqs) > 4:                 # a few variants, not a catalog
             seqs.pop(next(iter(seqs)))
     else:                                    # master: learn declared codecs
@@ -382,7 +523,7 @@ def _playlist_response(token: str, entry: dict, st: dict, text: str,
     st["pl"] += 1
     st["last"] = time.monotonic()
     _arm_reject_timer(token, entry, st)
-    return Response(rewrite(text, base_url, token),
+    return Response(rewrite(text, base_url, token, candidate_key),
                     media_type="application/vnd.apple.mpegurl",
                     headers={"Cache-Control": "no-store"})
 
@@ -395,11 +536,28 @@ async def serve_master(token: str, entry: dict, request) -> Response:
     cands = entry.get("cands") or []
     if not cands:
         return Response(status_code=404)
+    rejected = entry.get("_hls_rejected") or set()
+    cands = [c for c in cands
+             if not reputation.blocked(c.get("sig") or "")
+             and _cand_key(c) not in rejected]
+    if not cands:
+        return Response(status_code=502)
     skip_cooled = not all(reputation.cooled(c.get("sig") or "") for c in cands)
     # Bounded open: several dead mirrors must not turn the player's open into
     # a minute of spinner — spend at most _OPEN_BUDGET across all candidates.
     deadline = time.monotonic() + _OPEN_BUDGET
     last_upstream = ""
+
+    def bad(c: dict, reason: str) -> None:
+        sig, label = c.get("sig") or "", c.get("lbl") or ""
+        if sig:
+            reputation.observe(sig, token, reason, label)
+            reputation.cooldown(sig)
+        telemetry.record_buffer("failed", sig=sig,
+                                picker=entry.get("picker", ""),
+                                media_id=entry.get("id", ""), source=label,
+                                reason=reason)
+
     for idx, c in enumerate(cands):
         remaining = deadline - time.monotonic()
         if remaining <= 0.5:
@@ -414,18 +572,22 @@ async def serve_master(token: str, entry: dict, request) -> Response:
         except Exception as e:
             logger.info(f"hls: cand {idx} playlist fetch failed "
                         f"({type(e).__name__})")
+            bad(c, f"playlist-{type(e).__name__.lower()}")
             continue
         if r.status_code != 200 or len(r.content) > _PLAYLIST_MAX:
+            bad(c, (f"playlist-http-{r.status_code}" if r.status_code != 200
+                    else "playlist-too-large"))
             continue
         if not is_playlist(r.content):
             last_upstream = str(r.url)
+            bad(c, "playlist-not-hls")
             continue
         if idx and st.get("cand") is not c:
             logger.info(f"hls: serving candidate {idx} ({c.get('lbl', '')!r})")
         st["cand"], st["cand_idx"] = c, idx
         return _playlist_response(token, entry, st,
                                   r.content.decode("utf-8", errors="replace"),
-                                  str(r.url))
+                                  str(r.url), c)
     # Nothing served a playlist. If one answered with something else and its
     # URL is safe to hand out, let the player try it directly (old behavior).
     if last_upstream and _safe_raw(last_upstream):
@@ -442,75 +604,116 @@ async def serve_resource(token: str, entry: dict, request) -> Response:
         url = _decode_u(u)
     except Exception:
         return Response(status_code=403)
-    if not hmac.compare_digest(_sign(token, url), s):
+    candidate_key = request.query_params.get("c", "")
+    if not hmac.compare_digest(_sign(token, url, candidate_key), s):
+        return Response(status_code=403)
+    cands = entry.get("cands") or []
+    bound = next((c for c in cands if _cand_key(c) == candidate_key), None) \
+        if candidate_key else None
+    if candidate_key and bound is None:
         return Response(status_code=403)
     st = _st(token, entry)
-    rh = dict((st.get("cand") or (entry.get("cands") or [{}])[0])
-              .get("rh") or {})
+    cand = bound or st.get("cand") or (cands[0] if cands else {})
+    rh = dict(cand.get("rh") or {})
     rng = request.headers.get("range")
+    if rng and not _range_request_valid(rng):
+        return Response(status_code=416, headers={"Accept-Ranges": "bytes"})
+    media_segment = _is_media_segment(entry, url, candidate_key)
+    accountable_segment = bool(
+        media_segment and (not candidate_key
+                           or candidate_key == _cand_key(st.get("cand") or {})))
 
     if not rng:
-        hit = _cache_get(url)
+        hit = _cache_get(url, rh, candidate_key)
         if hit is not None:
             body, ct = hit
-            _note_segment(token, entry, st, len(body))
-            _prefetch_next(entry, url, rh)
+            if accountable_segment:
+                _note_segment(token, entry, st, len(body))
+                _prefetch_next(entry, url, rh, candidate_key)
             return Response(body, media_type=ct)
 
     if rng:
         rh["Range"] = rng
     st["active"] += 1
+    handed_off = False
+    slot_held = False
     try:
         r = None
+        last_reason = "segment-fetch-failed"
         for attempt in (1, 2):
             try:
                 req = _client.build_request("GET", url, headers=rh)
                 r = await _client.send(req, stream=True)
-                if r.status_code in (200, 206):
+                if _range_ok(r, rng):
                     break
+                last_reason = (f"http-{r.status_code}"
+                               if r.status_code not in (200, 206)
+                               else "bad-content-range")
                 await r.aclose()
                 r = None
             except Exception as e:
                 logger.info(f"hls: segment fetch attempt {attempt} failed "
                             f"({type(e).__name__})")
+                last_reason = type(e).__name__
                 r = None
         if r is None:
-            _note_seg_failure(token, entry, st)
+            _note_seg_failure(token, entry, st, last_reason, cand)
             return Response(status_code=502)
         ct = r.headers.get("content-type", "video/mp2t")
-        headers = {}
+        headers = {"Accept-Ranges": "bytes"}
         if r.status_code == 206 and r.headers.get("content-range"):
             headers["Content-Range"] = r.headers["content-range"]
+        if r.headers.get("content-length"):
+            headers["Content-Length"] = r.headers["content-length"]
         # Buffer small resources (playlist sniff + cache + prefetch); a large
         # body — a playlist URI pointing at a whole file is not unheard of —
         # must stream through, never sit in RAM.
         chunks: list[bytes] = []
         got = 0
-        big = False
+        length = r.headers.get("content-length") or ""
+        big = length.isdigit() and int(length) > _MAX_SEG_BUF
+        if not big:
+            await _buffer_slots.acquire()
+            slot_held = True
         try:
-            async for chunk in r.aiter_bytes():
-                chunks.append(chunk)
-                got += len(chunk)
-                if got > _MAX_SEG_BUF:
-                    big = True
-                    break
-        except Exception:
+            if not big:
+                async for chunk in r.aiter_bytes():
+                    chunks.append(chunk)
+                    got += len(chunk)
+                    if got > _MAX_SEG_BUF:
+                        big = True
+                        break
+        except Exception as exc:
             await r.aclose()
-            _note_seg_failure(token, entry, st)
+            _note_seg_failure(token, entry, st, type(exc).__name__, cand)
             return Response(status_code=502)
         if big:
-            async def gen(pre=chunks, resp=r):
+            handed_off = True
+
+            async def gen(pre=chunks, resp=r, held=slot_held):
+                total = sum(len(c) for c in pre)
                 try:
                     for c in pre:
                         yield c
                     async for c in resp.aiter_bytes():
+                        total += len(c)
                         yield c
+                    if accountable_segment:
+                        _note_segment(token, entry, st, total)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    _note_seg_failure(token, entry, st, type(exc).__name__, cand)
+                    raise
                 finally:
                     try:
                         await resp.aclose()
                     except Exception:
                         pass
-            _note_segment(token, entry, st, got)
+                    st["active"] = max(0, st["active"] - 1)
+                    st["last"] = time.monotonic()
+                    if held:
+                        _buffer_slots.release()
             return StreamingResponse(gen(), status_code=r.status_code,
                                      media_type=ct, headers=headers)
         await r.aclose()
@@ -518,13 +721,18 @@ async def serve_resource(token: str, entry: dict, request) -> Response:
         if is_playlist(body):
             return _playlist_response(
                 token, entry, st, body.decode("utf-8", errors="replace"),
-                str(r.url))
-        _note_segment(token, entry, st, len(body))
+                str(r.url), cand)
+        if accountable_segment:
+            _note_segment(token, entry, st, len(body))
         if not rng:
-            _cache_put(url, body, ct)
-            _prefetch_next(entry, url, rh)
+            _cache_put(url, body, ct, rh, candidate_key)
+            if accountable_segment:
+                _prefetch_next(entry, url, rh, candidate_key)
         return Response(body, status_code=r.status_code, media_type=ct,
                         headers=headers)
     finally:
-        st["active"] -= 1
-        st["last"] = time.monotonic()
+        if not handed_off:
+            st["active"] = max(0, st["active"] - 1)
+            st["last"] = time.monotonic()
+            if slot_held:
+                _buffer_slots.release()

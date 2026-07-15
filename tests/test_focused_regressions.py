@@ -24,6 +24,18 @@ def _stream(filename: str, url: str = "https://stream.invalid/video") -> dict:
 
 
 class AudioLanguageRegressionTests(unittest.TestCase):
+    def test_measured_track_language_overrides_misleading_filename(self) -> None:
+        stream = _stream("Movie.2024.English.1080p.WEB-DL-GROUP.mkv")
+        stream["_audio_langs"] = ["de"]
+        token = picker._accept_langs.set(frozenset({"en"}))
+        known = picker._original_lang_known.set(True)
+        try:
+            self.assertEqual(({"de"}, False), picker._audio_langs(stream))
+            self.assertEqual(0, picker._audio_ok(stream))
+        finally:
+            picker._original_lang_known.reset(known)
+            picker._accept_langs.reset(token)
+
     def test_web_dl_does_not_mean_multi_audio(self) -> None:
         stream = _stream("Movie.Name.2024.1080p.WEB-DL.DDP5.1-GROUP.mkv")
 
@@ -159,7 +171,7 @@ class PrefetchCacheRegressionTests(unittest.IsolatedAsyncioTestCase):
 
                 self.assertEqual({}, picker._cache)
 
-    async def test_verified_prefetch_still_primes_both_picker_keys(self) -> None:
+    async def test_fast_prefetch_primes_only_fast_picker_key(self) -> None:
         nxt = "tt9999999:1:2"
         stream = _stream("Show.S01E02.1080p.WEB-DL-GOOD.mkv")
         with mock.patch.object(picker, "_cache", {}), \
@@ -173,9 +185,7 @@ class PrefetchCacheRegressionTests(unittest.IsolatedAsyncioTestCase):
             await picker.prefetch_next(
                 "series", "tt9999999:1:1", "fast")
 
-            self.assertEqual(
-                {f"full:series:{nxt}", f"slow:full:series:{nxt}"},
-                set(picker._cache))
+            self.assertEqual({f"full:series:{nxt}"}, set(picker._cache))
 
 
 class FailureDetailTelemetryTests(unittest.TestCase):

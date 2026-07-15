@@ -7,6 +7,7 @@ test-failure details, and blank submits must mean 'keep' for secrets but
 """
 
 import json
+import base64
 import os
 import pathlib
 import re
@@ -50,13 +51,25 @@ class ConfigStoreTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             config.save({"PREFETCH_NEXT": "maybe"})
 
-    def test_numbers_clamped_to_schema_range(self):
-        config.save({"BUFFER_AHEAD_GB": "9999"})
-        self.assertEqual("32", config.pending("BUFFER_AHEAD_GB"))
-        config.save({"BUFFER_AHEAD_GB": "-3"})
-        self.assertEqual("1", config.pending("BUFFER_AHEAD_GB"))
+    def test_numbers_reject_out_of_range_nonfinite_and_fractional_ints(self):
+        for value in ("9999", "-3", "lots", "nan", "inf"):
+            with self.assertRaises(ValueError, msg=value):
+                config.save({"BUFFER_AHEAD_GB": value})
         with self.assertRaises(ValueError):
-            config.save({"BUFFER_AHEAD_GB": "lots"})
+            config.save({"MAX_PROBES": "4.5"})
+
+    def test_whole_config_constraints_are_atomic(self):
+        with self.assertRaisesRegex(ValueError, "BUFFER_AHEAD_GB"):
+            config.save({"BUFFER_CACHE_GB": "10", "BUFFER_AHEAD_GB": "20"})
+        self.assertEqual("100", config.pending("BUFFER_CACHE_GB"))
+        self.assertEqual("8", config.pending("BUFFER_AHEAD_GB"))
+
+    def test_corrupt_json_is_quarantined(self):
+        path = pathlib.Path(os.environ["CONFIG_FILE"])
+        path.write_text('{"env": {broken')
+        self.assertEqual({}, config._read())
+        self.assertFalse(path.exists())
+        self.assertTrue(list(path.parent.glob(path.name + ".corrupt-*")))
 
     def test_choice_must_be_in_schema(self):
         config.save({"DV_REJECT": "all"})
@@ -98,6 +111,14 @@ class ConfigStoreTests(unittest.TestCase):
         config.apply_env()
         self.assertEqual("220", os.environ["BUFFER_CACHE_GB"])
         os.environ.pop("BUFFER_CACHE_GB", None)
+
+    def test_apply_env_canonicalizes_explicit_bool_spellings(self):
+        os.environ["PROXY_PLAYBACK"] = "off"
+        try:
+            config.apply_env()
+            self.assertEqual("0", os.environ["PROXY_PLAYBACK"])
+        finally:
+            os.environ.pop("PROXY_PLAYBACK", None)
 
 
 class AdvancedKnobTests(unittest.TestCase):
@@ -187,14 +208,23 @@ class EnvReferenceTests(unittest.TestCase):
     def test_export_shows_values_but_redacts_secrets(self):
         os.environ["ADDON_PUBLIC_URL"] = "https://mine.example"
         os.environ["TMDB_API_KEY"] = "tmdb-live-secret-4242"
+        os.environ["ADMIN_PASSWORD"] = "admin-live-secret-9898"
+        os.environ["FAST_BASE_URL"] = "https://comet.example/config/embedded-token"
+        os.environ["NZB_INDEXERS"] = "idx|https://idx.example/api|nzb-secret"
         try:
             text = envref.current_dotenv()
             self.assertIn("ADDON_PUBLIC_URL=https://mine.example", text)
             self.assertNotIn("tmdb-live-secret-4242", text)
+            self.assertNotIn("admin-live-secret-9898", text)
+            self.assertNotIn("embedded-token", text)
+            self.assertNotIn("nzb-secret", text)
             self.assertIn("TMDB_API_KEY", text)   # key present, value not
         finally:
             os.environ.pop("ADDON_PUBLIC_URL", None)
             os.environ.pop("TMDB_API_KEY", None)
+            os.environ.pop("ADMIN_PASSWORD", None)
+            os.environ.pop("FAST_BASE_URL", None)
+            os.environ.pop("NZB_INDEXERS", None)
 
 
 class SecretHygieneTests(unittest.TestCase):
@@ -212,15 +242,34 @@ class SecretHygieneTests(unittest.TestCase):
     def test_rendered_page_never_contains_secret_values(self):
         os.environ["TMDB_API_KEY"] = "tmdb-secret-value-98765"
         os.environ["NZBDAV_PASS"] = "davpass-secret-55555"
+        os.environ["FAST_BASE_URL"] = "https://comet.example/secret-config-path"
+        os.environ["JELLIO_URL"] = "https://jellio.example/secret-token"
+        os.environ["NZB_INDEXERS"] = "idx|https://idx.example|secret-indexer-key"
         try:
             page = settings_ui.render()
             self.assertNotIn("tmdb-secret-value-98765", page)
             self.assertNotIn("davpass-secret-55555", page)
+            self.assertNotIn("secret-config-path", page)
+            self.assertNotIn("secret-token", page)
+            self.assertNotIn("secret-indexer-key", page)
+            self.assertGreaterEqual(page.count("kept · hidden"), 3)
             self.assertIn("TMDB_API_KEY", page)   # the key name is shown
             self.assertIn("data-service='tmdb'", page)
         finally:
             os.environ.pop("TMDB_API_KEY", None)
             os.environ.pop("NZBDAV_PASS", None)
+            os.environ.pop("FAST_BASE_URL", None)
+            os.environ.pop("JELLIO_URL", None)
+            os.environ.pop("NZB_INDEXERS", None)
+
+    def test_blank_sensitive_url_and_multiline_keep_values(self):
+        config.save({"FAST_BASE_URL": "https://comet.example/private",
+                     "NZB_INDEXERS": "idx|https://idx.example|key"})
+        res = config.save({"FAST_BASE_URL": "", "NZB_INDEXERS": ""})
+        self.assertEqual([], res["changed"])
+        self.assertEqual("https://comet.example/private",
+                         config.pending("FAST_BASE_URL"))
+        self.assertIn("|key", config.pending("NZB_INDEXERS"))
 
     def test_failure_details_scrub_credentials(self):
         s = connections._scrub(
@@ -241,21 +290,54 @@ class AdminGuardTests(unittest.TestCase):
         self.assertTrue(adminui.is_local(Req(host="127.0.0.1")))
         self.assertTrue(adminui.is_local(Req(host="192.168.1.10")))
         self.assertTrue(adminui.is_local(Req(host="172.17.0.1")))   # docker
-        self.assertTrue(adminui.is_local(Req(xff="10.0.0.5")))
-        self.assertFalse(adminui.is_local(Req(xff="8.8.8.8")))      # public
+        # A LAN caller cannot forge XFF to choose its own apparent address.
+        self.assertFalse(adminui.is_local(Req(xff="10.0.0.5",
+                                              host="192.168.1.10")))
+        self.assertFalse(adminui.is_local(Req(xff="127.0.0.1",
+                                              host="192.168.1.10")))
+        # Loopback is a trusted proxy by default; its forwarded public client
+        # is evaluated as public, while a forwarded LAN client remains local.
+        self.assertTrue(adminui.is_local(Req(xff="10.0.0.5",
+                                             host="127.0.0.1")))
+        self.assertFalse(adminui.is_local(Req(xff="8.8.8.8",
+                                              host="127.0.0.1")))
         self.assertFalse(adminui.is_local(Req(host="testclient")))  # non-IP
 
 
 class RouteTests(unittest.TestCase):
-    # A local client — the guard admits loopback/LAN, so present as 127.0.0.1.
-    LOCAL = {"x-forwarded-for": "127.0.0.1"}
+    AUTH = "Basic " + base64.b64encode(b"admin:test-secret").decode()
+    LOCAL = {"authorization": AUTH}
 
     @classmethod
     def setUpClass(cls):
+        cls._old_admin_username = os.environ.get("ADMIN_USERNAME")
+        cls._old_admin_password = os.environ.get("ADMIN_PASSWORD")
+        os.environ["ADMIN_USERNAME"] = "admin"
+        os.environ["ADMIN_PASSWORD"] = "test-secret"
         _wipe_store()
         from fastapi.testclient import TestClient
         from app import main
-        cls.client = TestClient(main.app)
+        cls._context = TestClient(main.app, client=("127.0.0.1", 50000))
+        cls.client = cls._context.__enter__()
+        token = cls.client.get("/api/admin/csrf", headers=cls.LOCAL).json()
+        cls.MUTATE = {**cls.LOCAL, "x-csrf-token": token["csrf_token"]}
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._context.__exit__(None, None, None)
+        if cls._old_admin_username is None:
+            os.environ.pop("ADMIN_USERNAME", None)
+        else:
+            os.environ["ADMIN_USERNAME"] = cls._old_admin_username
+        if cls._old_admin_password is None:
+            os.environ.pop("ADMIN_PASSWORD", None)
+        else:
+            os.environ["ADMIN_PASSWORD"] = cls._old_admin_password
+
+    def test_local_dashboard_requires_authentication(self):
+        r = self.client.get("/")
+        self.assertEqual(401, r.status_code)
+        self.assertIn("Basic", r.headers.get("www-authenticate", ""))
 
     def test_dashboard_is_clean_local_paths(self):
         for path in ("/", "/settings", "/stats"):
@@ -266,7 +348,7 @@ class RouteTests(unittest.TestCase):
 
     def test_public_client_is_blocked(self):
         # a request forwarded from the public internet must not see the dashboard
-        pub = {"x-forwarded-for": "8.8.8.8"}
+        pub = {**self.LOCAL, "x-forwarded-for": "8.8.8.8"}
         for path in ("/", "/settings", "/stats", "/api/settings/status.json"):
             self.assertEqual(404, self.client.get(path, headers=pub).status_code,
                              path)
@@ -274,6 +356,10 @@ class RouteTests(unittest.TestCase):
     def test_settings_page_renders(self):
         r = self.client.get("/settings", headers=self.LOCAL)
         self.assertEqual(200, r.status_code)
+        self.assertEqual("no-store", r.headers.get("cache-control"))
+        self.assertEqual("DENY", r.headers.get("x-frame-options"))
+        self.assertIn("frame-ancestors 'none'",
+                      r.headers.get("content-security-policy", ""))
         self.assertIn("Stream path", r.text)
         self.assertIn("Connections", r.text)
         self.assertIn("Advanced tuning", r.text)
@@ -289,6 +375,9 @@ class RouteTests(unittest.TestCase):
     def test_save_and_status_roundtrip(self):
         r = self.client.post("/api/settings/save", headers=self.LOCAL,
                              json={"values": {"SLOW_MAX_PROBES": "24"}})
+        self.assertEqual(403, r.status_code)  # authenticated is not CSRF-safe
+        r = self.client.post("/api/settings/save", headers=self.MUTATE,
+                             json={"values": {"SLOW_MAX_PROBES": "24"}})
         self.assertEqual(200, r.status_code)
         self.assertIn("SLOW_MAX_PROBES", r.json()["changed"])
         st = self.client.get("/api/settings/status.json",
@@ -299,10 +388,13 @@ class RouteTests(unittest.TestCase):
     def test_bad_save_is_400_not_500(self):
         r = self.client.post("/api/settings/save", headers=self.LOCAL,
                              json={"values": {"PATH": "/evil"}})
+        self.assertEqual(403, r.status_code)
+        r = self.client.post("/api/settings/save", headers=self.MUTATE,
+                             json={"values": {"PATH": "/evil"}})
         self.assertEqual(400, r.status_code)
 
     def test_unknown_test_service_is_400(self):
-        r = self.client.post("/api/settings/test/nope", headers=self.LOCAL,
+        r = self.client.post("/api/settings/test/nope", headers=self.MUTATE,
                              json={"values": {}})
         self.assertEqual(400, r.status_code)
 
@@ -311,6 +403,19 @@ class RouteTests(unittest.TestCase):
             "/test-secret/manifest.json").status_code)
         self.assertEqual(404, self.client.get(
             "/wrong-secret/manifest.json").status_code)
+
+    def test_cross_origin_mutation_is_denied_even_with_token(self):
+        r = self.client.post("/api/settings/save",
+                             headers={**self.MUTATE,
+                                      "origin": "https://attacker.example"},
+                             json={"values": {"PREFETCH_NEXT": "0"}})
+        self.assertEqual(403, r.status_code)
+
+    def test_liveness_and_readiness_are_distinct_and_healthy(self):
+        self.assertEqual(200, self.client.get("/health/live").status_code)
+        ready = self.client.get("/health/ready")
+        self.assertEqual(200, ready.status_code)
+        self.assertTrue(ready.json()["ok"])
 
 
 if __name__ == "__main__":
