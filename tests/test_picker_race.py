@@ -51,7 +51,8 @@ class FastRaceTests(unittest.IsolatedAsyncioTestCase):
             return []
 
         async def fake_probe_race(candidates, need_bps_of, ttfb_max, want,
-                                  concurrency=8, deadline=None):
+                                  concurrency=8, deadline=None,
+                                  expect_secs=None):
             stream = candidates[0]
             if stream["url"] == bad["url"]:
                 await asyncio.sleep(0.30)

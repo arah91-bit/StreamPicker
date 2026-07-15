@@ -229,6 +229,34 @@ def _blocklist_table(blocklist: list[dict]) -> str:
         f"<tbody>{''.join(body)}</tbody></table></div>")
 
 
+def _decode_table() -> str:
+    from app import decode_health
+    rows = decode_health.listing()
+    if not rows:
+        return ""
+    body = []
+    for r in rows:
+        state = ("<span class='bad'>UNDECODABLE</span>" if r["bad"]
+                 else "<span class='warn'>watching</span>" if r["rejects"]
+                 else "plays fine")
+        link = f"/api/decode/clear?key={_esc(r['key'])}"
+        body.append(
+            f"<tr class='{'bad' if r['bad'] else ''}'>"
+            f"<td class='k1'>{_esc(r['key'])}</td><td>{state}</td>"
+            f"<td>{r['rejects']}</td><td>{r['plays']}</td>"
+            f"<td class='mut'>{_esc('; '.join(r['labels']))}</td>"
+            f"<td><a href='{link}'>clear</a></td></tr>")
+    return (
+        "<h2>Player decode compatibility (learned)</h2>"
+        "<div class='note'>Codec attributes struck by player-rejected streams "
+        "and credited by real playback. An UNDECODABLE attribute demotes "
+        "matching releases below every clean candidate (never removes them). "
+        "Clear an attribute after upgrading a player.</div>"
+        "<div class='scroll'><table><thead><tr><th>attribute</th><th>state</th>"
+        "<th>rejects</th><th>plays</th><th>example releases</th><th></th>"
+        f"</tr></thead><tbody>{''.join(body)}</tbody></table></div>")
+
+
 def _nzb_indexer_table() -> str:
     rows = usenet_health.indexer_listing()
     if not rows:
@@ -311,6 +339,7 @@ def render(recs: list[dict], blocklist: list[dict],
 device via the proxy); probe numbers are our server's estimate. Worst first.</p>
 <div class="tiles">{tile_html}</div>
 {_blocklist_table(blocklist)}
+{_decode_table()}
 {_nzb_indexer_table()}
 {_nzb_failure_table(recs)}
 {_play_table(recs, 'src', 'Real playback delivery — by source (indexer)', 'source', min_n)}

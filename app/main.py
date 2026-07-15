@@ -240,6 +240,14 @@ async def unblock(request: Request, sig: str):
     return RedirectResponse(url="/stats", status_code=303)
 
 
+@app.get("/api/decode/clear")
+async def decode_clear(request: Request, key: str):
+    _admin(request)
+    from app import decode_health
+    decode_health.clear(key)
+    return RedirectResponse(url="/stats", status_code=303)
+
+
 @app.get("/api/settings/status.json")
 async def settings_status(request: Request):
     _admin(request)

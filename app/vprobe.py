@@ -116,15 +116,16 @@ def _norm_codec(name: str) -> str:
 
 
 async def codecs_of(target: str | bytes,
-                    timeout: float = 5.0) -> tuple[list[str], str]:
-    """(audio codec names, video codec name) of a media file. `target` is a
-    filesystem path or the first couple MB of the file as bytes — containers
-    keep their track table near the head, so a partial prefix parses fine for
-    MKV and faststart MP4. ([], \"\") when ffprobe is missing or can't tell."""
+                    timeout: float = 5.0) -> tuple[list[str], str, float]:
+    """(audio codec names, video codec name, duration seconds) of a media
+    file. `target` is a filesystem path or the first couple MB of the file as
+    bytes — containers keep their track table (and, for MKV/faststart MP4,
+    their declared duration) near the head, so a partial prefix parses fine.
+    ([], \"\", 0.0) when ffprobe is missing or can't tell."""
     if not enabled():
-        return [], ""
+        return [], "", 0.0
     args = [FFPROBE, "-v", "error", "-of", "json",
-            "-show_entries", "stream=codec_type,codec_name"]
+            "-show_entries", "stream=codec_type,codec_name:format=duration"]
     stdin = None
     if isinstance(target, bytes):
         args.append("pipe:0")
@@ -142,15 +143,20 @@ async def codecs_of(target: str | bytes,
             proc.kill()
         except Exception:
             pass
-        return [], ""
+        return [], "", 0.0
     except Exception:
-        return [], ""
+        return [], "", 0.0
     try:
-        streams = json.loads(out).get("streams", [])
+        data = json.loads(out)
+        streams = data.get("streams", [])
     except Exception:
-        return [], ""
+        return [], "", 0.0
     audio = [_norm_codec(s.get("codec_name", ""))
              for s in streams if s.get("codec_type") == "audio"]
     video = next((_norm_codec(s.get("codec_name", "")) for s in streams
                   if s.get("codec_type") == "video"), "")
-    return [a for a in audio if a], video
+    try:
+        secs = float(data.get("format", {}).get("duration") or 0.0)
+    except (TypeError, ValueError):
+        secs = 0.0
+    return [a for a in audio if a], video, secs

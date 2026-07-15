@@ -35,6 +35,16 @@ MIN_SPEED_BPS = 2_500_000      # floor when the file size is unknown
 # ranking first. ~50ms per *passed* probe; skipped when ffprobe is absent.
 CODEC_SNIFF = os.environ.get("PROBE_CODEC_SNIFF", "1") not in ("0", "false", "")
 _SNIFF_BYTES = 2 * 1024 * 1024
+# A stream's measured duration must roughly match the title's runtime — a
+# 3-minute clip delivers beautifully and passes every speed check, but it is
+# not the episode. Evidence comes free in both paths: HLS media playlists
+# declare every segment's duration, and ffprobe reads a direct file's declared
+# duration from the head bytes the probe already pulled. Fail when the
+# measured duration is below this fraction of the expected runtime (or absurdly
+# above it — a full movie file listed for a 24-minute episode). 0 disables.
+DURATION_MIN_FRAC = float(os.environ.get("DURATION_MIN_FRAC", "0.5"))
+_DURATION_MAX_FACTOR = 3.0            # ...and this much over, plus the slack
+_DURATION_MAX_SLACK = 1200.0
 
 _client = httpx.AsyncClient(
     follow_redirects=True,
@@ -63,6 +73,7 @@ class ProbeResult:
     # HLS variants declare theirs above). Feeds decode-compatibility demotion.
     acodecs: tuple = ()      # audio codec names, () = not sniffed
     vcodec: str = ""         # video codec name, "" = not sniffed
+    media_secs: float = 0.0  # measured duration (playlist sum / container), 0 = unknown
     head: bytes = field(default=b"", repr=False)   # transient; cleared by probe()
 
 
@@ -133,6 +144,31 @@ def _hls_first_uri(text: str) -> str:
     return ""
 
 
+_EXTINF_RE = re.compile(r"#EXTINF:([\d.]+)")
+
+
+def _hls_duration(text: str) -> float:
+    """Total declared duration of a complete (ENDLIST) media playlist — the
+    sum of its segment durations. 0.0 for masters and live playlists, where
+    duration is unknown or still growing."""
+    if "#EXT-X-ENDLIST" not in text:
+        return 0.0
+    return sum(float(m.group(1)) for m in _EXTINF_RE.finditer(text))
+
+
+def _duration_reason(secs: float, expect: float) -> str:
+    """Non-empty when a measured duration can't be the expected title."""
+    if not DURATION_MIN_FRAC or not secs or not expect:
+        return ""
+    if secs < expect * DURATION_MIN_FRAC:
+        return (f"runs {secs / 60:.0f}min, title needs "
+                f"~{expect / 60:.0f}min (clip/sample?)")
+    if secs > expect * _DURATION_MAX_FACTOR + _DURATION_MAX_SLACK:
+        return (f"runs {secs / 60:.0f}min, far beyond the title's "
+                f"~{expect / 60:.0f}min (wrong content?)")
+    return ""
+
+
 _BANDWIDTH_RE = re.compile(r"\bBANDWIDTH=(\d+)")
 _RESOLUTION_RE = re.compile(r"\bRESOLUTION=\d+x(\d+)")
 _CODECS_RE = re.compile(r'\bCODECS="([^"]*)"')
@@ -166,27 +202,39 @@ def _hls_variant_info(text: str) -> dict:
 
 
 async def probe(url: str, need_bps: float | None, ttfb_max: float,
-                headers: dict | None = None) -> ProbeResult:
+                headers: dict | None = None,
+                expect_secs: float | None = None) -> ProbeResult:
     """need_bps is the file's real bitrate (size/runtime) or None if unknown.
     `headers` are the stream's declared upstream request headers (proxyHeaders)
     — referer-gated hosts reject bare requests, so probing without them fails
-    streams that would play fine through the proxy."""
+    streams that would play fine through the proxy. `expect_secs` is the
+    title's runtime: a stream whose measured duration can't be the title (a
+    trailer-length clip, a whole movie for one episode) fails verification
+    however fast it delivers."""
     r = await _probe_url(url, _required_bps(need_bps), ttfb_max,
-                         time.monotonic(), hops=0, headers=headers)
+                         time.monotonic(), hops=0, headers=headers,
+                         expect_secs=expect_secs)
     if r.ok and r.head and CODEC_SNIFF and vprobe.enabled():
         try:
-            ac, vc = await vprobe.codecs_of(r.head)
+            ac, vc, secs = await vprobe.codecs_of(r.head)
             r.acodecs, r.vcodec = tuple(ac), vc
+            if secs:
+                r.media_secs = secs
         except Exception:
             pass
     r.head = b""            # transient sniff buffer — never leaves this module
+    if r.ok and expect_secs:
+        reason = _duration_reason(r.media_secs, expect_secs)
+        if reason:
+            r.ok, r.reason = False, reason
     return r
 
 
 async def _probe_url(url: str, required: float, ttfb_max: float,
                      t0: float, hops: int,
                      media: dict | None = None,
-                     headers: dict | None = None) -> ProbeResult:
+                     headers: dict | None = None,
+                     expect_secs: float | None = None) -> ProbeResult:
     """One GET of the probe descent. hops>0 means we're past an HLS playlist,
     probing a media segment: clean EOF short of the 4 MiB window is then a
     complete segment, not truncation. ttfb is always measured from the original
@@ -267,7 +315,17 @@ async def _probe_url(url: str, required: float, ttfb_max: float,
                 if not uri:
                     return ProbeResult(False, ttfb=ttfb, **ni,
                                        reason="empty playlist")
-                media = media or _hls_variant_info(text)
+                media = dict(media or _hls_variant_info(text))
+                dur = _hls_duration(text)
+                if dur:
+                    # The playlist declares its full runtime — judge it before
+                    # spending a segment fetch on a trailer-length clip.
+                    media["media_secs"] = dur
+                    if expect_secs:
+                        reason = _duration_reason(dur, expect_secs)
+                        if reason:
+                            return ProbeResult(False, ttfb=ttfb, **ni,
+                                               reason=reason, media_secs=dur)
                 playlist_url = str(resp.url)   # recurse outside the stream ctx
             elif got < PROBE_BYTES:
                 # A real feature/episode is vastly larger than this range.  A
@@ -301,12 +359,14 @@ async def _probe_url(url: str, required: float, ttfb_max: float,
         # request URL. The class is enough for retry/reputation classification.
         return ProbeResult(False, reason=type(e).__name__)
     return await _probe_url(urljoin(playlist_url, uri), required, ttfb_max,
-                            t0, hops + 1, media=media, headers=headers)
+                            t0, hops + 1, media=media, headers=headers,
+                            expect_secs=expect_secs)
 
 
 async def probe_batch(
     candidates: list[dict], need_bps_of, ttfb_max: float,
     want: int, batch_size: int = 3, deadline: float | None = None,
+    expect_secs: float | None = None,
 ) -> list[tuple[dict, ProbeResult]]:
     """Probe candidates in upstream-preference order, batch_size at a time,
     stopping once `want` have passed. Returns [(stream, result)] for passes,
@@ -323,7 +383,8 @@ async def probe_batch(
         batch = candidates[i:i + batch_size]
         results = await asyncio.gather(
             *(probe(s["url"], need_bps_of(s), ttfb_max,
-                    headers=hlsproxy.request_headers(s)) for s in batch)
+                    headers=hlsproxy.request_headers(s),
+                    expect_secs=expect_secs) for s in batch)
         )
         for s, r in zip(batch, results):
             _record(s, r, secrets.token_urlsafe(12))
@@ -342,6 +403,7 @@ async def probe_batch(
 async def probe_race(
     candidates: list[dict], need_bps_of, ttfb_max: float,
     want: int, concurrency: int = 8, deadline: float | None = None,
+    expect_secs: float | None = None,
 ) -> list[tuple[dict, ProbeResult]]:
     """Like probe_batch, but keeps up to `concurrency` probes in flight at once
     and returns the instant `want` have passed — every still-pending probe is
@@ -364,7 +426,8 @@ async def probe_race(
             nxt += 1
             running[asyncio.create_task(
                 probe(s["url"], need_bps_of(s), ttfb_max,
-                      headers=hlsproxy.request_headers(s)))] = (
+                      headers=hlsproxy.request_headers(s),
+                      expect_secs=expect_secs))] = (
                     s, secrets.token_urlsafe(12))
 
     _fill()

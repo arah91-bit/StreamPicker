@@ -147,7 +147,8 @@ class FastRaceDedupTests(unittest.IsolatedAsyncioTestCase):
             return list(streams) if source == sources.FAST else []
 
         async def fake_probe_race(candidates, need_bps_of, ttfb_max, want,
-                                  concurrency=8, deadline=None):
+                                  concurrency=8, deadline=None,
+                                  expect_secs=None):
             stream = candidates[0]
             probed_urls.append(stream["url"])
             await asyncio.sleep(0.02)

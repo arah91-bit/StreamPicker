@@ -753,6 +753,11 @@ def _mark_rejected(state: dict, *, sig: str, label: str, node: str, token: str,
     sess = _lookup(token)
     if sess is not None:     # lets the first real play log a recovery_ok event
         sess["rejected_at"] = time.time()
+    try:
+        from app import picker      # lazy: picker does not import proxy back
+        picker.invalidate(media_id)
+    except Exception:
+        pass
 
 
 # Players that reject a file usually go quiet, then re-request the same URL on
@@ -791,7 +796,13 @@ def _arm_reject_timer(e: "_Entry", token: str) -> None:
 
     t = asyncio.create_task(_fire())
     _bg_tasks.add(t)
-    t.add_done_callback(_bg_tasks.discard)
+    t.add_done_callback(_reap_task)
+
+
+def _reap_task(t) -> None:
+    _bg_tasks.discard(t)
+    if not t.cancelled() and t.exception() is not None:
+        logger.warning(f"proxy: background task failed: {t.exception()!r}")
 
 
 def _spawn_learn(e: "_Entry", played: bool) -> None:
@@ -800,7 +811,7 @@ def _spawn_learn(e: "_Entry", played: bool) -> None:
         return
     t = asyncio.create_task(_learn_codecs(e, played))
     _bg_tasks.add(t)
-    t.add_done_callback(_bg_tasks.discard)
+    t.add_done_callback(_reap_task)
 
 
 async def _learn_codecs(e: "_Entry", played: bool) -> None:
@@ -809,7 +820,7 @@ async def _learn_codecs(e: "_Entry", played: bool) -> None:
     what turns one FLAC spinner into 'FLAC stops ranking first' instead of
     re-learning the same lesson release by release."""
     try:
-        ac, vc = await vprobe.codecs_of(e.path)
+        ac, vc, _secs = await vprobe.codecs_of(e.path)
     except Exception:
         return
     if not ac and not vc:

@@ -50,6 +50,7 @@ CACHE_BYTES = int(float(os.environ.get("HLS_SEG_CACHE_MB", "64")) * 1e6)
 REJECT_COOLDOWN = float(os.environ.get("PLAYER_REJECT_COOLDOWN_HOURS",
                                        "24")) * 3600
 _PREFETCH = 2                      # segments fetched ahead of the player
+_OPEN_BUDGET = 15.0                # total seconds an HLS open may spend trying candidates
 _MAX_SEG_BUF = 32 * 1024 * 1024    # buffer/cache segments up to this size
 _REJECT_SILENCE = 15.0             # playlist(s) fetched, no segment, quiet
 _FLUSH_IDLE = 300.0                # idle seconds before a play record flushes
@@ -184,10 +185,16 @@ def _cache_put(url: str, body: bytes, ct: str) -> None:
         _seg_cache_bytes -= len(old)
 
 
+def _reap_task(t) -> None:
+    _bg.discard(t)
+    if not t.cancelled() and t.exception() is not None:
+        logger.warning(f"hls: background task failed: {t.exception()!r}")
+
+
 def _spawn(coro) -> None:
     t = asyncio.create_task(coro)
     _bg.add(t)
-    t.add_done_callback(_bg.discard)
+    t.add_done_callback(_reap_task)
 
 
 async def _prefetch_one(url: str, rh: dict) -> None:
@@ -203,16 +210,19 @@ async def _prefetch_one(url: str, rh: dict) -> None:
 
 
 def _prefetch_next(entry: dict, url: str, rh: dict) -> None:
-    seq = entry.get("_hlsseq") or []
-    try:
-        i = seq.index(url)
-    except ValueError:
-        return
-    for nxt in seq[i + 1:i + 1 + _PREFETCH]:
-        if nxt in _seg_cache or nxt in _prefetching:
+    # Per-variant sequences: an ABR player that just switched bitrates must
+    # get read-ahead on the variant it is *on*, not the one it left.
+    for seq in (entry.get("_hlsseqs") or {}).values():
+        try:
+            i = seq.index(url)
+        except ValueError:
             continue
-        _prefetching.add(nxt)
-        _spawn(_prefetch_one(nxt, rh))
+        for nxt in seq[i + 1:i + 1 + _PREFETCH]:
+            if nxt in _seg_cache or nxt in _prefetching:
+                continue
+            _prefetching.add(nxt)
+            _spawn(_prefetch_one(nxt, rh))
+        return
 
 
 # ── per-session state, rejection detection, stats ────────────────────────────
@@ -249,6 +259,11 @@ def _mark_rejected(token: str, entry: dict, st: dict) -> None:
     if ac or vc:
         decode_health.record_reject(ac, vc, label=lbl)
     entry["rejected_at"] = time.time()     # recovery_ok pairs with this
+    try:
+        from app import picker      # lazy: avoids an import cycle
+        picker.invalidate(entry.get("id", ""))
+    except Exception:
+        pass
 
 
 def _arm_reject_timer(token: str, entry: dict, st: dict) -> None:
@@ -356,7 +371,10 @@ def _safe_raw(url: str) -> bool:
 def _playlist_response(token: str, entry: dict, st: dict, text: str,
                        base_url: str) -> Response:
     if "#EXTINF" in text:                    # media playlist: remember order
-        entry["_hlsseq"] = segment_urls(text, base_url)
+        seqs = entry.setdefault("_hlsseqs", {})
+        seqs[base_url] = segment_urls(text, base_url)
+        while len(seqs) > 4:                 # a few variants, not a catalog
+            seqs.pop(next(iter(seqs)))
     else:                                    # master: learn declared codecs
         ac, vc = declared_codecs(text)
         if ac or vc:
@@ -378,13 +396,21 @@ async def serve_master(token: str, entry: dict, request) -> Response:
     if not cands:
         return Response(status_code=404)
     skip_cooled = not all(reputation.cooled(c.get("sig") or "") for c in cands)
+    # Bounded open: several dead mirrors must not turn the player's open into
+    # a minute of spinner — spend at most _OPEN_BUDGET across all candidates.
+    deadline = time.monotonic() + _OPEN_BUDGET
     last_upstream = ""
     for idx, c in enumerate(cands):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.5:
+            logger.info("hls: open budget exhausted, giving up on this open")
+            break
         if skip_cooled and reputation.cooled(c.get("sig") or ""):
             continue
         rh = c.get("rh") or {}
         try:
-            r = await _client.get(c["u"], headers=rh)
+            r = await _client.get(c["u"], headers=rh,
+                                  timeout=min(10.0, remaining))
         except Exception as e:
             logger.info(f"hls: cand {idx} playlist fetch failed "
                         f"({type(e).__name__})")

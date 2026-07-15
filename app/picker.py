@@ -919,8 +919,12 @@ def _usable(s: dict, profile: dict, runtime: float) -> bool:
     if not s.get("url"):          # infoHash-only p2p entries can't be probed
         return False
     # Dropped for real: a release the proxy watched deliver badly (see
-    # app.reputation) — 'never used again' until the strike decays or is cleared.
-    if reputation.blocked(telemetry.signature(s)):
+    # app.reputation) — 'never used again' until the strike decays or is
+    # cleared. A cooled release (just delivered badly, or player-rejected for
+    # 24h) is also excluded from fresh picks, so the list the user sees never
+    # ranks first something the proxy would refuse to serve anyway.
+    sig = telemetry.signature(s)
+    if reputation.blocked(sig) or reputation.cooled(sig):
         return False
     # A release explicitly known to contain neither English nor the title's
     # original language can never be auto-picked. Unknown audio metadata still
@@ -1051,6 +1055,18 @@ def _store(key: str, streams: list[dict]) -> None:
     _cache[key] = (time.monotonic(), streams)
     if len(_cache) > 500:
         _cache.pop(next(iter(_cache)))
+
+
+def invalidate(media_id: str) -> None:
+    """Drop every cached pick result for a title. Called when playback
+    evidence arrives that the cached ranking is wrong (a player-rejected
+    release was #1): the next open re-picks with the cooldown applied, so the
+    list the user sees matches what the proxy will actually serve."""
+    if not media_id:
+        return
+    suffix = f":{media_id}"
+    for k in [k for k in _cache if k.endswith(suffix)]:
+        _cache.pop(k, None)
 
 
 def _as_verified(lib: list[dict]) -> list[tuple[dict, None]]:
@@ -1372,7 +1388,7 @@ async def _race_fast(media: str, media_id: str, profile: dict, runtime: float,
                     ident_inflight.add(ident)
                 task = asyncio.create_task(probe.probe_race(
                     [stream], need_bps, PROBE_TTFB_MAX, want=1,
-                    concurrency=1, deadline=deadline))
+                    concurrency=1, deadline=deadline, expect_secs=runtime))
                 running_probes[task] = stream
 
             active = set(pending_sources) | set(running_probes)
@@ -1670,7 +1686,8 @@ async def _probe_bounded(ok: list[dict], runtime: float, ttfb_max: float,
     results = await probe.probe_race(
         cands, _need_bps_fn(runtime), ttfb_max,
         want=len(cands),               # collect all that pass, no early bail
-        concurrency=SLOW_CONCURRENCY, deadline=hard_deadline)
+        concurrency=SLOW_CONCURRENCY, deadline=hard_deadline,
+        expect_secs=runtime)
     for s, r in results:               # fold in HLS-declared quality evidence
         _apply_probe_quality(s, r, runtime)
     return results

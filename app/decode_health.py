@@ -147,6 +147,14 @@ def suspect(text: str, acodecs=(), vcodec: str = "") -> bool:
     return bool(declared_keys(text) & bad)
 
 
+def clear(key: str) -> None:
+    """Forget one learned attribute (dashboard: after a player upgrade)."""
+    with _lock:
+        if _store.pop(key, None) is not None:
+            _save()
+            logger.info(f"decode-health: cleared {key}")
+
+
 def listing() -> list[dict]:
     """Dashboard-friendly view of every learned attribute."""
     now = time.time()

@@ -89,6 +89,10 @@ CATALOG = [
     ("PROBE_CODEC_SNIFF", "fast", "bool", "1", "",
      "ffprobe the bytes each passing probe already pulled to learn real "
      "codecs, feeding the decode-compatibility demotion."),
+    ("DURATION_MIN_FRAC", "fast", "num", "0.5", "",
+     "Reject a verified stream whose measured duration is below this "
+     "fraction of the title's runtime (a clip/sample, not the episode). "
+     "0 disables."),
     ("EXTRA_ADDON_TIMEOUT", "fast", "num", "30", _S,
      "Search timeout for each user-added custom addon."),
 
