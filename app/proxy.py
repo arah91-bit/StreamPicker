@@ -686,17 +686,61 @@ def _note_consumer_close(state: dict, *, sig: str, label: str, node: str,
     state["false_starts"] = state.get("false_starts", 0) + 1
     if state["false_starts"] < PLAYER_REJECT_STARTS:
         return
+    _mark_rejected(state, sig=sig, label=label, node=node, token=token,
+                   picker=picker, media_id=media_id,
+                   detail=f"{state['false_starts']} false starts, "
+                          f"no sustained play")
+
+
+def _mark_rejected(state: dict, *, sig: str, label: str, node: str, token: str,
+                   picker: str, media_id: str, detail: str) -> None:
     state["rejected"] = True
-    logger.info(f"proxy: player rejected {label!r} — {state['false_starts']} "
-                f"short connections, no sustained play (codec/container the "
-                f"player can't open?); cooling release, next open serves the "
-                f"next source")
+    logger.info(f"proxy: player rejected {label!r} — {detail} (codec/container "
+                f"the player can't open?); cooling release, next open serves "
+                f"the next source")
     reputation.observe(sig, token, "player-rejected", label, node=node)
     reputation.cooldown(sig)
     telemetry.record_buffer("player_rejected", sig=sig, picker=picker,
                             media_id=media_id, source=label, node=node,
-                            reason=f"{state['false_starts']} false starts, "
-                                   f"no sustained play")
+                            reason=detail)
+
+
+# Players that reject a file usually go quiet, then re-request the same URL on
+# their own every ~30s. Waiting for a third failed open can therefore cost a
+# whole retry cycle. After two false starts, silence IS the signal: no new
+# connection and no active reader for _REJECT_SILENCE_SECS means the player has
+# given up on this file — reject now, so its very next self-retry is served the
+# next candidate. Recovery without the viewer touching anything.
+_REJECT_SILENT_STARTS = 2
+_REJECT_SILENCE_SECS = 15.0
+
+
+def _arm_reject_timer(e: "_Entry", token: str) -> None:
+    state = e.playfail
+    if (not PLAYER_REJECT_STARTS or state.get("rejected")
+            or state.get("real_play")
+            or state.get("false_starts", 0) < _REJECT_SILENT_STARTS
+            or state.get("timer_armed")):
+        return
+    state["timer_armed"] = True
+
+    async def _fire():
+        try:
+            await asyncio.sleep(_REJECT_SILENCE_SECS)
+            if (state.get("rejected") or state.get("real_play")
+                    or e.consumers > 0):
+                return                 # reattached or resolved meanwhile
+            _mark_rejected(state, sig=e.sig,
+                           label=(e.source or {}).get("lbl", ""), node=e.node,
+                           token=token, picker=e.picker, media_id=e.media_id,
+                           detail=f"{state.get('false_starts', 0)} false starts"
+                                  f" then {_REJECT_SILENCE_SECS:.0f}s silence")
+        finally:
+            state["timer_armed"] = False
+
+    t = asyncio.create_task(_fire())
+    _bg_tasks.add(t)
+    t.add_done_callback(_bg_tasks.discard)
 
 
 async def _body(entry, idx, cand, resp, it, prebuf, offset, end, ttfb, token, net):
@@ -1399,8 +1443,25 @@ async def _consume(e: _Entry, offset: int, end: int | None, token: str):
                 node=e.node, token=token, picker=e.picker,
                 media_id=e.media_id, served=served,
                 dur=time.monotonic() - t0)
+            _arm_reject_timer(e, token)
         except Exception:
             pass
+
+
+def _skip_rejected(source: dict | None, cands: list) -> dict | None:
+    """Swap a pass-through anchor away from a player-rejected release, so a
+    tail/seek request landing mid-recovery can't hand the player bytes of the
+    file it just gave up on (mixing files would make the GOOD file fail to
+    parse too). Only *rejected* releases are skipped — the player never played
+    them, so no open playback can depend on their bytes. A merely cooled (slow)
+    release still serves its own seeks: a viewer mid-file must keep getting
+    byte-identical data."""
+    def ok(c):
+        ent = _entries.get(c.get("sig") or "")
+        return not (ent and ent.playfail.get("rejected"))
+    if source is None or ok(source):
+        return source
+    return next((c for c in cands if ok(c)), source)
 
 
 async def _serve_direct(session: dict, cands: list, request, token: str,
@@ -1456,6 +1517,7 @@ async def _serve_buffered(token: str, session: dict, cands: list, offset: int,
     if e is None:                                       # seek-first, or no source at all
         pin = min(session.get("pin") or 0, len(cands) - 1) if cands else 0
         source = cands[pin] if cands and offset > 0 else None
+        source = _skip_rejected(source, cands)
         return await _serve_direct(session, cands, request, token, source=source)
     e.last = time.time()
     # Seek ahead of what's cached (and not done): pass through directly rather than
@@ -1501,6 +1563,7 @@ async def serve(token: str, request) -> Response:
                                        expected_total=cached.total)
         pin = min(entry.get("pin") or 0, len(cands) - 1) if cands else 0
         source = cands[pin] if cands else None
+        source = _skip_rejected(source, cands)
         pool = entry.get("pool") or cands
         return await _serve_direct(entry, pool, request, token, source=source)
 

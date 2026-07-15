@@ -153,5 +153,79 @@ class RejectedEntryReuseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(204, resp.status_code)
 
 
+class SilenceTimerTests(unittest.IsolatedAsyncioTestCase):
+    """A player that rejected a file goes quiet before its ~30s self-retry.
+    Two false starts + silence must reject early, so the player's very next
+    self-retry on the same URL is already served the next candidate — recovery
+    with zero viewer action."""
+
+    async def test_silence_after_two_false_starts_rejects(self):
+        import asyncio
+        e = _entry("file:quiet")
+        _short(e.playfail, sig="file:quiet")
+        _short(e.playfail, sig="file:quiet")
+        with (patch.object(proxy, "_REJECT_SILENCE_SECS", 0.05),
+              patch("app.proxy.reputation.observe") as observe,
+              patch("app.proxy.reputation.cooldown") as cooldown,
+              patch("app.proxy.telemetry.record_buffer")):
+            proxy._arm_reject_timer(e, "tok1")
+            await asyncio.sleep(0.2)
+        self.assertTrue(e.playfail.get("rejected"))
+        observe.assert_called_once()
+        cooldown.assert_called_once_with("file:quiet")
+
+    async def test_reattached_reader_cancels_silence_rejection(self):
+        import asyncio
+        e = _entry("file:busy")
+        _short(e.playfail, sig="file:busy")
+        _short(e.playfail, sig="file:busy")
+        with (patch.object(proxy, "_REJECT_SILENCE_SECS", 0.05),
+              patch("app.proxy.reputation.observe") as observe):
+            proxy._arm_reject_timer(e, "tok1")
+            e.consumers = 1                        # the player came back
+            await asyncio.sleep(0.2)
+        self.assertFalse(e.playfail.get("rejected"))
+        observe.assert_not_called()
+
+    async def test_single_false_start_never_arms_the_timer(self):
+        e = _entry("file:once")
+        _short(e.playfail, sig="file:once")
+        proxy._arm_reject_timer(e, "tok1")
+        self.assertFalse(e.playfail.get("timer_armed"))
+
+
+class SkipRejectedTests(unittest.TestCase):
+    """Pass-through (tail/seek) anchors must never point a recovering player
+    back at the file it just rejected — but only *rejected* releases may be
+    swapped; a slow-but-playing release must keep serving its own bytes."""
+
+    def setUp(self):
+        self._saved = dict(proxy._entries)
+        proxy._entries.clear()
+
+    def tearDown(self):
+        proxy._entries.clear()
+        proxy._entries.update(self._saved)
+
+    def test_rejected_anchor_swaps_to_clean_candidate(self):
+        bad = _entry("file:bad")
+        bad.playfail["rejected"] = True
+        proxy._entries["file:bad"] = bad
+        a = {"sig": "file:bad", "u": "u1"}
+        b = {"sig": "file:ok", "u": "u2"}
+        self.assertIs(b, proxy._skip_rejected(a, [a, b]))
+
+    def test_clean_anchor_is_kept(self):
+        a = {"sig": "file:ok", "u": "u1"}
+        self.assertIs(a, proxy._skip_rejected(a, [a]))
+
+    def test_all_rejected_keeps_the_anchor(self):
+        bad = _entry("file:bad")
+        bad.playfail["rejected"] = True
+        proxy._entries["file:bad"] = bad
+        a = {"sig": "file:bad", "u": "u1"}
+        self.assertIs(a, proxy._skip_rejected(a, [a]))
+
+
 if __name__ == "__main__":
     unittest.main()

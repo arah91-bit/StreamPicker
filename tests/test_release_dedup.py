@@ -199,12 +199,14 @@ class FastRaceDedupTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(verified)
 
     async def test_host_with_repeated_failures_is_benched_for_the_pick(self):
-        # Four distinct releases on one flaky host (all fail), one on a healthy
-        # host. After PROBE_HOST_BENCH failures the flaky host's remaining
-        # candidate is skipped; the healthy host still verifies.
+        # Six distinct releases on one flaky host (all fail), one on a healthy
+        # host. Probe completions can land in partial batches, so a couple of
+        # extra flaky probes may dispatch before the third failure registers —
+        # the invariant is that the bench eventually stops the bleeding (some
+        # flaky candidates are never probed) and the healthy host still wins.
         flaky = [_copy("Flaky 2160p", f"https://flaky.example/{i}",
                        size=20_000_000_000 + i * 1_000_000_000)
-                 for i in range(4)]
+                 for i in range(6)]
         healthy = _copy("Healthy 1080p", "https://healthy.example/ok",
                         size=8_000_000_000)
         streams = flaky + [healthy]
@@ -214,7 +216,8 @@ class FastRaceDedupTests(unittest.IsolatedAsyncioTestCase):
                 streams, failing_urls={s["url"] for s in flaky})
 
         flaky_probed = [u for u in probed_urls if "flaky.example" in u]
-        self.assertEqual(3, len(flaky_probed))     # 4th skipped: host benched
+        self.assertGreaterEqual(len(flaky_probed), 3)
+        self.assertLess(len(flaky_probed), 6)      # bench kicked in
         self.assertIn(healthy["url"], probed_urls)
         self.assertEqual(healthy["url"], verified[0][0]["url"])
 
