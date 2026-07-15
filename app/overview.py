@@ -254,6 +254,9 @@ def _mix_panel(title: str, counts: dict, total: int, order=None,
 # ── friendly names for the machine-y usenet failure reasons ──────────────────
 _REASON = {
     "missing-articles": "Missing articles (incomplete on usenet)",
+    "broken-archive": "Broken/unsupported archive",
+    "encrypted": "Password-protected archive",
+    "nzbdav-backend": "nzbdav backend fault (not the release)",
     "http-404": "Not on the indexer (404)",
     "http-410": "Gone from the indexer (410)",
     "short-body": "Truncated download",

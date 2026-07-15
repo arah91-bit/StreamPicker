@@ -27,6 +27,7 @@ import os
 import re
 import secrets
 import time
+import unicodedata
 import xml.etree.ElementTree as ET
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
@@ -265,8 +266,21 @@ async def _search_one(name: str, base: str, key: str, params: dict) -> list[dict
         return _SearchRows(ok=False, detail=shape)
 
 
+def _fold(t: str) -> str:
+    """Scene-name folding: strip diacritics and spell ``&``/``+`` out.
+
+    Authoritative metadata carries accents and ampersands ("Amélie",
+    "Fast & Furious") while release names are ASCII with "and" spelled out.
+    Without folding, every legitimate release for such a title fails the
+    title match and the whole lane goes dark for it.
+    """
+    t = unicodedata.normalize("NFKD", t or "").casefold()
+    t = "".join(ch for ch in t if not unicodedata.combining(ch))
+    return t.replace("&", "and").replace("+", "and")
+
+
 def _norm(t: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", (t or "").lower())
+    return re.sub(r"[^a-z0-9]", "", _fold(t))
 
 
 _IMDB_VALUE_RE = re.compile(r"^(?:tt)?(\d+)$", re.I)
@@ -362,7 +376,7 @@ _TITLE_TAIL_MARKERS = {
     "bdrip", "brrip", "remux", "hdtv", "dvdrip", "dvdscr", "cam",
     "telesync", "repack", "proper", "extended", "theatrical", "imax",
     "hdr", "hdr10", "dovi", "dv", "internal", "complete", "multi",
-    "dual",
+    "dual", "season", "seasons",
 }
 
 
@@ -378,6 +392,10 @@ def _release_title_match(release: str, expected: str) -> bool:
     target = _norm(expected)
     if not target:
         return False
+    # Fold the release side too: the consuming loop below compares character
+    # by character, so an accented release ("Amélie") must decompose the same
+    # way the expected title did.
+    release = _fold(release or "")
     consumed = ""
     end = -1
     for end, char in enumerate(release or ""):
@@ -397,6 +415,9 @@ def _release_title_match(release: str, expected: str) -> bool:
         re.fullmatch(r"(?:19|20)\d{2}", token)
         or re.fullmatch(r"(?:2160|1080|720|576|480)p", token)
         or re.fullmatch(r"s\d{1,3}e\d{1,4}", token)
+        # Bare season token: "Show.S01.COMPLETE" packs and "Show.S01.E02"
+        # spaced episode styles are this title, not a longer different one.
+        or re.fullmatch(r"s\d{1,3}", token)
         or re.fullmatch(r"\d{1,3}x\d{1,4}", token)
         or token in _TITLE_TAIL_MARKERS
     )
@@ -418,6 +439,72 @@ def _episode_match(text: str, season: int, episode: int) -> bool:
             r"[\s._-]*E\d{1,4}\b)", tail, re.I):
         return False
     return True
+
+
+def _season_pack_match(text: str, season: int, episode: int) -> bool:
+    """Whether a title names a season bundle that should contain the episode.
+
+    Packs are a last resort: mounting one is slower and its per-file episode
+    check (``_pick_video_identity``) is the real safety gate, so this only has
+    to recognize plausible containers — a bare season token, "Season N", or an
+    explicit episode range spanning the request.
+    """
+    t = text or ""
+    for match in re.finditer(
+            rf"(?<![A-Za-z0-9])S0*{season}[\s._-]*E0*(\d+)[\s._-]*"
+            rf"(?:-|to|thru|through)[\s._-]*(?:S0*{season})?[\s._-]*E?0*(\d+)"
+            r"(?!\d)", t, re.I):
+        if int(match.group(1)) <= episode <= int(match.group(2)):
+            return True
+    if re.search(rf"(?<![A-Za-z0-9])(?:S|Season[\s._-]*)0*{season}"
+                 r"(?![A-Za-z0-9])", t, re.I):
+        # A same-season episode token means this is a single episode (or a
+        # bundle already rejected above), not a whole-season container.
+        return not any(s == season for s, _ in _episode_tokens(t))
+    return False
+
+
+def _query_text(title: str) -> str:
+    """Free-text query form of an authoritative title: diacritics folded,
+    apostrophes dropped, sentence punctuation spaced — the shapes indexer
+    full-text search actually stores."""
+    t = unicodedata.normalize("NFKD", title or "")
+    t = "".join(ch for ch in t if not unicodedata.combining(ch))
+    t = t.replace("'", "").replace("’", "")
+    t = re.sub(r"[;:!?~]+", " ", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _text_queries(media: str, parts: list[str], titles: list[str],
+                  year: int | None) -> list[str]:
+    queries = []
+    for title in titles[:2]:
+        q = _query_text(title)
+        if not re.search(r"[A-Za-z0-9]", q):
+            continue
+        if media == "movie":
+            queries.append(f"{q} {year}" if year else q)
+        else:
+            queries.append(f"{q} S{int(parts[1]):02d}E{int(parts[2]):02d}")
+    return list(dict.fromkeys(queries))
+
+
+async def _text_search(media: str, parts: list[str], titles: list[str],
+                       year: int | None) -> list[list[dict]]:
+    """Free-text fallback when the id-scoped query yields nothing usable.
+
+    Anime and Asian dramas have the worst IMDb-id coverage on indexers —
+    releases indexed under romaji or English alternate names are invisible to
+    an imdbid query.  A ``t=search`` pass with the title and episode token in
+    the query recovers them; every result still runs the full strict identity
+    pipeline, so breadth here cannot admit wrong content."""
+    queries = _text_queries(media, parts, titles, year)
+    if not queries:
+        return []
+    cat = "2000" if media == "movie" else "5000"
+    return list(await asyncio.gather(*(
+        _search_one(n, b, k, {"t": "search", "q": q, "cat": cat})
+        for q in queries for n, b, k in INDEXERS)))
 
 
 async def search(media: str, media_id: str) -> list[dict]:
@@ -449,8 +536,13 @@ async def search(media: str, media_id: str) -> list[dict]:
     releases.search_ok = sum(1 for rows in results
                              if getattr(rows, "ok", True))
     releases.search_failed = len(results) - releases.search_ok
+    season_episode = ((int(parts[1]), int(parts[2]))
+                      if media != "movie" else None)
+    packs: list[dict] = []
     seen, dropped, attr_dropped, suppressed = {}, 0, 0, 0
-    for lst in results:
+
+    def _ingest(lst: list[dict]) -> None:
+        nonlocal dropped, attr_dropped, suppressed
         for it in lst:
             nt = _norm(it["title"])
             contradiction, attrs_trusted, attr_evidence, _ = (
@@ -463,10 +555,16 @@ async def search(media: str, media_id: str) -> list[dict]:
                        for title in expected_titles):
                 dropped += 1
                 continue
-            if media != "movie" and not _episode_match(
-                    it["title"], int(parts[1]), int(parts[2])):
-                dropped += 1
-                continue
+            is_pack = False
+            if season_episode and not _episode_match(it["title"],
+                                                     *season_episode):
+                # A whole-season container is kept aside as a last resort;
+                # the per-file episode check at mount time is its safety gate.
+                if _season_pack_match(it["title"], *season_episode):
+                    is_pack = True
+                else:
+                    dropped += 1
+                    continue
             if expected_year:
                 years = {int(y) for y in re.findall(r"(?<!\d)((?:19|20)\d{2})(?!\d)",
                                                     it["title"])}
@@ -476,8 +574,13 @@ async def search(media: str, media_id: str) -> list[dict]:
             if not _mountable_release(it["title"]):
                 dropped += 1
                 continue
+            # A pack is the season container: key it to the season so every
+            # episode of a binge reuses one mount instead of re-importing
+            # the same multi-GB NZB, and so a broken pack is suppressed for
+            # the whole season it fails to serve.
             key = usenet_health.release_key(
-                it["title"], it["size"], media, media_id)
+                it["title"], it["size"], media,
+                f"{parts[0]}:{parts[1]}" if is_pack else media_id)
             legacy_key = usenet_health.release_key(it["title"], it["size"])
             if key and usenet_health.should_skip(key):
                 suppressed += 1
@@ -518,8 +621,30 @@ async def search(media: str, media_id: str) -> list[dict]:
                            "titles": list(expected_titles),
                            "year": expected_year,
                        }}
+            if is_pack:
+                release["_nzb_pack"] = True
             seen[dedup] = release
-            releases.append(release)
+            (packs if is_pack else releases).append(release)
+
+    def _any_fetchable(rows: list[dict]) -> bool:
+        return any(usenet_health.fetch_allowed(o.get("indexer", ""))
+                   for r in rows for o in r.get("offers") or [])
+
+    for lst in results:
+        _ingest(lst)
+    if not _any_fetchable(releases):
+        before = len(releases)
+        for lst in await _text_search(media, parts, expected_titles,
+                                      expected_year):
+            _ingest(lst)
+        if len(releases) > before:
+            logger.info(f"nzb search {media_id}: id query yielded nothing "
+                        f"usable; free-text fallback recovered "
+                        f"{len(releases) - before} release(s)")
+    if not _any_fetchable(releases) and packs:
+        logger.info(f"nzb search {media_id}: no single-episode release; "
+                    f"admitting {len(packs)} season pack(s) as last resort")
+        releases.extend(packs)
     if dropped:
         logger.info(f"nzb search {media_id}: dropped {dropped} wrong-title results")
     if attr_dropped:
@@ -562,11 +687,26 @@ _JUNK_RE = re.compile(
 )
 _DV_TITLE_RE = re.compile(r"\b(?:dv|dovi|dolby[\s._-]?vision)\b", re.I)
 _HDR_FALLBACK_RE = re.compile(r"hdr10\+?|\bhdr\b", re.I)
+# Stray file-level entries from older indexer databases: bare parity/archive
+# parts are never a playable release.  Numeric split parts (.001-.999) demand
+# a literal dot so anime absolute numbering ("Show - 099") survives, and the
+# H.26x codec family (x264 tags without the x) is explicitly exempt.
+_ARCHIVE_PART_RE = re.compile(
+    r"(?:(?:^|[^a-z0-9])(par2|nzb|rar|r\d{1,3})|\.(\d{3}))[^a-z0-9]*$", re.I)
+_CODEC_NUMERAL_RE = re.compile(r"^26[1-6]$")
+
+
+def _bare_archive_part(title: str) -> bool:
+    match = _ARCHIVE_PART_RE.search(title or "")
+    if not match:
+        return False
+    token = match.group(1) or match.group(2)
+    return not _CODEC_NUMERAL_RE.fullmatch(token)
 
 
 def _mountable_release(title: str) -> bool:
     """Cheap format rejects before a release consumes scarce nzbdav slots."""
-    if _JUNK_RE.search(title or ""):
+    if _JUNK_RE.search(title or "") or _bare_archive_part(title):
         return False
     return not (_DV_TITLE_RE.search(title or "")
                 and not _HDR_FALLBACK_RE.search(title or ""))
@@ -804,17 +944,51 @@ _IMPORT_HARD_RE = re.compile(
     r"not enough.*article",
     re.I,
 )
+_IMPORT_ENCRYPTED_RE = re.compile(
+    r"password.?protect|password did not match|wrong password|"
+    r"\bencrypted\b|requires? a password",
+    re.I,
+)
 _IMPORT_TRANSIENT_RE = re.compile(
     r"auth|login|connection|too many|limit|timeout|timed out|network|"
     r"temporar|unavailable|nntp\s*50[023]",
     re.I,
 )
+# nzbdav's own faults ("Unable to load shared library 'rapidyenc'",
+# "SQLite Error 14", "Value cannot be null") — the release is not evidence
+# of anything when the backend is broken, so these must never strike it.
+_IMPORT_BACKEND_RE = re.compile(
+    r"shared librar|rapidyenc|sqlite|cannot be null",
+    re.I,
+)
+# Permanently-dead archive shapes, phrased as nzbdav actually emits them
+# (harvested from live HistoryItems).  Missing rar volumes are incomplete
+# posts; the rest are structurally unusable no matter which provider serves
+# the articles.
+_IMPORT_HARD_CLASSES = (
+    (re.compile(r"no importable video", re.I), "not-video"),
+    (re.compile(r"missing rar volume", re.I), "missing-articles"),
+    (re.compile(r"duplicate volume|rar signature|compression method", re.I),
+     "broken-archive"),
+)
 
 
 def _history_failure_class(message: str) -> tuple[str, str]:
     """Sanitize an nzbdav failure into health policy enums."""
+    if _IMPORT_BACKEND_RE.search(message or ""):
+        return "backend", "nzbdav-backend"
     if _IMPORT_TRANSIENT_RE.search(message or ""):
         return "transient", "transport"
+    # An encrypted/password-protected archive is permanently unplayable — we
+    # manage no passwords, so retrying only burns another mount slot.  The
+    # phrasing is kept archive-specific ("Password-protected rar archives
+    # cannot be solid.", "The password did not match.") so a provider
+    # credential complaint can never earn a release a permanent strike.
+    if _IMPORT_ENCRYPTED_RE.search(message or ""):
+        return "hard", "encrypted"
+    for pattern, reason in _IMPORT_HARD_CLASSES:
+        if pattern.search(message or ""):
+            return "hard", reason
     if _IMPORT_HARD_RE.search(message or ""):
         return "hard", "missing-articles"
     # Unknown import errors are cooldown-only: never permanently suppress a
@@ -981,10 +1155,14 @@ def _record_import_failure(release: dict, kind: str, reason: str,
         bucket = int(time.time() // max(seconds, 1))
         attempt = f"import:{key}:{bucket}"
     indexers = [o.get("indexer", "") for o in release.get("offers") or []]
-    accepted = usenet_health.record_failure(
-        key, release["title"],
-        indexers,
-        reason, attempt)
+    # A backend fault (nzbdav itself broke) says nothing about the release or
+    # the indexer that offered it — telemetry only, no health strikes.
+    accepted = False
+    if kind != "backend":
+        accepted = usenet_health.record_failure(
+            key, release["title"],
+            indexers,
+            reason, attempt)
     # Diagnostic evidence is deliberately independent of policy acceptance.
     # A replay may be idempotent for strikes yet still be valuable when we are
     # learning all the shapes nzbdav/provider failures take in the wild.
@@ -1146,6 +1324,12 @@ def _pick_video_identity(
             confidence = "strong"
         ranked.append((order[confidence], int(video[1] or 0), video,
                        confidence, evidence))
+    if release.get("_nzb_pack"):
+        # A season-pack mount holds many sibling episodes.  A file whose name
+        # carries only the title ranks "compatible" and the largest sibling
+        # would win, so a pack may only serve a file that positively names
+        # the requested episode.
+        ranked = [row for row in ranked if "basename-episode" in row[4]]
     if not ranked:
         return None, "contradiction" if mismatch_reason else "unknown", [], mismatch_reason
     _, _, video, confidence, evidence = max(ranked, key=lambda row: row[:2])

@@ -80,6 +80,12 @@ def _content_scope(media: str | None, media_id: str | None) -> str:
     imdb = f"tt{imdb_match.group(1).lstrip('0') or '0'}"
     if kind == "movie":
         return f"movie:{imdb}"
+    if len(parts) == 2 and parts[1].strip().isdigit():
+        # Season-level scope, used for season packs: the same container
+        # legitimately serves every episode of its season, so its mount and
+        # health state must be shared rather than split per episode.  It can
+        # never collide with an episode scope (those always carry :E).
+        return f"series:{imdb}:{int(parts[1])}"
     if (len(parts) != 3 or not parts[1].strip().isdigit()
             or not parts[2].strip().isdigit()):
         return ""
@@ -111,7 +117,7 @@ def release_key(title: str, size: int | float | None,
 _HARD_REASON_RE = re.compile(
     r"missing[\s._-]*articles?|not[\s._-]*(?:video|media)|wrong[\s._-]*episode|"
     r"wrong[\s._-]*(?:title|year|identity|imdb|media|season)|"
-    r"empty body|"
+    r"empty body|encrypted|password[\s._-]*protect|broken[\s._-]*archive|"
     r"short body|http\s+(?:404|410)\b",
     re.I,
 )
@@ -139,6 +145,10 @@ def _safe_reason(reason: str, kind: str) -> str:
     if kind == "hard":
         if "missing" in r and "article" in r:
             return "missing-articles"
+        if "encrypt" in r or "password" in r:
+            return "encrypted"
+        if "archive" in r or "rar" in r:
+            return "broken-archive"
         if "404" in r:
             return "http-404"
         if "410" in r:
