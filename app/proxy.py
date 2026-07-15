@@ -664,18 +664,32 @@ async def _open_twin(entry, cand, cur, end, tried):
 # next open serves the next candidate) and a reputation session is recorded, so
 # a repeat offender is eventually blocked for good. Server-side and
 # player-agnostic: no codec guessing, pure observed behavior.
-PLAYER_REJECT_STARTS = int(os.environ.get("PLAYER_REJECT_STARTS", "3"))
+PLAYER_REJECT_STARTS = int(os.environ.get("PLAYER_REJECT_STARTS", "2"))
 _REAL_PLAY_SECS = 20.0                   # a connection this long = actual playback
 _REAL_PLAY_BYTES = 256 * 1024 * 1024     # pulling this much = playing/buffering
+# What counts as one false start. Live data: a decode-rejecting player dies in
+# well under a second and always re-tries from byte 0, while normal playback is
+# full of short connections too — but those are seeks and chunked mid-file
+# range reads at NONZERO offsets (one healthy session had 931 of them). Offset
+# zero + sub-_FALSE_START_SECS is the shape only a rejecting player produces.
+_FALSE_START_SECS = 5.0
+# Strikes must also cluster: a viewer sampling a title a few times over an
+# evening is not a decode failure. Old strikes age out of the window.
+_STRIKE_WINDOW = 180.0
 
 
 def _note_consumer_close(state: dict, *, sig: str, label: str, node: str,
                          token: str, picker: str, media_id: str,
-                         served: int, dur: float) -> None:
+                         served: int, dur: float, offset: int = 0,
+                         immediate: bool = False) -> None:
     """Feed one closed player connection into the player-rejected detector.
     `state` is a mutable per-release dict living on the cache entry (buffered
     path) or the playback session (legacy path); real playback latches it open
-    so seek storms and header probes around a working stream never count."""
+    so seek storms, header probes, and chunk-readers never count. On the
+    buffered path rejection additionally requires the silence confirmation
+    (_arm_reject_timer) — a player mid-startup-burst is never quiet, a player
+    that gave up is. `immediate=True` (legacy path, which has no entry to hang
+    a timer on) rejects on the strike count alone."""
     if not PLAYER_REJECT_STARTS or not sig:
         return
     if dur >= _REAL_PLAY_SECS or served >= _REAL_PLAY_BYTES:
@@ -683,13 +697,17 @@ def _note_consumer_close(state: dict, *, sig: str, label: str, node: str,
         return
     if state.get("real_play") or state.get("rejected"):
         return
-    state["false_starts"] = state.get("false_starts", 0) + 1
-    if state["false_starts"] < PLAYER_REJECT_STARTS:
-        return
-    _mark_rejected(state, sig=sig, label=label, node=node, token=token,
-                   picker=picker, media_id=media_id,
-                   detail=f"{state['false_starts']} false starts, "
-                          f"no sustained play")
+    if offset != 0 or dur >= _FALSE_START_SECS:
+        return                            # seek/chunk read, or a sampled watch
+    now = time.monotonic()
+    strikes = [t for t in state.get("strikes", []) if now - t < _STRIKE_WINDOW]
+    strikes.append(now)
+    state["strikes"] = strikes
+    state["false_starts"] = len(strikes)
+    if immediate and len(strikes) >= PLAYER_REJECT_STARTS + 1:
+        _mark_rejected(state, sig=sig, label=label, node=node, token=token,
+                       picker=picker, media_id=media_id,
+                       detail=f"{len(strikes)} false starts, no sustained play")
 
 
 def _mark_rejected(state: dict, *, sig: str, label: str, node: str, token: str,
@@ -706,12 +724,12 @@ def _mark_rejected(state: dict, *, sig: str, label: str, node: str, token: str,
 
 
 # Players that reject a file usually go quiet, then re-request the same URL on
-# their own every ~30s. Waiting for a third failed open can therefore cost a
-# whole retry cycle. After two false starts, silence IS the signal: no new
-# connection and no active reader for _REJECT_SILENCE_SECS means the player has
-# given up on this file — reject now, so its very next self-retry is served the
-# next candidate. Recovery without the viewer touching anything.
-_REJECT_SILENT_STARTS = 2
+# their own every ~30s. After PLAYER_REJECT_STARTS false starts, silence IS the
+# confirmation: no new connection and no active reader for _REJECT_SILENCE_SECS
+# means the player has given up on this file — reject then, so its very next
+# self-retry is served the next candidate. Recovery without the viewer touching
+# anything. The silence requirement is also the false-positive guard: a player
+# mid-startup-burst or chunk-reading through a working stream is never quiet.
 _REJECT_SILENCE_SECS = 15.0
 
 
@@ -719,7 +737,7 @@ def _arm_reject_timer(e: "_Entry", token: str) -> None:
     state = e.playfail
     if (not PLAYER_REJECT_STARTS or state.get("rejected")
             or state.get("real_play")
-            or state.get("false_starts", 0) < _REJECT_SILENT_STARTS
+            or state.get("false_starts", 0) < PLAYER_REJECT_STARTS
             or state.get("timer_armed")):
         return
     state["timer_armed"] = True
@@ -898,7 +916,8 @@ async def _body(entry, idx, cand, resp, it, prebuf, offset, end, ttfb, token, ne
             sig=cand.get("sig") or "", label=cand.get("lbl", ""),
             node=net.get("node", ""), token=token,
             picker=entry.get("picker", ""), media_id=entry.get("id", ""),
-            served=served, dur=time.monotonic() - t0)
+            served=served, dur=time.monotonic() - t0, offset=offset,
+            immediate=True)
 
 
 # ── server-side read-ahead buffer (producer/consumer cache on NVMe) ──────────
@@ -1442,7 +1461,7 @@ async def _consume(e: _Entry, offset: int, end: int | None, token: str):
                 e.playfail, sig=e.sig, label=(e.source or {}).get("lbl", ""),
                 node=e.node, token=token, picker=e.picker,
                 media_id=e.media_id, served=served,
-                dur=time.monotonic() - t0)
+                dur=time.monotonic() - t0, offset=offset)
             _arm_reject_timer(e, token)
         except Exception:
             pass

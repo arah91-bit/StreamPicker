@@ -141,9 +141,10 @@ CATALOG = [
      "How many streams per list get proxy-wrapped for failover + stats."),
     ("PROXY_MAX_FAILOVER", "proxy", "num", "4", "",
      "Backup candidates carried in each playback token."),
-    ("PLAYER_REJECT_STARTS", "proxy", "num", "3", "",
-     "Short no-play connections before a release is judged undecodable by "
-     "the player, cooled, and skipped on the next open. 0 disables."),
+    ("PLAYER_REJECT_STARTS", "proxy", "num", "2", "",
+     "Failed fresh opens (sub-5s reads from byte 0) before 15s of player "
+     "silence rejects a release as undecodable and the next open serves "
+     "another. 0 disables."),
     ("PROXY_SESSION_TTL", "proxy", "num", "86400", _S,
      "How long a playback token stays valid."),
     ("PROXY_SESSION_MAX_BYTES", "proxy", "num", "20971520", _B,
