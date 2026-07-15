@@ -151,6 +151,13 @@ CATALOG = [
     ("PLAYER_REJECT_COOLDOWN_HOURS", "proxy", "num", "24", "",
      "How long a player-rejected release is skipped — long, because decode "
      "failure is deterministic, not a node lottery."),
+    ("PROXY_HLS", "proxy", "bool", "1", "",
+     "Rewrite HLS playlists through the proxy: upstream sees our headers/IP "
+     "(fixes referer-gated and IP-locked hosts), playback gets stats, "
+     "rejection detection, and read-ahead. 0 = pass playlists raw."),
+    ("HLS_SEG_CACHE_MB", "proxy", "num", "64", "",
+     "In-memory read-ahead cache for HLS segments (prefetches the next two "
+     "ahead of the player)."),
     ("DECODE_BAD_REJECTS", "proxy", "num", "2", "",
      "Player rejections (with zero successful plays) before a codec counts "
      "as undecodable and matching releases rank below clean ones."),

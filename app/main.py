@@ -300,3 +300,11 @@ async def proxy_stream(token: str, request: Request):
     # No secret gate: the token itself is an unguessable capability, and the
     # player must fetch it without our addon secret.
     return await proxy.serve(token, request)
+
+
+@app.api_route("/proxy/{token}/hls", methods=["GET", "HEAD"])
+async def proxy_hls(token: str, request: Request):
+    # HLS sub-resources (variants, segments, keys) rewritten into the playlist
+    # by app.hlsproxy; each URL carries an HMAC binding it to this token, so
+    # this cannot be used as an open proxy.
+    return await proxy.serve_hls(token, request)

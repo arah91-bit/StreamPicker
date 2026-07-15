@@ -57,17 +57,23 @@ class StrongSignatureTests(unittest.TestCase):
 
 
 class HlsPassThroughTests(unittest.TestCase):
-    """HLS playlists must never be wrapped: served from /proxy/ their relative
-    segment URIs resolve against our host and 404. Public playlists pass raw;
-    a playlist that is only safe wrapped (credentials/internal host) has no
-    servable form and is dropped."""
+    """With the rewriting proxy DISABLED (PROXY_HLS=0) the legacy rules hold:
+    playlists must never be wrapped un-rewritten (relative segment URIs would
+    404 against our host), public ones pass raw, and a playlist that is only
+    safe wrapped (credentials/internal host) has no servable form and is
+    dropped. The enabled path is covered in test_hls_proxy.py."""
 
     def setUp(self):
+        from app import hlsproxy
         self._mint = proxy._mint
         proxy._mint = lambda *a, **k: "tok"
+        self._hls = hlsproxy.ENABLED
+        hlsproxy.ENABLED = False
 
     def tearDown(self):
+        from app import hlsproxy
         proxy._mint = self._mint
+        hlsproxy.ENABLED = self._hls
 
     def test_is_hls_matches_playlist_paths_only(self):
         self.assertTrue(proxy._is_hls("https://cdn.example/live/master.m3u8"))

@@ -22,7 +22,7 @@ from urllib.parse import urljoin
 
 import httpx
 
-from app import telemetry, usenet_health, vprobe
+from app import hlsproxy, telemetry, usenet_health, vprobe
 
 logger = logging.getLogger("stream-picker")
 
@@ -165,10 +165,14 @@ def _hls_variant_info(text: str) -> dict:
     return info
 
 
-async def probe(url: str, need_bps: float | None, ttfb_max: float) -> ProbeResult:
-    """need_bps is the file's real bitrate (size/runtime) or None if unknown."""
+async def probe(url: str, need_bps: float | None, ttfb_max: float,
+                headers: dict | None = None) -> ProbeResult:
+    """need_bps is the file's real bitrate (size/runtime) or None if unknown.
+    `headers` are the stream's declared upstream request headers (proxyHeaders)
+    — referer-gated hosts reject bare requests, so probing without them fails
+    streams that would play fine through the proxy."""
     r = await _probe_url(url, _required_bps(need_bps), ttfb_max,
-                         time.monotonic(), hops=0)
+                         time.monotonic(), hops=0, headers=headers)
     if r.ok and r.head and CODEC_SNIFF and vprobe.enabled():
         try:
             ac, vc = await vprobe.codecs_of(r.head)
@@ -181,7 +185,8 @@ async def probe(url: str, need_bps: float | None, ttfb_max: float) -> ProbeResul
 
 async def _probe_url(url: str, required: float, ttfb_max: float,
                      t0: float, hops: int,
-                     media: dict | None = None) -> ProbeResult:
+                     media: dict | None = None,
+                     headers: dict | None = None) -> ProbeResult:
     """One GET of the probe descent. hops>0 means we're past an HLS playlist,
     probing a media segment: clean EOF short of the 4 MiB window is then a
     complete segment, not truncation. ttfb is always measured from the original
@@ -194,9 +199,11 @@ async def _probe_url(url: str, required: float, ttfb_max: float,
     timeout = httpx.Timeout(connect=10, read=max(20.0, ttfb_max + 5),
                             write=10, pool=10)
     playlist_url = ""
+    req_headers = dict(headers or {})
+    req_headers["Range"] = f"bytes=0-{PROBE_BYTES - 1}"
     try:
         async with _client.stream(
-            "GET", url, headers={"Range": f"bytes=0-{PROBE_BYTES - 1}"},
+            "GET", url, headers=req_headers,
             timeout=timeout,
         ) as resp:
             if resp.status_code not in (200, 206):
@@ -294,7 +301,7 @@ async def _probe_url(url: str, required: float, ttfb_max: float,
         # request URL. The class is enough for retry/reputation classification.
         return ProbeResult(False, reason=type(e).__name__)
     return await _probe_url(urljoin(playlist_url, uri), required, ttfb_max,
-                            t0, hops + 1, media=media)
+                            t0, hops + 1, media=media, headers=headers)
 
 
 async def probe_batch(
@@ -315,7 +322,8 @@ async def probe_batch(
             break
         batch = candidates[i:i + batch_size]
         results = await asyncio.gather(
-            *(probe(s["url"], need_bps_of(s), ttfb_max) for s in batch)
+            *(probe(s["url"], need_bps_of(s), ttfb_max,
+                    headers=hlsproxy.request_headers(s)) for s in batch)
         )
         for s, r in zip(batch, results):
             _record(s, r, secrets.token_urlsafe(12))
@@ -355,7 +363,8 @@ async def probe_race(
             s = candidates[nxt]
             nxt += 1
             running[asyncio.create_task(
-                probe(s["url"], need_bps_of(s), ttfb_max))] = (
+                probe(s["url"], need_bps_of(s), ttfb_max,
+                      headers=hlsproxy.request_headers(s)))] = (
                     s, secrets.token_urlsafe(12))
 
     _fill()

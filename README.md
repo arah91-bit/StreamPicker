@@ -114,6 +114,12 @@ exact size, or listing text) and verifies each release once, so extra addons
 widen coverage instead of multiplying probe work. Duplicate copies are kept
 as instant failover targets.
 
+HLS streams (many of these addons serve `.m3u8`) are proxied with rewritten
+playlists: the host only ever sees this server — with the addon's declared
+headers, from one IP — so referer-gated and IP-locked streams that would die
+on the player (especially away from home) play reliably, with per-segment
+retries and read-ahead. `PROXY_HLS=0` restores raw pass-through.
+
 ## Choosing how streams are handled
 
 The dashboard's **Stream path** switch is the main decision:

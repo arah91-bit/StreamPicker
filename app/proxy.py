@@ -37,7 +37,8 @@ from urllib.parse import urlsplit
 import httpx
 from starlette.responses import Response, StreamingResponse
 
-from app import decode_health, reputation, telemetry, usenet_health, vprobe
+from app import (decode_health, hlsproxy, reputation, telemetry,
+                 usenet_health, vprobe)
 
 logger = logging.getLogger("stream-picker")
 
@@ -211,7 +212,7 @@ def _lookup(token: str) -> dict | None:
 
 
 def _mint(cands: list[dict], pool: list[dict], media: str, media_id: str,
-          picker: str) -> str:
+          picker: str, hls: bool = False) -> str:
     token = secrets.token_urlsafe(9)
     # pool = every proxyable candidate for this title (the whole ranked list), so
     # a twin of whatever ends up playing can be found even if it sits outside this
@@ -220,6 +221,8 @@ def _mint(cands: list[dict], pool: list[dict], media: str, media_id: str,
     # splice to it.
     entry = {"cands": cands, "pool": pool, "id": media_id, "picker": picker,
              "pin": None, "total": None}
+    if hls:
+        entry["hls"] = True
     _sessions[token] = (time.time(), entry)
     _persist(token, entry)
     if len(_sessions) > 5000:                     # opportunistic prune
@@ -272,6 +275,7 @@ def _cand(s: dict) -> dict:
             "res": ident["res"], "size": ident["size"],
             "codec": ident["codec"], "hdr": ident["hdr"],
             "sig": telemetry.signature(s), "lbl": lbl,
+            "rh": hlsproxy.request_headers(s),   # upstream request headers
             "nzb_indexers": list(s.get("_nzb_indexers") or [])}
 
 
@@ -293,13 +297,34 @@ def wrap(streams: list[dict], media: str, media_id: str, picker: str) -> list[di
                 if not (_proxyable(s) and _must_wrap(s["url"]))]
     tail = [s for s in streams if _proxyable(s) and not _is_hls(s["url"])]
     pool = [_cand(x) for x in tail]          # every proxyable candidate, once
+    hls_tail = [s for s in streams if _proxyable(s) and _is_hls(s["url"])]
+    hls_pool = [_cand(x) for x in hls_tail]
     made = 0
     out = []
     for s in streams:
         if _proxyable(s) and _is_hls(s["url"]):
-            # Playlists pass through raw — unless raw is unsafe (credentials/
-            # internal host), in which case there is no way to serve them at
-            # all: wrapped they 404 every relative segment, raw they leak.
+            if hlsproxy.ENABLED:
+                # Playlist-rewriting proxy (app.hlsproxy): the player fetches
+                # everything from us, we fetch upstream with the declared
+                # headers from one IP — fixes referer-gated/IP-locked hosts
+                # and makes credentialed playlists servable. Failover
+                # candidates are the other HLS releases for this title.
+                pos = hls_tail.index(s)
+                token = _mint(hls_pool[pos:pos + MAXFAIL], hls_pool,
+                              media, media_id, picker, hls=True)
+                ns = dict(s)
+                ns["url"] = f"{PUBLIC}/proxy/{token}"
+                bh = dict(ns.get("behaviorHints") or {})
+                # The upstream headers are ours to send now; never hand the
+                # player a copy (they can carry tokens/cookies).
+                bh.pop("proxyHeaders", None)
+                ns["behaviorHints"] = bh
+                out.append(ns)
+                continue
+            # Proxying disabled: playlists pass raw — unless raw is unsafe
+            # (credentials/internal host), in which case there is no way to
+            # serve them at all: wrapped they 404 every relative segment
+            # without rewriting, raw they leak.
             if not _must_wrap(s["url"]):
                 out.append(s)
             continue
@@ -1103,6 +1128,16 @@ def _retire_failed(e: _Entry) -> None:
     t.add_done_callback(_bg_tasks.discard)
 
 
+async def serve_hls(token: str, request) -> Response:
+    """Route target for /proxy/{token}/hls — signed HLS sub-resources."""
+    entry = _lookup(token)
+    if entry is None:
+        return Response(status_code=410)
+    if not entry.get("hls"):
+        return Response(status_code=404)
+    return await hlsproxy.serve_resource(token, entry, request)
+
+
 async def _reaper() -> None:
     """Keep the cache inside its budget: drop entries idle past BUFFER_TTL, and
     when total on-disk exceeds BUFFER_CACHE_BYTES evict least-recently-used ones
@@ -1110,6 +1145,7 @@ async def _reaper() -> None:
     while True:
         await asyncio.sleep(BUFFER_REAP_INTERVAL)
         try:
+            await hlsproxy.flush_idle()   # HLS sessions account per-session
             now = time.time()
             for e in list(_entries.values()):
                 if e.consumers <= 0 and now - e.last > BUFFER_TTL:
@@ -1613,6 +1649,8 @@ async def serve(token: str, request) -> Response:
     entry = _lookup(token)
     if entry is None:
         return Response(status_code=410)          # expired -> client re-fetches
+    if entry.get("hls"):
+        return await hlsproxy.serve_master(token, entry, request)
     if request.method == "HEAD":
         return await _head(entry)
     range_header = request.headers.get("range")
