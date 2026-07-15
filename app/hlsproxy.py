@@ -37,7 +37,8 @@ from collections import OrderedDict
 from urllib.parse import urljoin, urlsplit
 
 import httpx
-from starlette.responses import RedirectResponse, Response
+from starlette.responses import (RedirectResponse, Response,
+                                 StreamingResponse)
 
 from app import decode_health, reputation, telemetry
 
@@ -223,9 +224,10 @@ def _st(token: str, entry: dict) -> dict:
     st = entry.get("_hls")
     if st is None:
         st = entry["_hls"] = {"pl": 0, "segs": 0, "bytes": 0, "t0": 0.0,
-                              "last": 0.0, "active": 0, "cand": None,
-                              "cand_idx": 0, "rejected": False,
-                              "timer": False, "credited": False}
+                              "last": time.monotonic(), "active": 0,
+                              "cand": None, "cand_idx": 0, "rejected": False,
+                              "timer": False, "credited": False,
+                              "seg_fails": 0, "struck": False}
         _active[token] = entry
     return st
 
@@ -293,6 +295,26 @@ def _note_segment(token: str, entry: dict, st: dict, size: int) -> None:
                 reason="played after player-rejected swap")
 
 
+def _note_seg_failure(token: str, entry: dict, st: dict) -> None:
+    """Segments dying under a playing session = the host is failing mid-stream.
+    Strike the release once per session so a repeat offender cools and the next
+    open serves a different one — the HLS analog of 'mid-stream-dead'."""
+    st["seg_fails"] += 1
+    if st["struck"] or st["seg_fails"] < 3:
+        return
+    st["struck"] = True
+    cand = st.get("cand") or {}
+    sig, lbl = cand.get("sig") or "", cand.get("lbl", "")
+    logger.info(f"hls: segments failing for {lbl!r} "
+                f"({st['seg_fails']} fetch failures) — cooling release")
+    if sig:
+        reputation.observe(sig, token, "hls-segments-dead", lbl)
+        reputation.cooldown(sig)
+    telemetry.record_buffer("failed", sig=sig, picker=entry.get("picker", ""),
+                            media_id=entry.get("id", ""), source=lbl,
+                            reason=f"{st['seg_fails']} segment fetch failures")
+
+
 async def flush_idle() -> None:
     """Emit one play record per HLS session once it has gone quiet — called
     from the proxy's reaper loop. HLS playback is hundreds of tiny requests,
@@ -301,7 +323,9 @@ async def flush_idle() -> None:
     for token, entry in list(_active.items()):
         st = entry.get("_hls") or {}
         if not st.get("segs") or st.get("flushed"):
-            if st.get("flushed"):
+            # Nothing to account for — but a session that never pulled a
+            # segment (rejected/abandoned) must still leave the registry.
+            if st.get("flushed") or now - (st.get("last") or now) > _FLUSH_IDLE:
                 _active.pop(token, None)
             continue
         if now - st["last"] < _FLUSH_IDLE:
@@ -414,28 +438,65 @@ async def serve_resource(token: str, entry: dict, request) -> Response:
         r = None
         for attempt in (1, 2):
             try:
-                r = await _client.get(url, headers=rh)
+                req = _client.build_request("GET", url, headers=rh)
+                r = await _client.send(req, stream=True)
                 if r.status_code in (200, 206):
                     break
+                await r.aclose()
+                r = None
             except Exception as e:
                 logger.info(f"hls: segment fetch attempt {attempt} failed "
                             f"({type(e).__name__})")
                 r = None
-        if r is None or r.status_code not in (200, 206):
+        if r is None:
+            _note_seg_failure(token, entry, st)
             return Response(status_code=502)
-        body = r.content
+        ct = r.headers.get("content-type", "video/mp2t")
+        headers = {}
+        if r.status_code == 206 and r.headers.get("content-range"):
+            headers["Content-Range"] = r.headers["content-range"]
+        # Buffer small resources (playlist sniff + cache + prefetch); a large
+        # body — a playlist URI pointing at a whole file is not unheard of —
+        # must stream through, never sit in RAM.
+        chunks: list[bytes] = []
+        got = 0
+        big = False
+        try:
+            async for chunk in r.aiter_bytes():
+                chunks.append(chunk)
+                got += len(chunk)
+                if got > _MAX_SEG_BUF:
+                    big = True
+                    break
+        except Exception:
+            await r.aclose()
+            _note_seg_failure(token, entry, st)
+            return Response(status_code=502)
+        if big:
+            async def gen(pre=chunks, resp=r):
+                try:
+                    for c in pre:
+                        yield c
+                    async for c in resp.aiter_bytes():
+                        yield c
+                finally:
+                    try:
+                        await resp.aclose()
+                    except Exception:
+                        pass
+            _note_segment(token, entry, st, got)
+            return StreamingResponse(gen(), status_code=r.status_code,
+                                     media_type=ct, headers=headers)
+        await r.aclose()
+        body = b"".join(chunks)
         if is_playlist(body):
             return _playlist_response(
                 token, entry, st, body.decode("utf-8", errors="replace"),
                 str(r.url))
-        ct = r.headers.get("content-type", "video/mp2t")
         _note_segment(token, entry, st, len(body))
         if not rng:
             _cache_put(url, body, ct)
             _prefetch_next(entry, url, rh)
-        headers = {}
-        if r.status_code == 206 and r.headers.get("content-range"):
-            headers["Content-Range"] = r.headers["content-range"]
         return Response(body, status_code=r.status_code, media_type=ct,
                         headers=headers)
     finally:

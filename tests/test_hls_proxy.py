@@ -187,5 +187,110 @@ class WrapIntegrationTests(unittest.TestCase):
                          [s["url"] for s in out])
 
 
+class SessionRegistryTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self._saved = dict(hlsproxy._active)
+        hlsproxy._active.clear()
+
+    def tearDown(self):
+        hlsproxy._active.clear()
+        hlsproxy._active.update(self._saved)
+
+    async def test_segless_sessions_leave_the_registry_after_idle(self):
+        import time
+        entry = {"picker": "fast", "id": "tt1"}
+        st = hlsproxy._st("tok-idle", entry)
+        st["last"] = time.monotonic() - hlsproxy._FLUSH_IDLE - 10
+        with patch("app.hlsproxy.telemetry.record_play") as rec:
+            await hlsproxy.flush_idle()
+        self.assertNotIn("tok-idle", hlsproxy._active)   # no leak
+        rec.assert_not_called()                          # nothing to account
+
+    async def test_played_sessions_flush_one_play_record(self):
+        import time
+        entry = {"picker": "fast", "id": "tt1"}
+        st = hlsproxy._st("tok-played", entry)
+        st.update({"segs": 40, "bytes": 200_000_000,
+                   "t0": time.monotonic() - 1200,
+                   "last": time.monotonic() - hlsproxy._FLUSH_IDLE - 10,
+                   "cand": {"sig": "x", "lbl": "HLS 1080p", "res": 1080}})
+        with patch("app.hlsproxy.telemetry.record_play") as rec:
+            await hlsproxy.flush_idle()
+            await hlsproxy.flush_idle()                  # idempotent
+        rec.assert_called_once()
+        self.assertEqual(200_000_000, rec.call_args.kwargs["served"])
+        self.assertNotIn("tok-played", hlsproxy._active)
+
+
+class SegmentFailureTests(unittest.TestCase):
+    def test_three_failures_strike_the_release_once(self):
+        entry = {"picker": "fast", "id": "tt1"}
+        st = hlsproxy._st("tok-f", entry)
+        hlsproxy._active.pop("tok-f", None)
+        st["cand"] = {"sig": "file:dead", "lbl": "HLS 1080p"}
+        with (patch("app.hlsproxy.reputation.observe") as observe,
+              patch("app.hlsproxy.reputation.cooldown") as cooldown,
+              patch("app.hlsproxy.telemetry.record_buffer")):
+            for _ in range(5):
+                hlsproxy._note_seg_failure("tok-f", entry, st)
+        observe.assert_called_once()
+        self.assertEqual("hls-segments-dead", observe.call_args.args[2])
+        cooldown.assert_called_once_with("file:dead")
+
+
+class LargeBodyStreamingTests(unittest.IsolatedAsyncioTestCase):
+    """A playlist URI pointing at a whole movie file must stream through,
+    never sit in RAM."""
+
+    async def test_oversized_body_streams_instead_of_buffering(self):
+        from starlette.requests import Request
+        from starlette.responses import StreamingResponse
+
+        big_chunk = b"x" * (1024 * 1024)
+
+        class FakeResp:
+            status_code = 200
+            headers = {"content-type": "video/mp4"}
+
+            def __init__(self):
+                self._sent = 0                            # one stream, like httpx
+
+            async def aiter_bytes(self):
+                while self._sent < 80:                    # 80 MB total
+                    self._sent += 1
+                    yield big_chunk
+
+            async def aclose(self):
+                pass
+
+        class FakeClient:
+            def build_request(self, method, url, headers=None):
+                return (method, url)
+
+            async def send(self, req, stream=False):
+                return FakeResp()
+
+        entry = {"picker": "fast", "id": "tt1",
+                 "cands": [{"sig": "s", "lbl": "x", "u": "u", "rh": {}}]}
+        url = "https://cdn.example/whole-movie.mp4"
+        token = "tok-big"
+        import base64
+        u = base64.urlsafe_b64encode(url.encode()).decode().rstrip("=")
+        q = f"u={u}&s={hlsproxy._sign(token, url)}"
+        req = Request({"type": "http", "method": "GET", "path": "/",
+                       "query_string": q.encode(), "headers": []})
+        with patch.object(hlsproxy, "_client", FakeClient()):
+            with patch.object(hlsproxy, "_MAX_SEG_BUF", 4 * 1024 * 1024):
+                resp = await hlsproxy.serve_resource(token, entry, req)
+        hlsproxy._active.pop(token, None)
+        self.assertIsInstance(resp, StreamingResponse)
+        self.assertNotIn(url, hlsproxy._seg_cache)        # too big to cache
+        # drain the generator to prove pass-through works end to end
+        total = 0
+        async for chunk in resp.body_iterator:
+            total += len(chunk)
+        self.assertEqual(80 * 1024 * 1024, total)
+
+
 if __name__ == "__main__":
     unittest.main()
