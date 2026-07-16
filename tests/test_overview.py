@@ -143,5 +143,27 @@ class NowPlayingTests(unittest.TestCase):
         self.assertNotIn("&amp;amp;", page)              # not double-escaped
 
 
+class AddonLinksTests(unittest.TestCase):
+    def test_links_render_with_copy_buttons(self):
+        addons = [("Auto Stream",
+                   "https://addon.example/sec/manifest.json"),
+                  ("Auto Stream (Best Quality)",
+                   "https://addon.example/sec/slow/manifest.json")]
+        page = overview.render([], addons=addons)
+        self.assertIn("Addon install links", page)
+        for _, url in addons:
+            self.assertIn(url, page)
+        self.assertIn("copybtn", page)
+        # LAN dashboards are plain http (non-secure context): the clipboard
+        # API is unavailable there, so the fallback must ship too.
+        self.assertIn("navigator.clipboard", page)
+        self.assertIn("execCommand", page)
+
+    def test_no_panel_or_script_without_links(self):
+        page = overview.render([])
+        self.assertNotIn("Addon install links", page)
+        self.assertNotIn("navigator.clipboard", page)
+
+
 if __name__ == "__main__":
     unittest.main()

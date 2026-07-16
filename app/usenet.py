@@ -441,6 +441,21 @@ def _episode_match(text: str, season: int, episode: int) -> bool:
     return True
 
 
+def _episode_range_match(text: str, season: int, episode: int) -> bool:
+    """Explicit same-season episode range spanning the requested episode.
+
+    Kids' shows ship as two-segment bundles ("S13E07-E08", AMZN's
+    "S13E07-08") — for those the bundle IS the broadcast episode, and it is
+    frequently the only English release of a segment."""
+    for match in re.finditer(
+            rf"(?<![A-Za-z0-9])S0*{season}[\s._-]*E0*(\d+)[\s._-]*"
+            rf"(?:-|to|thru|through)[\s._-]*(?:S0*{season})?[\s._-]*E?0*(\d+)"
+            r"(?!\d)", text or "", re.I):
+        if int(match.group(1)) <= episode <= int(match.group(2)):
+            return True
+    return False
+
+
 def _season_pack_match(text: str, season: int, episode: int) -> bool:
     """Whether a title names a season bundle that should contain the episode.
 
@@ -450,12 +465,8 @@ def _season_pack_match(text: str, season: int, episode: int) -> bool:
     explicit episode range spanning the request.
     """
     t = text or ""
-    for match in re.finditer(
-            rf"(?<![A-Za-z0-9])S0*{season}[\s._-]*E0*(\d+)[\s._-]*"
-            rf"(?:-|to|thru|through)[\s._-]*(?:S0*{season})?[\s._-]*E?0*(\d+)"
-            r"(?!\d)", t, re.I):
-        if int(match.group(1)) <= episode <= int(match.group(2)):
-            return True
+    if _episode_range_match(t, season, episode):
+        return True
     if re.search(rf"(?<![A-Za-z0-9])(?:S|Season[\s._-]*)0*{season}"
                  r"(?![A-Za-z0-9])", t, re.I):
         # A same-season episode token means this is a single episode (or a
@@ -486,6 +497,10 @@ def _text_queries(media: str, parts: list[str], titles: list[str],
             queries.append(f"{q} {year}" if year else q)
         else:
             queries.append(f"{q} S{int(parts[1]):02d}E{int(parts[2]):02d}")
+            # Double-episode bundles ("S13E07-E08") and season packs never
+            # match an exact SxxEyy text query; a season-level query recovers
+            # them and the strict matchers keep everything else out.
+            queries.append(f"{q} S{int(parts[1]):02d}")
     return list(dict.fromkeys(queries))
 
 
@@ -1173,6 +1188,56 @@ def _record_import_failure(release: dict, kind: str, reason: str,
         evidence_id=evidence or f"{attempt}:accepted={int(accepted)}")
 
 
+async def _dav_tree(path: str, release: dict | None = None,
+                    failure_seen: set[str] | None = None,
+                    ) -> list[tuple[str, int]] | None:
+    """Depth-1 listing plus a bounded descent into subdirectories.
+
+    nzbdav usually mounts video files at the job root, but some imports
+    materialize the release's own folder inside the job dir (live incident
+    2026-07-15: a playable bundle was struck "not-video" twice because its
+    mkv sat one level down).  Two levels and eight directories cover every
+    layout nzbdav produces while bounding the PROPFIND fan-out."""
+    top = await _dav_list(path, release, failure_seen)
+    if top is None:
+        return None
+    out = list(top)
+    root = path.rstrip("/")
+    frontier = [(href, 1) for href, size in top
+                if _dav_dir_candidate(href, size, root)]
+    visited = 0
+    while frontier:
+        href, depth = frontier.pop(0)
+        if depth > 2 or visited >= 8:
+            break
+        visited += 1
+        sub = await _dav_list(href.rstrip("/"), release, failure_seen)
+        for h, s in sub or []:
+            if h.rstrip("/") == href.rstrip("/"):
+                continue
+            out.append((h, s))
+            if _dav_dir_candidate(h, s, root):
+                frontier.append((h, depth + 1))
+    return out
+
+
+def _dav_dir_candidate(href: str, size: int, root: str) -> bool:
+    """Whether a listed entry looks like a subdirectory worth descending.
+
+    nzbdav's PROPFIND returns collection hrefs WITHOUT a trailing slash, and
+    release-named folders are full of dots ("PAW.Patrol...H.264-GRP"), so
+    only a short file-style extension marks a zero-size entry as a file.
+    Listing a plain file by mistake costs one bounded PROPFIND."""
+    h = href.rstrip("/")
+    if not h or h == root:
+        return False
+    if href.endswith("/"):
+        return True
+    if size:
+        return False
+    return not re.search(r"\.[A-Za-z0-9]{1,5}$", h.rsplit("/", 1)[-1])
+
+
 _VIDEO_EXT = (".mkv", ".mp4", ".avi", ".m2ts", ".ts", ".wmv")
 _UNSUPPORTED_MOUNT_RE = re.compile(
     r"(?:^|/)(?:bdmv)(?:/|$)|\.(?:iso|img)$", re.I)
@@ -1282,16 +1347,23 @@ def _basename_identity(href: str, release: dict,
 
     requested = episode
     tokens = _episode_tokens(stem)
-    if requested and tokens and requested not in tokens:
+    # A range spanning the request ("S13E07-E08" asked for E08) is this
+    # episode: two-segment shows publish the broadcast half-hour as one file,
+    # and _episode_tokens alone would read it as E07 and call it wrong.
+    range_hit = bool(requested and _episode_range_match(stem, *requested))
+    if requested and tokens and requested not in tokens and not range_hit:
         return "contradiction", evidence + ["basename-episode-mismatch"], "wrong-episode"
-    episode_exact = bool(requested and _episode_match(stem, *requested))
+    episode_exact = bool(requested and (range_hit
+                                        or _episode_match(stem, *requested)))
     if requested and tokens and not episode_exact:
         # The requested token began a range/multi-episode bundle.
         return "contradiction", evidence + ["basename-episode-bundle"], "wrong-episode"
     if year and years and year not in years:
         return "contradiction", evidence + ["basename-year-mismatch"], "wrong-year"
     if title_exact and episode_exact:
-        return "strong", evidence + ["basename-episode"], ""
+        marks = ["basename-episode"] + (["basename-episode-range"]
+                                        if range_hit else [])
+        return "strong", evidence + marks, ""
     if title_exact:
         return "compatible", evidence + ["basename-episode-missing"], ""
     if episode_exact:
@@ -1478,7 +1550,7 @@ async def _mount(release: dict, cat: str, delay: float = 0,
     job = base_job
     dir_path = f"/content/{cat}/{base_job}"
     failure_seen: set[str] = set()
-    entries = await _dav_list(dir_path, release, failure_seen)
+    entries = await _dav_tree(dir_path, release, failure_seen)
     # Scoped release keys intentionally change the deterministic job suffix.
     # Probe the legacy title+size mount once so upgrades can reuse existing
     # content, but validate its basename below before it becomes a candidate.
@@ -1535,6 +1607,7 @@ async def _mount(release: dict, cat: str, delay: float = 0,
                 return None
     video, identity_confidence, identity_evidence, identity_reason = (
         _pick_video_identity(entries or [], release, episode))
+    shape_settled = False
     if not video:
         deadline = time.monotonic() + MOUNT_WAIT
         next_history_check = time.monotonic() + 1.5
@@ -1544,7 +1617,7 @@ async def _mount(release: dict, cat: str, delay: float = 0,
         while time.monotonic() < deadline:
             await asyncio.sleep(min(poll_delay,
                                     max(0.01, deadline - time.monotonic())))
-            listed = await _dav_list(dir_path, release, failure_seen)
+            listed = await _dav_tree(dir_path, release, failure_seen)
             if listed is not None:
                 entries = listed
                 directory_seen = True
@@ -1564,6 +1637,7 @@ async def _mount(release: dict, cat: str, delay: float = 0,
             unsupported = any(_UNSUPPORTED_MOUNT_RE.search(unquote(href))
                               for href, _ in (entries or []))
             if unsupported or stable_count >= 3:
+                shape_settled = True
                 break
             now = time.monotonic()
             if now >= next_history_check:
@@ -1579,6 +1653,15 @@ async def _mount(release: dict, cat: str, delay: float = 0,
     if not video:
         failure_reason = _missing_content_reason(
             entries or [], episode, directory_seen, identity_reason)
+        # A "not-video" verdict is only trustworthy when the layout held
+        # still for three observations (or was terminal ISO/BDMV).  When the
+        # deadline expires mid-import, a directory without its video yet is
+        # "import still running", never proof of junk content — a playable
+        # release earned a 24h hard strike this way (PAW Patrol, 2026-07-15).
+        # Identity contradictions (wrong-*) stay hard: those come from a
+        # mounted video file that positively named other content.
+        if failure_reason == "not-video" and not shape_settled:
+            failure_reason = "never-appeared"
         failure_text = {
             "wrong-episode": "no matching video",
             "wrong-title": "mounted video title contradicted the request",

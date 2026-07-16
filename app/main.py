@@ -302,13 +302,30 @@ async def stream_slow_mobile(secret: str, media: str, media_id: str):
 
 
 # ── local admin dashboard (clean paths, no secret; see _admin guard) ─────────
+def _addon_links(request: Request) -> list[tuple[str, str]]:
+    """Manifest URLs for every picker variant, ready to paste into Stremio.
+    Prefer the configured public URL; a plain-LAN install falls back to the
+    address the dashboard itself was reached on."""
+    base = (os.environ.get("ADDON_PUBLIC_URL") or "").rstrip("/")
+    if not base:
+        base = str(request.base_url).rstrip("/")
+    return [
+        (ADDON_NAME, f"{base}/{SECRET}/manifest.json"),
+        (SLOW_NAME, f"{base}/{SECRET}/slow/manifest.json"),
+        (f"{ADDON_NAME} (Mobile)", f"{base}/{SECRET}/mobile/manifest.json"),
+        (f"{SLOW_NAME} (Mobile)",
+         f"{base}/{SECRET}/slow/mobile/manifest.json"),
+    ]
+
+
 @app.get("/")
 async def dash_home(request: Request):
     if adminui.setup_required():
         _setup_local(request)
         return HTMLResponse(adminui.setup_page(ADDON_NAME))
     await _admin(request)
-    return HTMLResponse(overview.render(telemetry.load()))
+    return HTMLResponse(overview.render(telemetry.load(),
+                                        addons=_addon_links(request)))
 
 
 @app.post("/api/admin/setup", status_code=201)

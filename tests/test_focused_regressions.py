@@ -160,6 +160,7 @@ class PrefetchCacheRegressionTests(unittest.IsolatedAsyncioTestCase):
                     mock.patch.object(picker, "_cache", {}), \
                     mock.patch.object(picker, "_background", {}), \
                     mock.patch.object(picker, "_prefetching", set()), \
+                    mock.patch.object(picker, "_PREFETCH_SETTLE", 0), \
                     mock.patch.object(
                         picker, "_next_episode",
                         new=mock.AsyncMock(return_value=nxt)), \
@@ -192,6 +193,7 @@ class PrefetchCacheRegressionTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(picker, "_cache", {}), \
                 mock.patch.object(picker, "_background", {}), \
                 mock.patch.object(picker, "_prefetching", set()), \
+                mock.patch.object(picker, "_PREFETCH_SETTLE", 0), \
                 mock.patch.object(
                     picker, "_next_episode",
                     new=mock.AsyncMock(return_value=nxt)), \
@@ -217,6 +219,7 @@ class PrefetchCacheRegressionTests(unittest.IsolatedAsyncioTestCase):
                     picker, "_background",
                     {"full:series:tt9999999:1:1": current_finisher}), \
                 mock.patch.object(picker, "_prefetching", set()), \
+                mock.patch.object(picker, "_PREFETCH_SETTLE", 0), \
                 mock.patch.object(picker, "_PREFETCH_QUIESCE_POLL", 0.01), \
                 mock.patch.object(
                     picker, "_next_episode",
@@ -238,6 +241,7 @@ class PrefetchCacheRegressionTests(unittest.IsolatedAsyncioTestCase):
                         picker, "_background",
                         {"full:series:tt9999999:1:1": never_done}), \
                     mock.patch.object(picker, "_prefetching", set()), \
+                    mock.patch.object(picker, "_PREFETCH_SETTLE", 0), \
                     mock.patch.object(picker, "_PREFETCH_QUIESCE_POLL", 0.01), \
                     mock.patch.object(picker, "_PREFETCH_QUIESCE_MAX", 0.03), \
                     mock.patch.object(

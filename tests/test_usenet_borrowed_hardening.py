@@ -188,6 +188,47 @@ class SeasonPackMatchTests(unittest.TestCase):
         self.assertEqual("compatible", confidence)
 
 
+class DoubleEpisodeBundleTests(unittest.TestCase):
+    """Two-segment kids' shows publish 'S13E07-E08' bundles — often the only
+    English release of a segment (live incident: PAW Patrol S13E08)."""
+
+    def test_range_spanning_request_is_admitted_as_bundle(self):
+        for title in ("PAW.Patrol.S13E07-E08.Pups.Save.the.One-Man.Band.1080p",
+                      "PAW.Patrol.S13E07-08.Hum.Kicker.One.Man.Band.1080p"):
+            self.assertTrue(usenet._episode_range_match(title, 13, 8), title)
+            self.assertTrue(usenet._season_pack_match(title, 13, 8), title)
+            self.assertFalse(usenet._episode_match(title, 13, 8), title)
+
+    def test_range_not_spanning_request_is_rejected(self):
+        self.assertFalse(usenet._episode_range_match(
+            "PAW.Patrol.S13E05-E06.Alien.Grandpa.1080p", 13, 8))
+        self.assertFalse(usenet._episode_range_match(
+            "PAW.Patrol.S12E07-E08.Old.Season.1080p", 13, 8))
+
+    def test_bundle_file_serves_the_requested_episode(self):
+        release = {"_nzb_pack": True,
+                   "_nzb_expected": {"media": "series",
+                                     "titles": ["PAW Patrol"],
+                                     "year": None}}
+        entries = [("/content/tv/job/PAW.Patrol.S13E07-E08.Pups.Save.the."
+                    "One-Man.Band.1080p.WEB-DL.mkv", 1_500_000_000)]
+        video, confidence, evidence, _ = usenet._pick_video_identity(
+            entries, release, (13, 8))
+        self.assertEqual(entries[0], video)
+        self.assertEqual("strong", confidence)
+        self.assertIn("basename-episode-range", evidence)
+
+    def test_wrong_bundle_file_still_refused(self):
+        release = {"_nzb_pack": True,
+                   "_nzb_expected": {"media": "series",
+                                     "titles": ["PAW Patrol"],
+                                     "year": None}}
+        entries = [("/content/tv/job/PAW.Patrol.S13E05-E06.Alien.Grandpa"
+                    ".1080p.WEB-DL.mkv", 1_500_000_000)]
+        video, _, _, _ = usenet._pick_video_identity(entries, release, (13, 8))
+        self.assertIsNone(video)
+
+
 class TextQueryTests(unittest.TestCase):
     def test_query_text_folds_for_indexer_fulltext(self):
         self.assertEqual("Amelie", usenet._query_text("Amélie"))
@@ -195,8 +236,10 @@ class TextQueryTests(unittest.TestCase):
                          usenet._query_text("It's a Test: Story!"))
 
     def test_text_queries_carry_episode_or_year(self):
-        self.assertEqual(["Example Show S01E02"], usenet._text_queries(
-            "series", ["tt1", "1", "2"], ["Example Show"], 2024))
+        self.assertEqual(["Example Show S01E02", "Example Show S01"],
+                         usenet._text_queries(
+                             "series", ["tt1", "1", "2"],
+                             ["Example Show"], 2024))
         self.assertEqual(["Amelie 2001"], usenet._text_queries(
             "movie", ["tt1"], ["Amélie"], 2001))
 

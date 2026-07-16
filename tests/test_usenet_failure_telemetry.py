@@ -126,11 +126,18 @@ class FailureTelemetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("HTTP 503", fields["detail"])
 
     async def test_mounted_non_video_content_records_a_hard_failure(self) -> None:
+        # The junk verdict requires a layout that held still for three
+        # observations — a settled mount full of non-video really is junk.
         release = _release()
         entries = [("/content/movies/job/readme.txt", 100)]
         with mock.patch.object(
                 usenet, "_dav_list", new=mock.AsyncMock(return_value=entries)), \
-                mock.patch.object(usenet, "MOUNT_WAIT", 0), \
+                mock.patch.object(usenet, "MOUNT_WAIT", 0.2), \
+                mock.patch.object(
+                    usenet.asyncio, "sleep", new=mock.AsyncMock()), \
+                mock.patch.object(
+                    usenet, "_history_failure",
+                    new=mock.AsyncMock(return_value=None)), \
                 mock.patch.object(
                     usenet.usenet_health, "record_failure", return_value=True), \
                 mock.patch.object(
@@ -142,6 +149,77 @@ class FailureTelemetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("nzbdav-content", fields["stage"])
         self.assertEqual("hard", fields["decision"])
         self.assertEqual("not-video", fields["reason"])
+
+    async def test_video_nested_in_release_folder_is_found(self) -> None:
+        # Some imports materialize the release's own folder inside the job
+        # dir; the mkv one level down must be found (live incident: a
+        # playable bundle was struck not-video twice for this).
+        release = _release()
+
+        async def dav(path, release=None, seen=None):
+            # Real nzbdav shape: collection hrefs carry NO trailing slash
+            # and the inner folder is a dotted release name; the listing
+            # also echoes the requested dir itself.
+            if path.endswith("Example.Movie.2024.4K.WEB-DL-GROUP"):
+                return [(path, 0),
+                        (f"{path}/Example.Movie.2024.4K.WEB-DL-GROUP.mkv",
+                         5_000_000_000)]
+            return [(path, 0), (f"{path}/Example.Movie.2024.4K.WEB-DL-GROUP", 0)]
+
+        with mock.patch.object(usenet, "_dav_list", new=dav), \
+                mock.patch.object(usenet, "MOUNT_WAIT", 0):
+            stream = await usenet._mount(release, "movies")
+
+        self.assertIsNotNone(stream)
+        self.assertTrue(stream["url"].endswith(
+            "Example.Movie.2024.4K.WEB-DL-GROUP.mkv"))
+
+    async def test_dav_tree_descent_is_bounded(self) -> None:
+        calls = []
+
+        async def dav(path, release=None, seen=None):
+            calls.append(path)
+            return [(f"{path}/deeper/", 0)]
+
+        with mock.patch.object(usenet, "_dav_list", new=dav):
+            out = await usenet._dav_tree("/content/movies/job")
+
+        # top-level + at most two nested levels; endless chains stop.
+        self.assertLessEqual(len(calls), 4)
+        self.assertTrue(any(h.endswith("/deeper/") for h, _ in out))
+
+    async def test_deadline_expiry_mid_import_never_strikes_hard(self) -> None:
+        # A directory still materializing when MOUNT_WAIT expires is "import
+        # still running", not junk — a playable release earned a 24h
+        # not-video strike this way (PAW Patrol incident, 2026-07-15).  The
+        # changing shape means stability is never reached.
+        release = _release()
+        state = {"n": 0}
+
+        async def dav(path, release=None, seen=None):
+            # A listing that grows on every observation: the import is
+            # materializing files, so the shape never holds still.
+            state["n"] += 1
+            return [(f"/content/movies/job/part{i}.nfo", 100 + i)
+                    for i in range(state["n"])]
+
+        with mock.patch.object(usenet, "_dav_list", new=dav), \
+                mock.patch.object(usenet, "MOUNT_WAIT", 0.05), \
+                mock.patch.object(
+                    usenet.asyncio, "sleep", new=mock.AsyncMock()), \
+                mock.patch.object(
+                    usenet, "_history_failure",
+                    new=mock.AsyncMock(return_value=None)), \
+                mock.patch.object(
+                    usenet.usenet_health, "record_failure", return_value=True), \
+                mock.patch.object(
+                    usenet.telemetry, "record_usenet_failure") as record:
+            self.assertIsNone(await usenet._mount(release, "movies"))
+
+        record.assert_called_once()
+        fields = record.call_args.kwargs
+        self.assertEqual("transient", fields["decision"])
+        self.assertEqual("never-appeared", fields["reason"])
 
     async def test_never_appeared_records_a_transient_mount_timeout(self) -> None:
         release = _release()

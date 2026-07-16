@@ -129,6 +129,20 @@ border-radius:12px;padding:18px 16px;text-align:center}
 .np-card .prog-label{font:11px var(--mono);color:var(--mut);margin-top:5px;
  display:flex;justify-content:space-between}
 
+.addons .arow{display:flex;align-items:center;gap:12px;padding:9px 0;
+ border-bottom:1px solid var(--line)}
+.addons .arow:last-child{border-bottom:0}
+.addons .aname{flex:0 0 auto;font-size:13px;font-weight:600;white-space:nowrap}
+.addons .aurl{flex:1 1 auto;min-width:0;font:12px var(--mono);color:var(--mut);
+ overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.copybtn{flex:0 0 auto;font-size:12px;padding:5px 14px;border-radius:16px;
+ border:1px solid var(--line);background:var(--card);color:var(--accent);
+ cursor:pointer}
+.copybtn:hover{border-color:var(--accent)}
+.copybtn.ok{color:var(--good);border-color:var(--good)}
+@media (max-width:560px){.addons .arow{flex-wrap:wrap}
+.addons .aurl{flex-basis:100%;order:3}}
+
 @media (prefers-reduced-motion:reduce){*{transition:none!important}
 .np .dot{animation:none}}
 """
@@ -278,7 +292,43 @@ def _reason_label(code: str) -> str:
     return code.replace("-", " ").capitalize() if code else "Unknown"
 
 
-def render(recs: list[dict]) -> str:
+def _addons_panel(addons: list[tuple[str, str]] | None) -> str:
+    """Install links for every picker variant, each with a copy button."""
+    if not addons:
+        return ""
+    rows = "".join(
+        f"<div class='arow'><div class='aname'>{_esc(name)}</div>"
+        f"<div class='aurl'>{_esc(url)}</div>"
+        f"<button class='copybtn' data-url='{_esc(url)}' "
+        f"onclick='cp(this)'>Copy</button></div>"
+        for name, url in addons)
+    return ("<h2>Addon install links <span class='hint'>paste into Stremio's "
+            "addon search on any device</span></h2>"
+            f"<div class='panel addons'>{rows}</div>")
+
+
+# The dashboard is usually reached over plain LAN http, where the async
+# clipboard API is unavailable (non-secure context) — keep the textarea
+# fallback or the buttons silently do nothing on http://<lan-ip>.
+_COPY_JS = """<script>
+function cp(btn){
+  var url = btn.dataset.url;
+  var done = function(){btn.textContent='Copied \\u2713';
+    btn.classList.add('ok');
+    setTimeout(function(){btn.textContent='Copy';
+      btn.classList.remove('ok');}, 1600);};
+  if (navigator.clipboard && window.isSecureContext){
+    navigator.clipboard.writeText(url).then(done); return;
+  }
+  var ta = document.createElement('textarea');
+  ta.value = url; ta.style.position = 'fixed'; ta.style.opacity = '0';
+  document.body.appendChild(ta); ta.select();
+  document.execCommand('copy'); document.body.removeChild(ta); done();
+}
+</script>"""
+
+
+def render(recs: list[dict], addons: list[tuple[str, str]] | None = None) -> str:
     plays = [r for r in recs if r.get("kind") == "play"]
     probes = [r for r in recs if r.get("kind") == "probe"]
     nzb_probes = [r for r in probes if r.get("lane") == "nzb"]
@@ -509,4 +559,5 @@ def render(recs: list[dict]) -> str:
 {usenet_section}
 {recs_html}
 {spark}
-</div></body></html>"""
+{_addons_panel(addons)}
+</div>{_COPY_JS if addons else ''}</body></html>"""

@@ -2492,6 +2492,7 @@ async def _next_episode(media_id: str) -> str | None:
     return f"{base}:{se[0]}:{se[1]}" if se else None
 
 
+_PREFETCH_SETTLE = 180.0
 _PREFETCH_QUIESCE_POLL = 5.0
 _PREFETCH_QUIESCE_MAX = 600.0
 
@@ -2526,6 +2527,13 @@ async def prefetch_next(media: str, media_id: str, picker_label: str) -> None:
     try:
         profile = "mobile" if "mob" in (picker_label or "") else "full"
         slow = "slow" in (picker_label or "")
+        # Let playback settle first.  The trigger fires at the stream's very
+        # first byte — the moment the start gate is measuring throughput —
+        # and a prefetch probe wave there can strangle that measurement into
+        # 'too slow' failures (live incident 2026-07-15: 41s of 502s while
+        # the prefetch's slow merge probed 65 candidates).  The viewer needs
+        # E+1 in twenty minutes, not twenty seconds.
+        await asyncio.sleep(_PREFETCH_SETTLE)
         deadline = time.monotonic() + _PREFETCH_QUIESCE_MAX
         while (_episode_work_active(media, media_id)
                and time.monotonic() < deadline):
