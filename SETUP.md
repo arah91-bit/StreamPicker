@@ -55,11 +55,11 @@ source; add the rest later from the dashboard.
 The smallest thing that streams something:
 
 1. Get a **debrid** account (TorBox or Real-Debrid).
-2. Get one **search addon** configured with that debrid key — a **Comet** base
-   URL is the usual choice.
-3. Get a free **TMDB** API key.
-4. Run this app (steps below), paste those two values + the key into the
-   dashboard, and install the addon in your player.
+2. Run this app (steps below) and open the dashboard: the **guided setup**
+   asks which debrid you have, takes its API key, and builds + live-tests
+   the search lanes itself. No addon URLs to assemble.
+3. Optionally paste a free **TMDB** API key on the same page.
+4. Install the addon links it hands you in your player.
 
 Everything else — more sources, usenet, the library, auto-acquire, a public
 domain — is additive and can wait.
@@ -104,10 +104,16 @@ In a browser on your LAN:
 ```
 http://<this-host-LAN-IP>:8011/
 ```
-No secret in this URL — the dashboard is LAN-only by default. You'll land on
-**Overview** (empty until you've watched something). Go to the **Settings** tab.
+No secret in this URL — the dashboard is LAN-only by default. After creating
+your administrator account you land on the **guided setup**: switch on your
+debrid service(s), paste the API key, optionally add TMDB and your public
+URL, and hit **Set up my streams**. Keys are verified against the debrid
+itself and each lane must return real streams before anything is saved; one
+restart later your install links are on the Overview tab. If you use it, skip
+straight to Step 6 — Step 5 is the manual alternative (it's also where
+usenet, *arr and library connections live, any time later).
 
-### Step 5 — connect at least one source
+### Step 5 — connect sources manually (optional)
 On **Settings → Connections**:
 1. Paste your **Comet** base URL into the Comet field (the URL that embeds your
    debrid key — it looks like `https://comet…/<long-config-string>`).

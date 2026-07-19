@@ -30,7 +30,7 @@ except ValueError as exc:
 from app import (acquire, admin_auth, adminui, connections, dashboard, envref,  # noqa: E402
                  library, meta, overview, picker, probe, proxy, reputation,
                  settings_ui, sources, tbcache, telemetry, usenet,
-                 usenet_health, vprobe)
+                 usenet_health, vprobe, wizard)
 
 NOTICE_FILE = pathlib.Path(__file__).parent / "static" / "notice.mp4"
 NOTICE_THEATRICAL_FILE = (pathlib.Path(__file__).parent / "static"
@@ -326,8 +326,31 @@ async def dash_home(request: Request):
         _setup_local(request)
         return HTMLResponse(adminui.setup_page(ADDON_NAME))
     await _admin(request)
+    if wizard.needed():
+        # Fresh install with no stream source yet: the overview would be an
+        # empty ledger, so the home tab walks through setup instead.
+        return HTMLResponse(wizard.render())
     return HTMLResponse(overview.render(telemetry.load(),
                                         addons=_addon_links(request)))
+
+
+@app.get("/setup")
+async def setup_wizard(request: Request):
+    """The guided first-run setup; revisitable any time by URL."""
+    await _admin(request)
+    return HTMLResponse(wizard.render())
+
+
+@app.post("/api/setup/apply")
+async def setup_apply(request: Request):
+    """Mint source URLs from the wizard's picks, live-test them, save what
+    passed. Same mutation gate as every settings write."""
+    await _admin(request, mutation=True)
+    body = await _json_body(request)
+    try:
+        return await wizard.apply(body)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.post("/api/admin/setup", status_code=201)

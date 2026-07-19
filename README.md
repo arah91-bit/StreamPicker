@@ -56,10 +56,18 @@ your own username and a password of at least 12 characters. Later visits use
 that account through the browser's normal sign-in prompt. For unattended deployment, preseed
 `ADMIN_USERNAME` and `ADMIN_PASSWORD` in `.env` to skip enrollment.
 
+After signing in you land on the **guided setup**: switch on the debrid
+service(s) you have — TorBox, Real-Debrid, AllDebrid, Premiumize — and paste
+the API key. That's the whole setup: the wizard builds and live-tests the
+search lanes for you (your key is verified against the debrid itself, and
+each lane must actually return streams before it's saved), then restarts and
+hands you the install links. It's revisitable any time at `/setup`.
+
 It's one site with three tabs you click between — **Overview**, **Settings**,
 **Source health**. On Settings, each service has a **Test** button that checks
 your URL/key before you save; hit **Save**, then **Restart addon** to apply.
-Settings live in `./data/config.json` and survive rebuilds.
+Settings live in `./data/config.json` and survive rebuilds. Usenet indexers,
+Radarr/Sonarr, a Jellyfin library, and extra addons are added there too.
 
 The dashboard is **authenticated and local-only by default** — it answers to
 loopback/LAN/Docker clients but not to requests coming through a public reverse
