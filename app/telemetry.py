@@ -554,6 +554,22 @@ def record_buffer(event: str, *, sig: str = "", picker: str = "",
     })
 
 
+def record_tbcache(media_id: str, stream: dict, *, res: int,
+                   status: str) -> None:
+    """One record per TorBox auto-cache trigger (kind=tbcache): which uncached
+    release we asked TorBox to start downloading for a title, its evidence-
+    backed resolution, and what the upstream playback endpoint answered."""
+    _append({
+        "ts": round(time.time(), 1),
+        "kind": "tbcache",
+        "id": media_id,
+        "label": (stream.get("name") or "").replace("\n", " ")[:60],
+        "file": (stream.get("behaviorHints", {}).get("filename") or "")[:80],
+        "res": res,
+        "status": str(status)[:40],
+    })
+
+
 def aggregate_play(recs: list[dict], key: str, min_n: int = 1) -> list[dict]:
     """Group real-playback records by identity: how often the source died, how
     often we had to switch away from it, and the real throughput/watched-fraction."""

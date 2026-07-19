@@ -45,7 +45,8 @@ from urllib.parse import urlsplit
 import httpx
 
 from app import (acquire, content_identity, decode_health, library, meta, probe,
-                 reputation, sources, telemetry, usenet as nzb_lane, vprobe)
+                 reputation, sources, tbcache, telemetry, usenet as nzb_lane,
+                 vprobe)
 
 logger = logging.getLogger("stream-picker")
 
@@ -1697,6 +1698,7 @@ async def _finish_in_background(cache_key: str, media: str, media_id: str,
             finish_slice, runtime, USENET_TTFB_MAX, len(finish_slice),
             time.monotonic() + SLOW_FINISH_DEADLINE)
         verified = _combine_verified(inherited, probed)
+        _tb_autocache(media, media_id, verified, runtime)
         if verified:
             # Off-clock, so measure true video bitrate of the leaders too: the
             # cached answer a retry gets should be compression-honest, not
@@ -1715,6 +1717,21 @@ async def _finish_in_background(cache_key: str, media: str, media_id: str,
         logger.exception(f"{cache_key}: background verification failed")
     finally:
         _background.pop(cache_key, None)
+
+
+def _tb_autocache(media: str, media_id: str,
+                  verified: list[tuple[dict, probe.ProbeResult | None]],
+                  runtime: float) -> None:
+    """Fire-and-forget: when this pick's outcome is weak (nothing verified, or
+    only below what an uncached TorBox torrent offers), ask TorBox to start
+    caching a better copy for the next visit. See app.tbcache."""
+    if not tbcache.enabled():
+        return
+    best = max((int(s.get("_effres") or _resolution(s)) for s, _ in verified),
+               default=0)
+    t = asyncio.create_task(tbcache.maybe_cache(media, media_id, best, runtime))
+    _acquire_tasks.add(t)
+    t.add_done_callback(_acquire_tasks.discard)
 
 
 def _count_tiers(verified: list[tuple[dict, probe.ProbeResult | None]]) -> tuple[int, int]:
@@ -2227,6 +2244,7 @@ async def _finish_slow(cache_key: str, media: str, media_id: str,
             time.monotonic() + SLOW_FINISH_DEADLINE)
         await _refine_video_bitrate(verified, runtime, 45)
         all_verified = _combine_verified(fast_verified, verified)
+        _tb_autocache(media, media_id, all_verified, runtime)
         if all_verified:
             vurls = {v.get("url") for v, _ in all_verified}
             streams = _assemble(all_verified,

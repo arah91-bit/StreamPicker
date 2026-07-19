@@ -277,6 +277,17 @@ CATALOG = [
      "Days after theatrical to assume a digital release exists if none listed."),
     ("NOTICE_TTL_SECONDS", "acquire", "num", "1200", _S,
      "How long the 'being added' notice is shown before re-checking a title."),
+    ("TB_AUTO_CACHE", "acquire", "bool", "0", "",
+     "Auto-cache to TorBox: when a title ends a pick with nothing playable, "
+     "or the best verified stream is a lower resolution tier than an uncached "
+     "TorBox torrent offers, start that download on TorBox (via your Comet's "
+     "own debrid config) so the title plays cached on a later visit."),
+    ("TB_CACHE_TITLE_HOURS", "acquire", "num", "24", "hours",
+     "Cooldown before auto-cache may fire again for the same title; the "
+     "retry picks the next-best release it hasn't tried."),
+    ("TB_CACHE_SLOT_SECS", "acquire", "num", "900", _S,
+     "How long a triggered TorBox download is assumed to occupy one of the "
+     "plan's TORBOX_MAX_DOWNLOADS slots; auto-cache never assumes more."),
 
     # ── reputation & blocking ────────────────────────────────────────────────
     ("REPUTATION_BLOCK", "reputation", "bool", "1", "",
