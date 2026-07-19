@@ -54,15 +54,19 @@ source; add the rest later from the dashboard.
 
 The smallest thing that streams something:
 
-1. Get a **debrid** account (TorBox or Real-Debrid).
-2. Run this app (steps below) and open the dashboard: the **guided setup**
-   asks which debrid you have, takes its API key, and builds + live-tests
-   the search lanes itself. No addon URLs to assemble.
-3. Optionally paste a free **TMDB** API key on the same page.
+1. Have at least one **source of streams**. The easy one is a **debrid**
+   account (TorBox or Real-Debrid) — but usenet indexers, a Jellyfin library,
+   MediaFusion, or any other Stremio addon each count on their own too.
+2. Run this app (steps below) and open the dashboard: the **guided setup** is a
+   "do you have this?" checklist. Switch on what you actually have, paste its
+   details, and it live-tests each one. For a debrid it builds the search lanes
+   from just the API key — no addon URLs to assemble.
+3. Optionally switch on a free **TMDB** key and the other extras on the same page.
 4. Install the addon links it hands you in your player.
 
-Everything else — more sources, usenet, the library, auto-acquire, a public
-domain — is additive and can wait.
+Everything on that page is optional except *one* stream source; helpers
+(usenet mount, *arr, requests), metadata and a public domain are additive and
+can wait.
 
 ---
 
@@ -105,13 +109,16 @@ In a browser on your LAN:
 http://<this-host-LAN-IP>:8011/
 ```
 No secret in this URL — the dashboard is LAN-only by default. After creating
-your administrator account you land on the **guided setup**: switch on your
-debrid service(s), paste the API key, optionally add TMDB and your public
-URL, and hit **Set up my streams**. Keys are verified against the debrid
-itself and each lane must return real streams before anything is saved; one
-restart later your install links are on the Overview tab. If you use it, skip
-straight to Step 6 — Step 5 is the manual alternative (it's also where
-usenet, *arr and library connections live, any time later).
+your administrator account you land on the **guided setup** — a checklist
+grouped into debrid services, more stream sources (usenet indexers, Jellyfin
+library, MediaFusion, another addon), usenet mount & automation
+(nzbdav, Radarr/Sonarr, Jellyseerr), metadata (TMDB/OMDb/TVDB), and a public
+address. Switch on whatever you have, fill it in, and hit **Set up my
+streams** — you don't need a debrid if another source is switched on. Keys are
+verified against each service, debrid lanes must return real streams, and only
+what passes is saved; one restart later your install links are on the Overview
+tab. This one page covers everything Step 5 does; Step 5 is the manual
+equivalent (and where these same connections live, any time later).
 
 ### Step 5 — connect sources manually (optional)
 On **Settings → Connections**:

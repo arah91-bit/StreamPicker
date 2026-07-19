@@ -1,24 +1,38 @@
 """First-run setup wizard — /setup, and what "/" shows until a source exists.
 
-The settings page assumes an operator who can produce a configured Comet or
-StremThru manifest URL; a non-technical user cannot. But both of those URLs
-are just base64 configs around a debrid API key — so the wizard asks only
-"which debrid do you have?" and mints the rest itself:
+The settings page assumes an operator who can produce configured manifest URLs
+and knows which of a dozen services matter; a non-technical user cannot. So the
+wizard is a plain "do you have this?" checklist: every kind of source, mount,
+automation and metadata provider is a card you switch on only if you have it,
+paste its details, and the wizard live-tests each one and saves only what
+passed. Nobody has to set up something they don't own.
 
-  * Comet: standard *padded* base64 of a minimal config (Comet's strict
-    config check rejects urlsafe/unpadded); all omitted fields take Comet's
-    own defaults, cachedOnly stays true.
-  * StremThru Torz: urlsafe unpadded base64 of {indexers,stores,cached}.
+Two shapes get special handling:
 
-Both minted URLs are live-tested (connections.test) before anything is
-saved, so a typo'd key fails visibly instead of configuring a dead lane.
-One debrid key therefore yields the two torrent lanes; TMDB and the public
-URL are optional extras. Everything else — usenet, *arr, Jellyfin, custom
-addons — stays in Settings, linked from the page.
+  * Debrid services. A configured Comet or StremThru URL is just base64 around
+    a debrid key, so the wizard asks only "which debrid?" and mints both:
+      - Comet: standard *padded* base64 of a minimal config (Comet's strict
+        config check rejects urlsafe/unpadded); omitted fields take Comet's
+        defaults, cachedOnly stays true.
+      - StremThru Torz: urlsafe unpadded base64 of {indexers,stores,cached}.
+    Both minted URLs are lane-tested (real streams for a universally-cached
+    title) before being saved, so a typo'd key fails visibly.
 
-The defaults point at the public Comet / StremThru deployments so a
+  * Every other card maps 1:1 onto connections.test() — the same live checks
+    behind the Settings "Test" buttons — and its fields onto config keys, so
+    the wizard is a thin front-end over machinery that already exists. The lone
+    exception is the custom-addon card, whose manifest URL is tested as a bare
+    addon and stored into the EXTRA_ADDONS JSON list.
+
+Setup succeeds when at least one *stream source* came up (a debrid lane, usenet
+indexers, a Jellyfin library, MediaFusion, or another addon); metadata and
+automation help but don't play anything on their own. The public-URL card is
+save-only and deliberately setup-agnostic — reverse proxy, tunnel, or LAN — as
+there is no honest way to verify an external address from inside the server.
+
+The debrid/Comet/StremThru defaults point at the public deployments so a
 docker-compose-only install works with zero self-hosted extras; self-hosters
-can override the bases in the collapsed "advanced" section.
+override the bases in the collapsed "advanced" section.
 """
 
 import asyncio
@@ -55,9 +69,90 @@ DEBRIDS = [
 _ST_CODE = {sid: code for sid, _, code, _ in DEBRIDS}
 
 # A source of streams, from any lane. While none is configured the dashboard
-# home shows the wizard instead of an empty overview.
+# home shows the wizard instead of an empty overview, and apply() will not
+# report success — a config with only metadata/automation plays nothing.
 _SOURCE_KEYS = ("FAST_BASE_URL", "STREMTHRU_BASE_URL", "MEDIAFUSION_BASE_URL",
                 "NZB_INDEXERS", "EXTRA_ADDONS", "JELLIO_URL")
+
+
+def _f(key: str, label: str, kind: str = "text", placeholder: str = "") -> dict:
+    return {"key": key, "label": label, "kind": kind, "placeholder": placeholder}
+
+
+# ── The optional "do you have this?" cards ────────────────────────────────
+# Each card is a toggle that reveals its fields, is live-tested via
+# connections.test(<test>), and — on success — has its field values saved.
+# `source=True` marks the cards that actually yield streams (setup needs one).
+# `test` is a connections.test service id; fields map onto config keys, except
+# the custom-addon card (keys prefixed "__" are form-only, see _save_values).
+
+SOURCE_CARDS = [
+    dict(id="indexers", title="Usenet indexers", test="indexers", source=True,
+         blurb="Newznab indexers you have accounts with. One per line.",
+         fields=[_f("NZB_INDEXERS",
+                    "name | api-url | apikey — one indexer per line",
+                    "multiline",
+                    "myindexer | https://api.myindexer.com/api | abcd1234")]),
+    dict(id="jellio", title="Jellyfin library", test="jellio", source=True,
+         blurb="Plays titles you already own, checked before any search. "
+               "Needs the Jellio addon pointed at your Jellyfin.",
+         fields=[_f("JELLIO_URL",
+                    "Jellio manifest base URL — includes your token", "url",
+                    "https://your-host/jellio/<token>")]),
+    dict(id="mediafusion", title="MediaFusion", test="mediafusion", source=True,
+         blurb="A broad community scraper. Slower first hit; widens the search.",
+         fields=[_f("MEDIAFUSION_BASE_URL", "Manifest base URL", "url",
+                    "https://mediafusion.example")]),
+    dict(id="addon", title="Another Stremio addon", test="addon", source=True,
+         blurb="Any addon that returns streams — paste its manifest URL.",
+         fields=[_f("__name", "A name for it", "text", "My addon"),
+                 _f("url", "Manifest URL", "url",
+                    "https://addon.example/manifest.json")]),
+]
+
+HELPER_CARDS = [
+    dict(id="nzbdav", title="nzbdav", test="nzbdav", source=False,
+         blurb="Mounts usenet releases so they stream directly. "
+               "Pairs with the usenet indexers above.",
+         fields=[_f("NZBDAV_URL", "Base URL", "url", "http://nzbdav:8080"),
+                 _f("NZBDAV_USER", "WebDAV user", "text"),
+                 _f("NZBDAV_PASS", "WebDAV password", "secret")]),
+    dict(id="radarr", title="Radarr", test="radarr", source=False,
+         blurb="Grabs missing movies on request.",
+         fields=[_f("RADARR_URL", "Base URL", "url", "http://radarr:7878"),
+                 _f("RADARR_API_KEY", "API key", "secret"),
+                 _f("RADARR_QUALITY_PROFILE", "Quality profile (optional)",
+                    "text", "HD-1080p")]),
+    dict(id="sonarr", title="Sonarr", test="sonarr", source=False,
+         blurb="Grabs missing series on request.",
+         fields=[_f("SONARR_URL", "Base URL", "url", "http://sonarr:8989"),
+                 _f("SONARR_API_KEY", "API key", "secret"),
+                 _f("SONARR_QUALITY_PROFILE", "Quality profile (optional)",
+                    "text", "HD-1080p")]),
+    dict(id="jellyseerr", title="Jellyseerr", test="jellyseerr", source=False,
+         blurb="Preferred path for requesting missing titles.",
+         fields=[_f("JELLYSEERR_URL", "Base URL", "url",
+                    "http://jellyseerr:5055"),
+                 _f("JELLYSEERR_API_KEY", "API key", "secret")]),
+]
+
+META_CARDS = [
+    dict(id="tmdb", title="TMDB", test="tmdb", source=False, recommended=True,
+         key_url="https://www.themoviedb.org/settings/api",
+         blurb="Better titles, languages and next-episode handling. Free.",
+         fields=[_f("TMDB_API_KEY", "API key", "secret")]),
+    dict(id="omdb", title="OMDb", test="omdb", source=False,
+         key_url="https://www.omdbapi.com/apikey.aspx",
+         blurb="Independent title / year / type corroboration. Free.",
+         fields=[_f("OMDB_API_KEY", "API key", "secret")]),
+    dict(id="tvdb", title="TVDB", test="tvdb", source=False,
+         key_url="https://thetvdb.com/api-information",
+         blurb="Season-rollover fallback for episode prefetch.",
+         fields=[_f("TVDB_API_KEY", "API key", "secret")]),
+]
+
+ALL_CARDS = SOURCE_CARDS + HELPER_CARDS + META_CARDS
+CARD_BY_ID = {c["id"]: c for c in ALL_CARDS}
 
 
 def needed() -> bool:
@@ -150,61 +245,138 @@ async def _lane_check(base: str) -> dict:
         return {"ok": False, "detail": type(e).__name__}
 
 
-async def apply(body: dict) -> dict:
-    """Mint, live-test, and save. Saves only what passed its test; succeeds
-    when at least one stream source lane came up. Never echoes keys back."""
-    from app import connections
-    debrids = []
-    for d in body.get("debrids") or []:
+def _result(r) -> dict:
+    if isinstance(r, BaseException):
+        return {"ok": False, "detail": type(r).__name__}
+    return {"ok": bool(r.get("ok")), "detail": str(r.get("detail", ""))[:200]}
+
+
+def _parse_debrids(raw) -> list[tuple[str, str]]:
+    out = []
+    for d in raw or []:
         sid = str((d or {}).get("service", ""))
         key = str((d or {}).get("key", "")).strip()
         if sid not in _ST_CODE:
             raise ValueError(f"unknown debrid service: {sid[:24]}")
         if not key:
             raise ValueError(f"missing API key for {sid}")
-        debrids.append((sid, key))
-    if not debrids:
-        raise ValueError("pick at least one debrid service and paste its key")
+        out.append((sid, key))
+    return out
 
-    # Keys first: every pasted key must be real before any lane is trusted.
-    key_results = dict(zip(
-        (sid for sid, _ in debrids),
-        await asyncio.gather(*(_key_check(sid, key) for sid, key in debrids))))
-    if not all(r["ok"] for r in key_results.values()):
-        return {"ok": False, "results": key_results, "saved": []}
 
-    fast = comet_url(debrids, _clean_base(body.get("comet_base")
-                                          or COMET_PUBLIC))
-    torz = stremthru_url(debrids, _clean_base(body.get("stremthru_base")
-                                              or STREMTHRU_PUBLIC))
-    tmdb = str(body.get("tmdb") or "").strip()
+def _parse_cards(raw) -> list[tuple[dict, dict]]:
+    """(card spec, {field key: value}) for every card that was toggled on and
+    has at least one value. Unknown card ids are ignored (forward-compat)."""
+    active = []
+    for cid, submitted in (raw or {}).items():
+        card = CARD_BY_ID.get(cid)
+        if card is None:
+            continue
+        vals = {fld["key"]: str((submitted or {}).get(fld["key"], "")).strip()
+                for fld in card["fields"]}
+        if any(vals.values()):
+            active.append((card, vals))
+    return active
+
+
+def _test_overrides(card: dict, vals: dict) -> dict:
+    """What connections.test() gets. The custom addon is tested as a bare
+    manifest URL; every other card's field keys already are config keys."""
+    if card["id"] == "addon":
+        return {"url": vals.get("url", "")}
+    return {k: v for k, v in vals.items() if not k.startswith("__")}
+
+
+def _merge_addon(name: str, url: str) -> str:
+    """Append this addon to the EXTRA_ADDONS JSON list (de-duped by URL),
+    leaving any addon the operator already configured in place."""
+    existing = []
+    raw = config.pending("EXTRA_ADDONS")
+    if raw:
+        try:
+            loaded = json.loads(raw)
+            existing = [it for it in loaded if isinstance(it, dict)]
+        except ValueError:
+            existing = []
+    url = url.strip()
+    existing = [it for it in existing
+                if str(it.get("url", "")).strip() != url]
+    existing.append({"name": name.strip() or url, "url": url})
+    return json.dumps(existing, separators=(",", ":"))
+
+
+def _save_values(card: dict, vals: dict) -> dict:
+    """The config keys to persist for a card whose test passed."""
+    if card["id"] == "addon":
+        return {"EXTRA_ADDONS": _merge_addon(vals.get("__name", ""),
+                                             vals.get("url", ""))}
+    return {k: v for k, v in vals.items() if not k.startswith("__") and v}
+
+
+async def apply(body: dict) -> dict:
+    """Live-test every switched-on card and mint+test the debrid lanes, then
+    save only what passed. Succeeds when at least one stream source came up;
+    never echoes a key back."""
+    from app import connections
+
+    debrids = _parse_debrids(body.get("debrids"))
+    active = _parse_cards(body.get("cards"))
     public = str(body.get("public_url") or "").strip()
+    if not debrids and not active:
+        raise ValueError("Switch on at least one service you have and "
+                         "fill in its details.")
+    # Validate the minting bases up front so malformed input fails fast.
+    comet_base = _clean_base(body.get("comet_base") or COMET_PUBLIC)
+    st_base = _clean_base(body.get("stremthru_base") or STREMTHRU_PUBLIC)
 
-    checks = {"comet": _lane_check(fast), "stremthru": _lane_check(torz)}
-    if tmdb:
-        checks["tmdb"] = connections.test("tmdb", {"TMDB_API_KEY": tmdb})
-    settled = await asyncio.gather(*checks.values(), return_exceptions=True)
-    results = dict(key_results)
-    for name, r in zip(checks, settled):
-        if isinstance(r, BaseException):
-            r = {"ok": False, "detail": type(r).__name__}
-        results[name] = {"ok": bool(r.get("ok")),
-                         "detail": str(r.get("detail", ""))[:200]}
+    # Round 1: debrid key checks and every card test — all independent.
+    probes: dict = {}
+    for sid, key in debrids:
+        probes[("key", sid)] = _key_check(sid, key)
+    for card, vals in active:
+        probes[("card", card["id"])] = connections.test(
+            card["test"], _test_overrides(card, vals))
+    settled = await asyncio.gather(*probes.values(), return_exceptions=True)
+    got = {k: _result(r) for k, r in zip(probes, settled)}
 
-    values = {}
-    if results["comet"]["ok"]:
-        values["FAST_BASE_URL"] = fast
-    if results["stremthru"]["ok"]:
-        values["STREMTHRU_BASE_URL"] = torz
-    if tmdb and results.get("tmdb", {}).get("ok"):
-        values["TMDB_API_KEY"] = tmdb
-    if not (values.get("FAST_BASE_URL") or values.get("STREMTHRU_BASE_URL")):
+    results: dict = {}
+    values: dict = {}
+
+    for card, vals in active:
+        res = got[("card", card["id"])]
+        results[card["id"]] = res
+        if res["ok"]:
+            values.update(_save_values(card, vals))
+
+    keys_ok = bool(debrids)
+    for sid, _ in debrids:
+        res = got[("key", sid)]
+        results[sid] = res
+        keys_ok = keys_ok and res["ok"]
+
+    # Round 2: only mint and lane-test the torrent lanes if every debrid key
+    # was accepted (Comet lists cached streams even with a bad key).
+    if keys_ok:
+        fast = comet_url(debrids, comet_base)
+        torz = stremthru_url(debrids, st_base)
+        lanes = await asyncio.gather(_lane_check(fast), _lane_check(torz),
+                                     return_exceptions=True)
+        results["comet"] = _result(lanes[0])
+        results["stremthru"] = _result(lanes[1])
+        if results["comet"]["ok"]:
+            values["FAST_BASE_URL"] = fast
+        if results["stremthru"]["ok"]:
+            values["STREMTHRU_BASE_URL"] = torz
+
+    # Nothing playable => save nothing; the user must add a real stream source.
+    if not any(k in values for k in _SOURCE_KEYS):
         return {"ok": False, "results": results, "saved": []}
+
     if public:
         values["ADDON_PUBLIC_URL"] = public
     config.save(values)
     logger.info(f"wizard: configured {sorted(values)} "
-                f"({len(debrids)} debrid service(s))")
+                f"({len(debrids)} debrid service(s), {len(active)} card(s))")
     return {"ok": True, "results": results, "saved": sorted(values),
             "restart_needed": True}
 
@@ -223,23 +395,30 @@ padding:24px 16px 130px}
 .wrap{max-width:760px;margin:0 auto}
 h1{font-size:24px;margin:6px 0 6px}
 .sub{color:var(--mut);margin:0 0 26px;font-size:14px;max-width:600px}
-h2{font-size:16px;margin:28px 0 4px}
+h2{font-size:16px;margin:30px 0 4px}
 .blurb{color:var(--mut);font-size:13px;margin:0 0 12px;max-width:620px}
 .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:12px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:12px;
 padding:15px 16px;transition:border-color .15s}
 .card.on{border-color:var(--accent)}
 .chead{display:flex;justify-content:space-between;align-items:center;gap:10px}
-.cname{font-weight:650;font-size:15px}
-.keylink{font-size:12px;color:var(--accent);text-decoration:none}
+.cname{font-weight:650;font-size:15px;display:flex;align-items:center}
+.badge{font-size:9.5px;font-weight:700;color:var(--accent);background:var(--accent-soft);
+border-radius:99px;padding:2px 7px;margin-left:8px;text-transform:uppercase;
+letter-spacing:.04em}
+.keylink{font-size:12px;color:var(--accent);text-decoration:none;white-space:nowrap}
 .keylink:hover{text-decoration:underline}
 .kfield{margin-top:12px}
 .kfield[hidden]{display:none}
-.kfield label{display:block;font-size:11.5px;color:var(--mut);margin:0 0 4px}
-input[type=password],input[type=text],input[type=url]{width:100%;
+.kfield label,.flabel{display:block;font-size:11.5px;color:var(--mut);margin:10px 0 4px}
+.kfield .flabel:first-of-type{margin-top:0}
+.cblurb{font-size:12px;color:var(--mut);margin:0 0 8px;line-height:1.45}
+.cnote{font-size:11.5px;color:var(--mut);margin:7px 0 0;font-style:italic}
+input[type=password],input[type=text],input[type=url],textarea{width:100%;
 background:var(--bg);color:var(--fg);border:1px solid var(--line);
 border-radius:8px;padding:9px 11px;font:13px var(--mono)}
-input::placeholder{color:var(--mut);opacity:.8}
+textarea{resize:vertical;min-height:66px;line-height:1.5}
+input::placeholder,textarea::placeholder{color:var(--mut);opacity:.8}
 .swi{appearance:none;-webkit-appearance:none;width:42px;height:24px;margin:0;
 border-radius:99px;background:var(--line);position:relative;cursor:pointer;
 transition:background .15s;flex-shrink:0}
@@ -248,6 +427,10 @@ border-radius:50%;background:var(--card);box-shadow:0 1px 2px rgba(0,0,0,.25);
 transition:transform .15s}
 .swi:checked{background:var(--accent)}
 .swi:checked::before{transform:translateX(18px)}
+.hintlist{margin:6px 0 4px;padding-left:18px;font-size:12px;color:var(--mut)}
+.hintlist li{margin:3px 0;line-height:1.45}
+.hintlist code{font:11.5px var(--mono);background:var(--accent-soft);
+border-radius:5px;padding:1px 5px;color:var(--fg)}
 details.adv{margin-top:26px;color:var(--mut)}
 details.adv summary{cursor:pointer;font-size:13px}
 details.adv .card{margin-top:10px}
@@ -263,7 +446,8 @@ border-radius:9px;padding:10px 22px;cursor:pointer;white-space:nowrap}
 .btn:disabled{opacity:.5;cursor:default}
 .gomsg{font-size:13px;color:var(--mut)}
 .gomsg b{color:var(--fg)}
-.checks{display:none;flex-direction:column;gap:3px;font:12.5px var(--mono)}
+.checks{display:none;flex-direction:column;gap:3px;font:12.5px var(--mono);
+max-height:34vh;overflow:auto}
 .checks.show{display:flex}
 .checks .ok{color:var(--good)}
 .checks .bad{color:var(--bad)}
@@ -273,10 +457,11 @@ border-radius:9px;padding:10px 22px;cursor:pointer;white-space:nowrap}
 
 _JS = """
 const $=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)];
-$$('.card[data-service] .swi').forEach(sw=>sw.addEventListener('change',()=>{
- const card=sw.closest('.card');card.classList.toggle('on',sw.checked);
- card.querySelector('.kfield').hidden=!sw.checked;
- if(sw.checked)card.querySelector('input[type=password]').focus();
+$$('.swi').forEach(sw=>sw.addEventListener('change',()=>{
+ const card=sw.closest('.card'),kf=card.querySelector('.kfield');
+ card.classList.toggle('on',sw.checked);
+ if(kf){kf.hidden=!sw.checked;
+  if(sw.checked){const f=kf.querySelector('input,textarea');if(f)f.focus();}}
 }));
 const csrf=()=>document.querySelector('.adminnav').dataset.csrf;
 async function post(url,body){
@@ -287,18 +472,28 @@ async function post(url,body){
  if(!r.ok)throw new Error(data.detail||('HTTP '+r.status));
  return data;
 }
+function cardVals(card){
+ const o={};
+ card.querySelectorAll('[data-key]').forEach(el=>{
+  const v=el.value.trim();if(v)o[el.dataset.key]=v;});
+ return o;
+}
 function collect(){
  const debrids=$$('.card[data-service]').filter(c=>c.querySelector('.swi').checked)
   .map(c=>({service:c.dataset.service,
    key:c.querySelector('input[type=password]').value.trim()}));
- return {debrids,tmdb:$('#tmdbkey').value.trim(),
-  public_url:$('#publicurl').value.trim(),
-  comet_base:$('#cometbase').value.trim(),
-  stremthru_base:$('#stbase').value.trim()};
+ const cards={};
+ $$('.card[data-card]').forEach(c=>{
+  if(c.querySelector('.swi').checked){
+   const v=cardVals(c);if(Object.keys(v).length)cards[c.dataset.card]=v;}});
+ return {debrids,cards,public_url:$('#publicurl').value.trim(),
+  comet_base:$('#cometbase').value.trim(),stremthru_base:$('#stbase').value.trim()};
 }
 const NICE={comet:'Torrent lane (Comet)',stremthru:'Torrent lane (StremThru)',
- tmdb:'TMDB metadata',torbox:'TorBox key',realdebrid:'Real-Debrid key',
- alldebrid:'AllDebrid key',premiumize:'Premiumize key'};
+ torbox:'TorBox key',realdebrid:'Real-Debrid key',alldebrid:'AllDebrid key',
+ premiumize:'Premiumize key',indexers:'Usenet indexers',jellio:'Jellyfin library',
+ mediafusion:'MediaFusion',addon:'Custom addon',nzbdav:'nzbdav',radarr:'Radarr',
+ sonarr:'Sonarr',jellyseerr:'Jellyseerr',tmdb:'TMDB',omdb:'OMDb',tvdb:'TVDB'};
 function showChecks(results){
  const box=$('#checks');box.classList.add('show');
  box.innerHTML=Object.entries(results).map(([k,v])=>
@@ -319,19 +514,24 @@ $('#gobtn').addEventListener('click',async()=>{
   msg.textContent='Still restarting — reload this page in a moment.';return;
  }
  const body=collect();
- if(!body.debrids.length||body.debrids.some(d=>!d.key)){
-  msg.innerHTML='<span style="color:var(--bad)">Switch on at least one '+
-   'service and paste its API key.</span>';return;
- }
+ const bad=v=>msg.innerHTML='<span style="color:var(--bad)">'+v+'</span>';
+ if(body.debrids.some(d=>!d.key))
+  return bad('Paste the API key for each debrid you switched on.');
+ if(!body.debrids.length&&!Object.keys(body.cards).length)
+  return bad('Switch on at least one service you have and fill in its details.');
  btn.disabled=true;msg.textContent='Testing your services…';
  try{
   const res=await post('/api/setup/apply',body);
   showChecks(res.results);
   if(res.ok){phase='restart';btn.textContent='Finish →';btn.disabled=false;
-   msg.innerHTML='<b>Ready.</b> One restart and your addon links appear.';}
+   const failed=Object.values(res.results).filter(v=>!v.ok).length;
+   msg.innerHTML=failed?'<b>Ready.</b> Saved what worked; the ✗ items can '+
+    'wait. One restart to finish.':'<b>All set.</b> One restart and your '+
+    'addon links appear.';}
   else{btn.disabled=false;
-   msg.innerHTML='<span style="color:var(--bad)">No lane came up — '+
-    'check the key and try again.</span>';}
+   msg.innerHTML='<span style="color:var(--bad)">Nothing playable yet — '+
+    'add a debrid, usenet indexers, a Jellyfin library, MediaFusion or '+
+    'another addon, then try again.</span>';}
  }catch(e){btn.disabled=false;
   msg.innerHTML='<span style="color:var(--bad)">'+
    String(e.message).replace(/</g,'&lt;')+'</span>';}
@@ -351,9 +551,47 @@ def _debrid_card(sid: str, label: str, key_url: str) -> str:
 </div>"""
 
 
+def _field_html(card_id: str, fld: dict) -> str:
+    fid = f"{card_id}-{fld['key']}"
+    label = html.escape(fld["label"])
+    ph = html.escape(fld.get("placeholder", ""))
+    key = html.escape(fld["key"])
+    if fld["kind"] == "multiline":
+        control = (f'<textarea data-key="{key}" id="{fid}" rows="3" '
+                   f'autocomplete="off" spellcheck="false" '
+                   f'placeholder="{ph}"></textarea>')
+    else:
+        typ = {"secret": "password", "url": "url"}.get(fld["kind"], "text")
+        control = (f'<input type="{typ}" data-key="{key}" id="{fid}" '
+                   f'autocomplete="off" spellcheck="false" placeholder="{ph}">')
+    return f'<label class="flabel" for="{fid}">{label}</label>{control}'
+
+
+def _source_card(card: dict) -> str:
+    fields = "".join(_field_html(card["id"], f) for f in card["fields"])
+    badge = ('<span class="badge">recommended</span>'
+             if card.get("recommended") else "")
+    blurb = (f'<p class="cblurb">{html.escape(card["blurb"])}</p>'
+             if card.get("blurb") else "")
+    key_link = ""
+    if card.get("key_url"):
+        key_link = (f'<a class="keylink" href="{html.escape(card["key_url"])}" '
+                    f'target="_blank" rel="noopener noreferrer">'
+                    f'where is my key?</a> ')
+    return f"""<div class="card" data-card="{card['id']}">
+ <div class="chead"><span class="cname">{html.escape(card['title'])}{badge}</span>
+  <input type="checkbox" class="swi"
+         aria-label="I have {html.escape(card['title'])}"></div>
+ <div class="kfield" hidden>{blurb}{key_link}{fields}</div>
+</div>"""
+
+
 def render() -> str:
-    cards = "".join(_debrid_card(sid, label, key_url)
-                    for sid, label, _, key_url in DEBRIDS)
+    debrid_cards = "".join(_debrid_card(sid, label, key_url)
+                           for sid, label, _, key_url in DEBRIDS)
+    source_cards = "".join(_source_card(c) for c in SOURCE_CARDS)
+    helper_cards = "".join(_source_card(c) for c in HELPER_CARDS)
+    meta_cards = "".join(_source_card(c) for c in META_CARDS)
     name = html.escape(ADDON_NAME)
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -362,41 +600,64 @@ def render() -> str:
 <div class="wrap">
 {adminui.nav("overview", ADDON_NAME)}
 <h1>Set up your streams</h1>
-<p class="sub">Switch on what you have, paste its key, and everything else is
-configured for you. It's all changeable later in Settings.</p>
+<p class="sub">Switch on the things you actually have and fill in their
+details — leave the rest off. Each one is tested before it's saved, and it's
+all changeable later in Settings.</p>
 
-<h2>Your debrid service</h2>
-<p class="blurb">Where your streams come from. One is enough.</p>
-<div class="cards">{cards}</div>
+<h2>Debrid services</h2>
+<p class="blurb">Where most streams come from. Switch on any you have — one is
+enough — and the two torrent search lanes are built for you.</p>
+<div class="cards">{debrid_cards}</div>
 
-<h2>Nice to have</h2>
+<h2>More sources of streams</h2>
+<p class="blurb">Optional. Any of these can stand in for — or add to — a
+debrid.</p>
+<div class="cards">{source_cards}</div>
+
+<h2>Usenet mount &amp; automation</h2>
+<p class="blurb">Optional helpers. They don't provide streams on their own,
+but improve or extend the sources above.</p>
+<div class="cards">{helper_cards}</div>
+
+<h2>Metadata</h2>
+<p class="blurb">Optional, all free. Better titles, languages, and
+episode handling.</p>
+<div class="cards">{meta_cards}</div>
+
+<h2>Watch away from home</h2>
 <div class="cards">
- <div class="card"><div class="chead"><span class="cname">TMDB</span>
-  <a class="keylink" href="https://www.themoviedb.org/settings/api"
-     target="_blank" rel="noopener noreferrer">get a free key</a></div>
-  <div class="kfield"><label>API key — better titles, languages and
-   next-episode handling</label>
-  <input type="password" id="tmdbkey" autocomplete="off" spellcheck="false"
-         placeholder="optional"></div></div>
- <div class="card"><div class="chead"><span class="cname">Watch away from
-   home</span></div>
-  <div class="kfield"><label>The public address this server is reachable on
-   (leave empty for home-network use)</label>
-  <input type="url" id="publicurl" autocomplete="off" spellcheck="false"
-         placeholder="https://streams.example.com — optional"></div></div>
+ <div class="card">
+  <div class="kfield">
+   <p class="cblurb">The address a player <em>outside your home</em> would use
+    to reach this server. Every setup is different — this is just however you
+    already reach it from the internet:</p>
+   <ul class="hintlist">
+    <li><b>Reverse proxy</b> (Caddy, Nginx, Traefik): your public HTTPS
+     hostname, e.g. <code>https://streams.example.com</code></li>
+    <li><b>Tunnel</b> (Cloudflare Tunnel, Tailscale Funnel): the URL the
+     tunnel hands you</li>
+    <li><b>Home network only:</b> leave this blank</li>
+   </ul>
+   <label class="flabel" for="publicurl">Public address (optional)</label>
+   <input type="url" id="publicurl" autocomplete="off" spellcheck="false"
+          placeholder="https://streams.example.com — or leave blank">
+   <p class="cnote">We can't verify this from here — it's whatever address
+    works from outside your network.</p>
+  </div>
+ </div>
 </div>
 
 <details class="adv"><summary>Advanced — use different Comet / StremThru
 servers</summary>
  <div class="card">
-  <div class="kfield"><label>Comet server</label>
+  <div class="kfield"><label class="flabel" for="cometbase">Comet server</label>
    <input type="url" id="cometbase" value="{COMET_PUBLIC}"></div>
-  <div class="kfield"><label>StremThru server</label>
+  <div class="kfield"><label class="flabel" for="stbase">StremThru server</label>
    <input type="url" id="stbase" value="{STREMTHRU_PUBLIC}"></div>
  </div></details>
 
-<p class="later">Have usenet indexers, Radarr/Sonarr, a Jellyfin library or
-extra addons? Add them any time in <a href="/settings">Settings</a>.</p>
+<p class="later">Everything here — and more knobs besides — lives in
+<a href="/settings">Settings</a> too.</p>
 </div>
 
 <div class="gobar">

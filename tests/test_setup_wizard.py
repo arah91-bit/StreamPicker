@@ -135,8 +135,12 @@ class ApplyTests(unittest.TestCase):
         body = {"debrids": [{"service": "torbox", "key": "k1"}], **kw}
         return asyncio.run(wizard.apply(body))
 
+    def _card(self, cid, **fields):
+        return {"cards": {cid: fields}}
+
     def test_happy_path_saves_both_lanes_and_extras(self):
-        res = self._apply(tmdb="tk", public_url="https://s.example.com")
+        res = self._apply(public_url="https://s.example.com",
+                          cards={"tmdb": {"TMDB_API_KEY": "tk"}})
         self.assertTrue(res["ok"])
         self.assertEqual(["ADDON_PUBLIC_URL", "FAST_BASE_URL",
                           "STREMTHRU_BASE_URL", "TMDB_API_KEY"], res["saved"])
@@ -156,7 +160,8 @@ class ApplyTests(unittest.TestCase):
 
     def test_no_working_lane_saves_nothing(self):
         self.outcomes.update(comet=False, stremthru=False)
-        res = self._apply(tmdb="tk", public_url="https://s.example.com")
+        res = self._apply(public_url="https://s.example.com",
+                          cards={"tmdb": {"TMDB_API_KEY": "tk"}})
         self.assertFalse(res["ok"])
         self.assertEqual([], res["saved"])
         self.assertEqual("", config.stored("ADDON_PUBLIC_URL"))
@@ -164,9 +169,10 @@ class ApplyTests(unittest.TestCase):
 
     def test_failed_tmdb_key_is_not_saved(self):
         self.outcomes["tmdb"] = False
-        res = self._apply(tmdb="bad-key")
+        res = self._apply(cards={"tmdb": {"TMDB_API_KEY": "bad-key"}})
         self.assertTrue(res["ok"])
         self.assertNotIn("TMDB_API_KEY", res["saved"])
+        self.assertFalse(res["results"]["tmdb"]["ok"])
 
     def test_validation_rejects_bad_input(self):
         for body in ({}, {"debrids": []},
@@ -195,6 +201,65 @@ class ApplyTests(unittest.TestCase):
     def test_results_never_echo_the_key(self):
         res = self._apply()
         self.assertNotIn("k1", json.dumps(res))
+
+    # ── Cards: any source stands alone; helpers/metadata never do ──────────
+    def _cards(self, cards):
+        return asyncio.run(wizard.apply({"cards": cards}))
+
+    def test_a_source_card_alone_succeeds_without_any_debrid(self):
+        self.outcomes["indexers"] = True
+        res = self._cards({"indexers": {"NZB_INDEXERS": "a|https://x/api|k"}})
+        self.assertTrue(res["ok"])
+        self.assertEqual(["NZB_INDEXERS"], res["saved"])
+        self.assertEqual("a|https://x/api|k", config.pending("NZB_INDEXERS"))
+        # tested with exactly the submitted field, as a config-key override
+        self.assertEqual({"NZB_INDEXERS": "a|https://x/api|k"},
+                         self.tested["indexers"])
+
+    def test_metadata_only_configures_no_stream_source(self):
+        self.outcomes["tmdb"] = True
+        res = self._cards({"tmdb": {"TMDB_API_KEY": "tk"}})
+        self.assertFalse(res["ok"])          # a key that plays nothing
+        self.assertEqual([], res["saved"])
+        self.assertEqual("", config.stored("TMDB_API_KEY"))
+
+    def test_helper_card_alone_is_not_a_stream_source(self):
+        self.outcomes["nzbdav"] = True
+        res = self._cards({"nzbdav": {"NZBDAV_URL": "http://n:8080",
+                                      "NZBDAV_USER": "u", "NZBDAV_PASS": "p"}})
+        self.assertFalse(res["ok"])
+        self.assertEqual([], res["saved"])
+
+    def test_custom_addon_tested_as_url_saved_into_extra_addons(self):
+        self.outcomes["addon"] = True
+        res = self._cards({"addon": {"__name": "My Addon",
+                                     "url": "https://a.example/manifest.json"}})
+        self.assertTrue(res["ok"])
+        self.assertEqual(["EXTRA_ADDONS"], res["saved"])
+        # tested as a bare manifest URL, not the form-only __name
+        self.assertEqual({"url": "https://a.example/manifest.json"},
+                         self.tested["addon"])
+        stored = json.loads(config.pending("EXTRA_ADDONS"))
+        self.assertEqual("My Addon", stored[0]["name"])
+        self.assertIn("a.example", stored[0]["url"])
+
+    def test_failing_card_never_blocks_a_working_debrid_lane(self):
+        self.outcomes["mediafusion"] = False
+        res = self._apply(cards={"mediafusion":
+                                 {"MEDIAFUSION_BASE_URL": "https://mf.example"}})
+        self.assertTrue(res["ok"])
+        self.assertIn("FAST_BASE_URL", res["saved"])
+        self.assertNotIn("MEDIAFUSION_BASE_URL", res["saved"])
+        self.assertFalse(res["results"]["mediafusion"]["ok"])
+
+    def test_unknown_card_id_is_ignored(self):
+        res = self._apply(cards={"nope": {"WHATEVER": "x"}})
+        self.assertTrue(res["ok"])
+        self.assertNotIn("nope", res["results"])
+
+    def test_empty_toggled_cards_do_not_count_as_selection(self):
+        with self.assertRaises(ValueError):
+            asyncio.run(wizard.apply({"cards": {"tmdb": {"TMDB_API_KEY": ""}}}))
 
 
 class RouteTests(unittest.TestCase):
