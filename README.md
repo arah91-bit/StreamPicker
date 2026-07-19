@@ -78,6 +78,12 @@ your URL/key before you save; hit **Save**, then **Restart addon** to apply.
 Settings live in `./data/config.json` and survive rebuilds. Everything the
 wizard offers — and the long-tail tuning knobs — can also be changed there.
 
+Prefer to configure it from files instead of the UI (for scripting, or to hand
+the job to an AI)? Every setting is equally reachable by editing `.env` or
+`data/config.json` — the same keys the dashboard writes. See
+[AGENTS.md](AGENTS.md) for the guide and [`.env.reference`](.env.reference) for
+the full annotated key list.
+
 The dashboard is **authenticated and local-only by default** — it answers to
 loopback/LAN/Docker clients but not to requests coming through a public reverse
 proxy, so keep the port on your LAN (like Radarr/Sonarr). First-run enrollment
