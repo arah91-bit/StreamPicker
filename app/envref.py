@@ -60,6 +60,10 @@ def _body(value_fn, commented: bool) -> list[str]:
           "installation. Generate: "
           "openssl rand -hex 24", commented=commented,
           secret=True)
+    _emit(L, "CONFIG_ENCRYPTION_KEY_FILE",
+          value_fn("CONFIG_ENCRYPTION_KEY_FILE"),
+          "Container path to the separately mounted 32-byte dashboard-secret "
+          "encryption key.", commented=commented, secret=False)
     L.append("")
 
     L.append("# ── identity ──")

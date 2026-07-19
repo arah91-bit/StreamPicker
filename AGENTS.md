@@ -1,7 +1,8 @@
 # Configuring stream-picker as an agent
 
-There are **two equivalent ways** to configure this addon, and they write the
-same keys to the same place:
+There are **two equivalent ways** to configure this addon. They use the same
+setting names, but the dashboard encrypts sensitive values before persisting
+them:
 
 1. **The dashboard / setup wizard** — for a human. Open the site, switch things
    on, paste keys, hit *Set up my streams* (or use **Settings** for the full
@@ -10,9 +11,8 @@ same keys to the same place:
    can set, you can set by editing a file and restarting. **This document is
    the guide for that path.**
 
-Neither path is "underneath" the other: the dashboard just edits the same file
-surfaces described below. Anything you set here shows up in the dashboard, and
-vice-versa.
+Neither path is "underneath" the other. Anything you set here shows up in the
+dashboard, and vice-versa; only the on-disk representation of a secret differs.
 
 ---
 
@@ -23,9 +23,19 @@ There is a single catalog of every setting the addon understands (defined in
 merged at process start by `config.apply_env()`:
 
 - **`.env`** (mounted as the container's env, or a compose `environment:` block)
-  — best for the required secret and any deployment seeds.
+  — best for the required addon secret and non-sensitive deployment seeds. It
+  is a plaintext format; do not put the Jellyfin password there in the normal
+  deployment.
 - **`data/config.json`** — a JSON document `{"env": {"KEY": "value", …}}`. This
-  is what the dashboard writes. **When a key is in both, `config.json` wins.**
+  is what the dashboard writes. Sensitive fields are stored as independently
+  authenticated AES-256-GCM ciphertext. **When a key is in both, `config.json`
+  wins.**
+
+The AES master key is separate from `config.json`. Production mounts it
+read-only at `/run/secrets/stream_picker_config_key` and sets
+`CONFIG_ENCRYPTION_KEY_FILE` to that path. Keep the host key outside the Git
+repository, mode `0600`, and back it up with the encrypted config; losing or
+replacing it makes existing ciphertext intentionally unreadable.
 
 Both are read **only at startup**, so a config change takes effect on the
 **next restart**, never live. That is by design and is the one rule you must
@@ -85,15 +95,17 @@ Rules that will bite you if ignored:
 - **Booleans** are `"1"`/`"0"` (the loader also accepts `true/false/yes/no/on/off`).
 - **Blank a key to revert it** to its `.env`/built-in default (just remove the
   key, or set it to `""`).
-- **Secrets**: put the real value. (Through the dashboard API a *blank* secret
-  means "keep the stored one"; when hand-editing the file, just write the value
-  or omit the key.)
+- **Secrets**: do not hand-write plaintext secrets into `config.json`. Pass the
+  real value through `config.save(...)` or the authenticated dashboard API so
+  it is encrypted before the file is replaced. A blank secret submitted through
+  the dashboard means "keep the stored one"; omit it when no change is needed.
 
 ### Editing `.env`
 
 Same keys, `KEY=value` per line. Use this for `ADDON_SECRET` (required) and
-anything you want to live in version-controlled deployment config. See
-`.env.reference` for the annotated menu; copy the lines you want and fill them in.
+non-sensitive deployment seeds. `.env` is ignored by this repository but is
+still plaintext on disk, so save `JELLYFIN_PASSWORD` through the dashboard/API
+instead. See `.env.reference` for the annotated menu.
 
 ### Then: restart
 
@@ -162,8 +174,24 @@ UI becomes `;`-joined in storage):
 **Public address** (reverse proxy / tunnel / blank for LAN):
 `"ADDON_PUBLIC_URL": "https://streams.example.com"`.
 
-**Jellyfin library, *arr, Jellyseerr, nzbdav** — see the `connections` section
-of `.env.reference` for the exact key names (`JELLIO_URL`, `RADARR_URL` +
+**Native Jellyfin library** — set `JELLYFIN_URL` to the internal API base the
+container can reach, then save `JELLYFIN_USERNAME` and `JELLYFIN_PASSWORD`
+through the encrypted dashboard/API path. Use a dedicated non-admin Jellyfin
+user restricted to the needed libraries and playback. There is no Jellio URL
+and no player-facing Jellyfin URL: Stream Picker returns its own signed proxy
+URL, injects the user token only on the server-side upstream request, and
+preserves byte ranges for seeking.
+
+Player-decodable codecs (H.264/HEVC/VP9/AV1) are direct-played untouched. A
+codec the player can't decode (MPEG‑2, XviD/DivX, VC‑1, WMV) is transcoded by
+Jellyfin and proxied back as token-safe HLS — but only if that Jellyfin user
+has the *allow video/audio transcoding* and *allow remuxing* permissions
+enabled in its Jellyfin policy (Stream Picker cannot grant those; an admin sets
+them). `JELLYFIN_TRANSCODE=0` disables the fallback and drops such titles from
+library results instead of handing over an audio-only file.
+
+**Jellyfin, *arr, Jellyseerr, nzbdav** — see the `connections` section of
+`.env.reference` for all exact key names (`JELLYFIN_URL`, `RADARR_URL` +
 `RADARR_API_KEY`, `NZBDAV_URL` + `NZBDAV_USER` + `NZBDAV_PASS`, etc.).
 
 ---
@@ -182,8 +210,8 @@ quarantined):
 Also: numeric keys must parse as numbers **and stay within their own bounds**
 (e.g. `BUFFER_AHEAD_GB` ≤ 32) — see the units/ranges in `.env.reference`; URLs
 must be absolute `http(s)`; and at least one **stream source** (a debrid lane,
-`NZB_INDEXERS`, `JELLIO_URL`, `MEDIAFUSION_BASE_URL`, or `EXTRA_ADDONS`) should
-be set for the addon to return anything.
+`NZB_INDEXERS`, a complete native Jellyfin connection, `MEDIAFUSION_BASE_URL`,
+or `EXTRA_ADDONS`) should be set for the addon to return anything.
 
 ---
 
@@ -191,7 +219,7 @@ be set for the addon to return anything.
 
 Every connection has the same live check the dashboard's **Test** button uses,
 exposed as `app.connections.test(service, {KEY: value, …})` (async). Service
-ids: `comet`, `stremthru`, `mediafusion`, `jellio`, `addon`, `tmdb`, `omdb`,
+ids: `comet`, `stremthru`, `mediafusion`, `jellyfin`, `addon`, `tmdb`, `omdb`,
 `tvdb`, `jellyseerr`, `radarr`, `sonarr`, `nzbdav`, `indexers`. It returns
 `{"ok": bool, "detail": "…"}`. Use it to verify a key is real before writing it
 to `config.json` and restarting.
@@ -205,7 +233,8 @@ credentials, the same operations are:
 
 1. `GET /api/admin/csrf` → `{csrf_token}` (send it as `X-CSRF-Token` on writes).
 2. `POST /api/settings/save` with `{"values": {KEY: value, …}}` — validates and
-   writes to `config.json`, returns `{changed, restart_needed}`.
+   writes to `config.json`, encrypting sensitive fields first, and returns
+   `{changed, restart_needed}`. Never log or echo the submitted secrets.
 3. `POST /api/settings/restart` — validates the pending config, then restarts.
 
 The dashboard is admin-authenticated and LAN-only by default, so this path is

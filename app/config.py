@@ -27,7 +27,7 @@ import tempfile
 import time
 from urllib.parse import urlsplit
 
-from app import knobs
+from app import knobs, secret_store
 
 logger = logging.getLogger("stream-picker.config")
 
@@ -161,11 +161,15 @@ CONNECTIONS = [
     dict(id="stremthru", name="StremThru Torz",
          role="Long-tail crowdsourced hash index",
          fields=[dict(key="STREMTHRU_BASE_URL", label="Manifest base URL",
-                      kind="url")]),
+                      kind="url", sensitive=True,
+                      hint="The Torz URL embeds your debrid key in its path — "
+                           "treat it like a password.")]),
     dict(id="mediafusion", name="MediaFusion",
          role="Broad scrape — slow first hit, feeds the quality pass",
          fields=[dict(key="MEDIAFUSION_BASE_URL", label="Manifest base URL",
-                      kind="url")]),
+                      kind="url", sensitive=True,
+                      hint="A configured MediaFusion URL can encode your "
+                           "debrid credentials — treat it like a password.")]),
     dict(id="indexers", name="Usenet indexers",
          role="Direct usenet searches (Newznab)",
         fields=[dict(key="NZB_INDEXERS", label="One per line: name|api-url|apikey",
@@ -187,12 +191,15 @@ CONNECTIONS = [
     dict(id="tvdb", name="TVDB",
          role="Season-rollover fallback for episode prefetch",
          fields=[dict(key="TVDB_API_KEY", label="API key", kind="secret")]),
-    dict(id="jellio", name="Jellyfin library (Jellio)",
+    dict(id="jellyfin", name="Jellyfin library",
          role="Serves titles you already have — checked before any search",
-        fields=[dict(key="JELLIO_URL", label="Public manifest base URL",
-                      kind="url", sensitive=True,
-                      hint="Public base including the Jellio token, so the "
-                           "playback URLs it returns work from the player.")]),
+        fields=[dict(key="JELLYFIN_URL", label="Server URL", kind="url",
+                     hint="URL reachable by StreamPicker, for example "
+                          "http://jellyfin:8096 on a shared Docker network."),
+                dict(key="JELLYFIN_USERNAME", label="Username", kind="text"),
+                dict(key="JELLYFIN_PASSWORD", label="Password", kind="secret",
+                     hint="Encrypted at rest. Prefer a dedicated playback-only "
+                          "Jellyfin account rather than an administrator.")]),
     dict(id="jellyseerr", name="Jellyseerr",
          role="Preferred path for requesting missing titles",
          fields=[dict(key="JELLYSEERR_URL", label="Base URL", kind="url"),
@@ -287,7 +294,11 @@ def _specs() -> dict[str, dict]:
 
 
 _SPECS = _specs()
-_RETIRED_KEYS = {"NZB_TIMEOUT", "NZB_IMPORT_SLOT_HOLD"}
+_RETIRED_KEYS = {
+    "NZB_TIMEOUT", "NZB_IMPORT_SLOT_HOLD",
+    "JELLIO_URL", "JELLIO_DIRECT_PLAY", "JELLIO_ENRICH",
+    "JELLIO_CACHE_TTL", "JELLIO_NEG_TTL", "JELLIO_TIMEOUT",
+}
 
 
 def _path() -> str:
@@ -307,7 +318,7 @@ def _quarantine(path: str, reason: Exception | str) -> None:
                          path, reason)
 
 
-def _read() -> dict[str, str]:
+def _read(*, migrate_plaintext: bool = False) -> dict[str, str]:
     path = _path()
     try:
         with open(path, encoding="utf-8") as f:
@@ -316,6 +327,7 @@ def _read() -> dict[str, str]:
             raise ValueError("root and 'env' must be JSON objects")
         env = data.get("env", {})
         out = {}
+        plaintext_sensitive = False
         for key, value in env.items():
             if key in _RETIRED_KEYS:
                 logger.warning("config: ignoring retired setting %s", key)
@@ -325,6 +337,11 @@ def _read() -> dict[str, str]:
             if isinstance(value, (dict, list)) or value is None:
                 raise ValueError(f"{key}: stored value must be scalar")
             raw = str(value)
+            if is_secret(key):
+                if secret_store.is_encrypted(raw):
+                    raw = secret_store.decrypt(key, raw, path)
+                elif raw:
+                    plaintext_sensitive = True
             norm = _normalize(_SPECS[key], raw)
             if norm == "" and _SPECS[key].get("type") == "number":
                 logger.warning("config: ignoring blank numeric override %s", key)
@@ -332,6 +349,12 @@ def _read() -> dict[str, str]:
             # A blank sensitive field means "keep" only for a form submit. An
             # older store containing it is harmless and remains explicitly blank.
             out[key] = raw.strip() if norm is None else norm
+        # Upgrade legacy plaintext dashboard secrets in place without ever
+        # creating a plaintext backup. Authentication/key errors deliberately
+        # escape this function and leave the original file untouched.
+        if migrate_plaintext and plaintext_sensitive:
+            _write(out)
+            logger.info("config: encrypted legacy sensitive settings at rest")
         return out
     except FileNotFoundError:
         return {}
@@ -348,7 +371,12 @@ def _write(store: dict[str, str]) -> None:
     path = _path()
     directory = os.path.dirname(path) or "."
     os.makedirs(directory, exist_ok=True)
-    encoded = json.dumps({"env": store}, indent=1, sort_keys=True)
+    persisted = {
+        key: (secret_store.encrypt(key, value, path)
+              if value and is_secret(key) else value)
+        for key, value in store.items()
+    }
+    encoded = json.dumps({"env": persisted}, indent=1, sort_keys=True)
     if len(encoded.encode("utf-8")) > 256 * 1024:
         raise ValueError("configuration exceeds 256 KiB")
     fd, tmp = tempfile.mkstemp(dir=directory, prefix=".config-")
@@ -380,7 +408,7 @@ def apply_env() -> int:
     """Overlay stored values onto os.environ. Must run before any app module
     bakes env into constants — main.py calls it above its own app imports.
     Returns how many keys were applied (for the startup log line)."""
-    store = _read()
+    store = _read(migrate_plaintext=True)
     try:
         effective = _validate_effective(store)
     except ValueError as exc:

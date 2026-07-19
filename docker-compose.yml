@@ -1,9 +1,11 @@
-# Standalone deployment of the stream-picker addon — this file plus a .env is
-# the entire install; the image is prebuilt and pulled from GitHub's registry.
+# Standalone deployment of the stream-picker addon — this file, a .env, and one
+# generated encryption-key file are the entire install; the image is prebuilt.
 #
 #   mkdir stream-picker && cd stream-picker
 #   curl -O  https://raw.githubusercontent.com/arah91-bit/StreamPicker/main/docker-compose.yml
 #   curl -o .env https://raw.githubusercontent.com/arah91-bit/StreamPicker/main/.env.example
+#   install -d -m 700 secrets && openssl rand -out secrets/stream-picker-config.key 32
+#   chmod 400 secrets/stream-picker-config.key
 #   # edit .env: set ADDON_SECRET (openssl rand -hex 24) and ADDON_PUBLIC_URL
 #   docker compose up -d
 #
@@ -44,12 +46,15 @@ services:
     environment:
       # Fail fast with a clear message instead of a crash loop if it's unset.
       ADDON_SECRET: "${ADDON_SECRET:?Set ADDON_SECRET in .env — generate one with openssl rand -hex 24}"
+      CONFIG_ENCRYPTION_KEY_FILE: /run/secrets/stream_picker_config_key
     env_file:
       - .env                 # passes ADDON_PUBLIC_URL and any other seeds through
     volumes:
       # Dashboard settings (config.json) + source-health telemetry. Persisting
       # this is what lets the dashboard remember your setup across rebuilds.
       - ./data:/data
+      # Separate encryption root: config.json contains ciphertext, never this key.
+      - ./secrets/stream-picker-config.key:/run/secrets/stream_picker_config_key:ro
     healthcheck:
       # The slim image has no curl; python3 + urllib is always present.
       test: ["CMD", "python3", "-c",

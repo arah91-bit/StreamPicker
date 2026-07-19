@@ -35,6 +35,9 @@ prebuilt from GitHub's registry (amd64 + arm64):
 mkdir stream-picker && cd stream-picker
 curl -O https://raw.githubusercontent.com/arah91-bit/StreamPicker/main/docker-compose.yml
 curl -o .env https://raw.githubusercontent.com/arah91-bit/StreamPicker/main/.env.example
+install -d -m 700 secrets
+openssl rand -out secrets/stream-picker-config.key 32
+chmod 400 secrets/stream-picker-config.key
 
 # edit .env: set ADDON_SECRET (run: openssl rand -hex 24)
 #            set ADDON_PUBLIC_URL to how your devices reach this host
@@ -74,9 +77,12 @@ at `/setup`.
 
 It's one site with three tabs you click between — **Overview**, **Settings**,
 **Source health**. On Settings, each service has a **Test** button that checks
-your URL/key before you save; hit **Save**, then **Restart addon** to apply.
-Settings live in `./data/config.json` and survive rebuilds. Everything the
-wizard offers — and the long-tail tuning knobs — can also be changed there.
+your URL/key or login before you save; hit **Save**, then **Restart addon** to
+apply. Settings live in `./data/config.json`; sensitive values saved through
+the dashboard are AES-256-GCM ciphertext rather than plaintext. They survive
+rebuilds with the install's separate encryption key.
+Everything the wizard offers — and the long-tail tuning knobs — can also be
+changed there.
 
 Prefer to configure it from files instead of the UI (for scripting, or to hand
 the job to an AI)? Every setting is equally reachable by editing `.env` or
@@ -117,8 +123,9 @@ or mix them.
 **From the dashboard** (`http://<host>:8011/settings`) — the whole configuration is
 here. Connect each upstream (with a live **Test** button), pick how streams are
 handled, and open **Advanced tuning** for the full set of timeouts, budgets,
-and thresholds (searchable). **Save**, then **Restart addon** to apply. It all
-lands in `./data/config.json`.
+and thresholds (searchable). **Save**, then **Restart addon** to apply.
+Values land in `./data/config.json`; secret fields are encrypted there at rest
+and exports always redact them.
 
 **From files** (good for scripting or handing to an AI) — every setting is an
 environment variable. `.env.reference` is the complete, self-describing menu:
@@ -185,19 +192,50 @@ immutable tag — every commit on `main` is published as
 
 ## Connecting to an existing *arr / Jellyfin stack
 
-The "add missing titles" fallback (Radarr / Sonarr / Jellyseerr) and the local
-library check (Jellyfin via Jellio) are optional. If those run in another
-Compose project on the same host, uncomment the `networks:` blocks in
-`docker-compose.yml` and set the name to that project's network
-(`docker network ls`) — then you can point the dashboard at
-`http://radarr:7878` instead of an IP. Otherwise just give the dashboard a
-reachable URL for each.
+The "add missing titles" fallback (Radarr / Sonarr / Jellyseerr) and the native
+Jellyfin library check are optional. Jellio is not required. For Jellyfin, set:
+
+- `JELLYFIN_URL` to the base URL this container can reach, such as
+  `http://jellyfin:8096` on a shared Docker network.
+- `JELLYFIN_USERNAME` and `JELLYFIN_PASSWORD` to a dedicated Jellyfin user with
+  access only to the libraries and playback permissions this addon needs.
+
+The addon logs in through Jellyfin's native API, resolves library items itself,
+and returns a signed Auto Stream URL. Auto Stream then Range-proxies the media
+to the player with server-side authentication, preserving seeking and direct
+play without putting the Jellyfin password, access token, or internal address
+in the player URL.
+
+Most files play by **direct play** — the original bytes, untouched, no server
+load. A file whose video codec the player can't decode (MPEG‑2, XviD/DivX,
+VC‑1, WMV) would otherwise arrive as *audio with no picture*; for those, Auto
+Stream falls back to a **Jellyfin transcode** to H.264, served back as seekable
+HLS with the token still kept server-side. That fallback needs the Jellyfin
+user to be **allowed to transcode**: in Jellyfin's **Dashboard → Users → (this
+user)**, enable *Allow video playback that requires transcoding*, *Allow audio
+playback that requires transcoding*, and *Allow media playback that requires
+conversion by the server (remuxing)*. Set `JELLYFIN_TRANSCODE=0` to drop such
+titles from library results instead of transcoding them.
+
+If Jellyfin or the *arr services run in another Compose project on the same
+host, uncomment the `networks:` blocks in `docker-compose.yml` and set the name
+to that project's network (`docker network ls`). Otherwise give the dashboard
+a reachable URL for each service.
 
 ## Notes
 
 - `ADDON_SECRET` gates addon installation and is not accepted as the dashboard
   password. Dashboard credentials are stored as a salted scrypt verifier in
   `./data/admin-auth.json`, never as the chosen plaintext password.
+- Connection secrets entered through the dashboard, including
+  `JELLYFIN_PASSWORD`, are encrypted in `config.json` with AES-256-GCM and
+  redacted from settings exports. The master key is mounted read-only from the
+  host at `/run/secrets/stream_picker_config_key` (configured with
+  `CONFIG_ENCRYPTION_KEY_FILE`) and must stay outside the repository. The `.env`
+  format itself is plaintext, so enter the Jellyfin password through the
+  dashboard rather than putting it in `.env`. Encryption limits damage from an
+  accidental file copy or Git commit; it cannot protect against root or another
+  process with access to both the ciphertext and the master key.
 - To reset a forgotten dashboard account, stop the container, delete
   `data/admin-auth.json` and `data/admin-auth.initialized`, then start it and
   enroll again from the LAN.

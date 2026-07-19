@@ -2,8 +2,9 @@
 
 When the slow picker can't find a source *anywhere* (no online streams and not
 in the library), hand the title to Radarr (movies) or Sonarr (series) so it
-gets downloaded. Once it lands in the library, Jellio serves it and the next
-open plays it locally. The picker meanwhile shows a "being added" notice.
+gets downloaded. Once it lands in Jellyfin, the native library integration
+serves it and the next open plays it locally. The picker meanwhile shows a
+"being added" notice.
 
 Deliberately conservative: only ever called from pick_slow's no-source branch
 (never the fast picker), and deduped per title so repeated opens don't spam adds

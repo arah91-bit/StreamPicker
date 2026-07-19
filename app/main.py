@@ -120,6 +120,7 @@ async def _log_request(request: Request, call_next):
     # and must be masked for the same reason.
     path = request.url.path.replace(SECRET, "<secret>")
     path = re.sub(r"^/proxy/[^/]+", "/proxy/<token>", path)
+    path = re.sub(r"^/library/[^/]+", "/library/<token>", path)
     logger.info(f'req {client} "{request.method} {path}" '
                 f'{resp.status_code} ua="{ua}"')
     return resp
@@ -301,6 +302,12 @@ async def stream_slow(secret: str, media: str, media_id: str):
 async def stream_slow_mobile(secret: str, media: str, media_id: str):
     _check(secret)
     return await _streams(media, media_id, "mobile", slow=True)
+
+
+@app.api_route("/library/{token}", methods=["GET", "HEAD"])
+async def library_playback(token: str, request: Request):
+    """Opaque native-Jellyfin playback URL; credentials stay server-side."""
+    return await library.serve(token, request)
 
 
 # ── local admin dashboard (clean paths, no secret; see _admin guard) ─────────

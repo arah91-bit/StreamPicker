@@ -24,6 +24,7 @@ shown as the field's placeholder so the current value reads as an override.
 EXCLUDE = {
     "ADDON_SECRET": "the gate to this dashboard — set it in .env only",
     "CONFIG_FILE": "path of this settings store itself",
+    "CONFIG_ENCRYPTION_KEY_FILE": "mounted encryption key path; deployment wiring",
     "TELEMETRY_DIR": "data directory root; set via the volume mount",
     "BUFFER_DIR": "derived from the data directory",
     "NZB_HEALTH_DB": "derived from the data directory",
@@ -259,16 +260,20 @@ CATALOG = [
      "Half-life for time-decaying indexer evidence in the learned ordering."),
 
     # ── library & acquire ────────────────────────────────────────────────────
-    ("JELLIO_DIRECT_PLAY", "acquire", "bool", "1", "",
-     "Return direct-play library URLs from Jellyfin rather than transcoded."),
-    ("JELLIO_ENRICH", "acquire", "bool", "1", "",
-     "Enrich library hits with extra metadata."),
-    ("JELLIO_CACHE_TTL", "acquire", "num", "300", _S,
-     "How long a positive library lookup is cached."),
-    ("JELLIO_NEG_TTL", "acquire", "num", "60", _S,
-     "How long a 'not in library' result is cached."),
-    ("JELLIO_TIMEOUT", "acquire", "num", "8", _S,
-     "Library (Jellio) request timeout."),
+    ("JELLYFIN_INDEX_TTL", "acquire", "num", "300", _S,
+     "How long the native Jellyfin IMDb library index is cached."),
+    ("JELLYFIN_NEG_TTL", "acquire", "num", "60", _S,
+     "How long a native Jellyfin 'not in library' result is cached."),
+    ("JELLYFIN_TIMEOUT", "acquire", "num", "8", _S,
+     "Jellyfin metadata and authentication request timeout."),
+    ("JELLYFIN_STREAM_TOKEN_TTL", "acquire", "num", "604800", _S,
+     "Lifetime of a signed, credential-free Jellyfin playback URL."),
+    ("JELLYFIN_TRANSCODE", "acquire", "bool", "1", "",
+     "Let Jellyfin transcode library titles whose video codec a player can't "
+     "direct-play (MPEG-2, XviD/DivX, VC-1, WMV3), served back as seekable "
+     "HLS with the token kept server-side. Off: such titles are dropped from "
+     "library results rather than handed over as audio-only. Needs the "
+     "Jellyfin user's 'allow video transcoding' permission enabled."),
     ("ACQUIRE_DEDUP_TTL", "acquire", "num", "1800", _S,
      "Window in which repeat requests for a title won't re-add it."),
     ("ACQUIRE_FOREGROUND_WAIT", "acquire", "num", "3", _S,

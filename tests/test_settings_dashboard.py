@@ -243,23 +243,26 @@ class SecretHygieneTests(unittest.TestCase):
         os.environ["TMDB_API_KEY"] = "tmdb-secret-value-98765"
         os.environ["NZBDAV_PASS"] = "davpass-secret-55555"
         os.environ["FAST_BASE_URL"] = "https://comet.example/secret-config-path"
-        os.environ["JELLIO_URL"] = "https://jellio.example/secret-token"
+        os.environ["JELLYFIN_PASSWORD"] = "jellyfin-secret-password-2468"
         os.environ["NZB_INDEXERS"] = "idx|https://idx.example|secret-indexer-key"
         try:
             page = settings_ui.render()
             self.assertNotIn("tmdb-secret-value-98765", page)
             self.assertNotIn("davpass-secret-55555", page)
             self.assertNotIn("secret-config-path", page)
-            self.assertNotIn("secret-token", page)
+            self.assertNotIn("jellyfin-secret-password-2468", page)
             self.assertNotIn("secret-indexer-key", page)
-            self.assertGreaterEqual(page.count("kept · hidden"), 3)
+            # Sensitive URLs/multiline specs are fully hidden; ordinary secret
+            # fields show only their harmless four-character tail.
+            self.assertGreaterEqual(page.count("kept · hidden"), 2)
+            self.assertGreaterEqual(page.count("kept"), 5)
             self.assertIn("TMDB_API_KEY", page)   # the key name is shown
             self.assertIn("data-service='tmdb'", page)
         finally:
             os.environ.pop("TMDB_API_KEY", None)
             os.environ.pop("NZBDAV_PASS", None)
             os.environ.pop("FAST_BASE_URL", None)
-            os.environ.pop("JELLIO_URL", None)
+            os.environ.pop("JELLYFIN_PASSWORD", None)
             os.environ.pop("NZB_INDEXERS", None)
 
     def test_blank_sensitive_url_and_multiline_keep_values(self):
@@ -277,6 +280,28 @@ class SecretHygieneTests(unittest.TestCase):
             "and https://user:pw@nzbdav.example/nzbs/")
         self.assertNotIn("verysecret123", s)
         self.assertNotIn("user:pw", s)
+
+    def test_debrid_bearing_base_urls_are_treated_as_secret(self):
+        # A StremThru Torz URL carries the debrid key in its path, and a
+        # configured MediaFusion URL can encode credentials the same way the
+        # Comet URL does — so both must be classified secret and never appear
+        # in the export or the rendered page, not just Comet's FAST_BASE_URL.
+        for key in ("STREMTHRU_BASE_URL", "MEDIAFUSION_BASE_URL"):
+            self.assertTrue(config.is_secret(key), key)
+        os.environ["STREMTHRU_BASE_URL"] = (
+            "https://st.example/stremio/torz/torz-debrid-key-abcd")
+        os.environ["MEDIAFUSION_BASE_URL"] = (
+            "https://mf.example/D-mf-debrid-blob-wxyz/manifest.json")
+        try:
+            export = envref.current_dotenv()
+            self.assertNotIn("torz-debrid-key-abcd", export)
+            self.assertNotIn("mf-debrid-blob-wxyz", export)
+            page = settings_ui.render()
+            self.assertNotIn("torz-debrid-key-abcd", page)
+            self.assertNotIn("mf-debrid-blob-wxyz", page)
+        finally:
+            os.environ.pop("STREMTHRU_BASE_URL", None)
+            os.environ.pop("MEDIAFUSION_BASE_URL", None)
 
 
 class AdminGuardTests(unittest.TestCase):

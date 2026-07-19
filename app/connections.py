@@ -160,6 +160,62 @@ async def _tvdb(overrides: dict) -> dict:
         return _fail(t0, e)
 
 
+async def _jellyfin(overrides: dict) -> dict:
+    """Authenticate as a Jellyfin user and prove static Range playback.
+
+    A server API key can enumerate metadata but cannot direct-play video on
+    Jellyfin 10.11.  This deliberately exercises the user-session flow the
+    native library source actually uses, including one byte from a real file.
+    """
+    base = _val("JELLYFIN_URL", overrides).rstrip("/")
+    username = _val("JELLYFIN_USERNAME", overrides)
+    password = _val("JELLYFIN_PASSWORD", overrides)
+    t0 = time.monotonic()
+    if not base:
+        return _fail(t0, "no server URL configured")
+    if not username or not password:
+        return _fail(t0, "username and password are required")
+    auth = ('MediaBrowser Client="StreamPicker Setup", '
+            'Device="StreamPicker Server", '
+            'DeviceId="streampicker-setup-test", Version="1.0"')
+    try:
+        login = await _client.post(
+            f"{base}/Users/AuthenticateByName",
+            headers={"Authorization": auth},
+            json={"Username": username, "Pw": password})
+        login.raise_for_status()
+        payload = login.json()
+        token = str(payload.get("AccessToken") or "")
+        user_id = str((payload.get("User") or {}).get("Id") or "")
+        if not token or not user_id:
+            return _fail(t0, "login returned no user session")
+        headers = {"X-Emby-Token": token}
+        listing = await _client.get(
+            f"{base}/Users/{user_id}/Items", headers=headers,
+            params={"Recursive": "true", "IncludeItemTypes": "Movie,Episode",
+                    "Fields": "MediaSources", "EnableImages": "false",
+                    "EnableUserData": "false", "Limit": 25})
+        listing.raise_for_status()
+        playable = next((item for item in listing.json().get("Items") or []
+                         if item.get("MediaSources")), None)
+        if not playable:
+            return _fail(t0, "login works, but this user sees no playable video")
+        source = playable["MediaSources"][0]
+        source_id = str(source.get("Id") or "")
+        item_id = str(playable.get("Id") or "")
+        container = str(source.get("Container") or "mkv").lstrip(".")
+        probe = await _client.get(
+            f"{base}/Videos/{item_id}/stream.{container}", headers={
+                **headers, "Range": "bytes=0-0"},
+            params={"static": "true", "MediaSourceId": source_id})
+        if probe.status_code != 206 or not probe.headers.get("content-range"):
+            return _fail(t0, f"login works, direct-play Range returned HTTP "
+                             f"{probe.status_code}")
+        return _ok(t0, "user login accepted · native direct-play Range works")
+    except Exception as e:
+        return _fail(t0, e)
+
+
 async def _jellyseerr(overrides: dict) -> dict:
     base = _val("JELLYSEERR_URL", overrides).rstrip("/")
     key = _val("JELLYSEERR_API_KEY", overrides)
@@ -262,7 +318,7 @@ _TESTS = {
     "comet": lambda o: _manifest("FAST_BASE_URL", o),
     "stremthru": lambda o: _manifest("STREMTHRU_BASE_URL", o),
     "mediafusion": lambda o: _manifest("MEDIAFUSION_BASE_URL", o),
-    "jellio": lambda o: _manifest("JELLIO_URL", o),
+    "jellyfin": _jellyfin,
     "addon": _addon,
     "tmdb": _tmdb,
     "omdb": _omdb,

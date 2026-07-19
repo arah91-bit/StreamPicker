@@ -11,6 +11,9 @@
 # URLs), telemetry, the usenet-health DB, and the read-ahead buffer cache.
 # Committing any of this would leak keys and your viewing history.
 data/
+/secrets/
+*.key
+*.key.*
 
 # ── local tooling & build noise ──────────────────────────────────────────────
 # Rendered-dashboard snapshots saved at the repo root while iterating on page

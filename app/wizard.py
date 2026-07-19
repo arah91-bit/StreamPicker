@@ -72,7 +72,7 @@ _ST_CODE = {sid: code for sid, _, code, _ in DEBRIDS}
 # home shows the wizard instead of an empty overview, and apply() will not
 # report success — a config with only metadata/automation plays nothing.
 _SOURCE_KEYS = ("FAST_BASE_URL", "STREMTHRU_BASE_URL", "MEDIAFUSION_BASE_URL",
-                "NZB_INDEXERS", "EXTRA_ADDONS", "JELLIO_URL")
+                "NZB_INDEXERS", "EXTRA_ADDONS", "JELLYFIN_URL")
 
 
 def _f(key: str, label: str, kind: str = "text", placeholder: str = "") -> dict:
@@ -93,12 +93,13 @@ SOURCE_CARDS = [
                     "name | api-url | apikey — one indexer per line",
                     "multiline",
                     "myindexer | https://api.myindexer.com/api | abcd1234")]),
-    dict(id="jellio", title="Jellyfin library", test="jellio", source=True,
-         blurb="Plays titles you already own, checked before any search. "
-               "Needs the Jellio addon pointed at your Jellyfin.",
-         fields=[_f("JELLIO_URL",
-                    "Jellio manifest base URL — includes your token", "url",
-                    "https://your-host/jellio/<token>")]),
+    dict(id="jellyfin", title="Jellyfin library", test="jellyfin", source=True,
+         blurb="Plays titles you already own through Jellyfin's native API. "
+               "Credentials are encrypted and never sent to the player.",
+         fields=[_f("JELLYFIN_URL", "Server URL reachable by StreamPicker", "url",
+                    "http://jellyfin:8096"),
+                 _f("JELLYFIN_USERNAME", "Playback-only username"),
+                 _f("JELLYFIN_PASSWORD", "Password", "secret")]),
     dict(id="mediafusion", title="MediaFusion", test="mediafusion", source=True,
          blurb="A broad community scraper. Slower first hit; widens the search.",
          fields=[_f("MEDIAFUSION_BASE_URL", "Manifest base URL", "url",
@@ -491,7 +492,7 @@ function collect(){
 }
 const NICE={comet:'Torrent lane (Comet)',stremthru:'Torrent lane (StremThru)',
  torbox:'TorBox key',realdebrid:'Real-Debrid key',alldebrid:'AllDebrid key',
- premiumize:'Premiumize key',indexers:'Usenet indexers',jellio:'Jellyfin library',
+ premiumize:'Premiumize key',indexers:'Usenet indexers',jellyfin:'Jellyfin library',
  mediafusion:'MediaFusion',addon:'Custom addon',nzbdav:'nzbdav',radarr:'Radarr',
  sonarr:'Sonarr',jellyseerr:'Jellyseerr',tmdb:'TMDB',omdb:'OMDb',tvdb:'TVDB'};
 function showChecks(results){

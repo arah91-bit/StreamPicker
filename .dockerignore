@@ -1,6 +1,10 @@
 app/__pycache__
 app.bak*
 data
+secrets
+secrets/**
+*.key
+*.key.*
 .dockerignore
 .env
 .env.*

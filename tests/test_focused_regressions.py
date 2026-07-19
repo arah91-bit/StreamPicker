@@ -1,7 +1,7 @@
 """Focused regressions for picker and direct-Usenet edge cases.
 
 The async tests replace every network operation with deterministic in-process
-fakes.  No fixture in this module contacts an indexer, nzbdav, or Jellio.
+fakes.  No fixture in this module contacts an indexer, nzbdav, or Jellyfin.
 """
 
 from __future__ import annotations

@@ -43,7 +43,7 @@ source; add the rest later from the dashboard.
 | **OMDb API key** | Independent title identity and runtime check | Optional | The app persists exact-IMDb results and caps uncached calls at 750/day, leaving headroom under OMDb's 1,000-call plan. |
 | More search addons | Wider coverage | Optional | **StremThru Torz** (`MunifTanjim/stremthru`), **MediaFusion** (`mhdzumair/MediaFusion`), or *any* addon via the **Custom addons** panel (AIOStreams, etc.). |
 | **Usenet lane** | Direct usenet as a source | Optional (advanced) | Needs Newznab **indexers** (paid), a usenet **provider** (paid), and **nzbdav** to mount NZBs as a streamable filesystem. The most complex piece — skip it for your first run. |
-| Jellyfin + Jellio | Serve titles you already own first | Optional | Jellio is a Jellyfin→player addon; its URL goes in the dashboard. |
+| Jellyfin library | Serve titles you already own first | Optional | Native Jellyfin API integration; no Jellio plugin is required. Give it an internal URL and a restricted playback user's login. |
 | Radarr / Sonarr / Jellyseerr | Auto-request titles nothing can stream yet | Optional | Pointed at from the dashboard. |
 | A reverse proxy | HTTPS + reach the addon from outside your LAN | Needed for remote use | Caddy / Traefik / nginx. Not needed if you only watch on your LAN. |
 | A player | Plays the streams | **Essential** | Stremio, or a Stremio-compatible player (Nuvio, Vidi, Fusion). |
@@ -85,9 +85,15 @@ the compose file and the env template:
 mkdir stream-picker && cd stream-picker
 curl -O https://raw.githubusercontent.com/arah91-bit/StreamPicker/main/docker-compose.yml
 curl -o .env https://raw.githubusercontent.com/arah91-bit/StreamPicker/main/.env.example
+install -d -m 700 secrets
+openssl rand -out secrets/stream-picker-config.key 32
+chmod 400 secrets/stream-picker-config.key
 ```
-(Working from a clone of the repo instead? `cp .env.example .env` and swap the
-compose file's `image:` line for `build: .`.)
+The last three commands create the separate 32-byte key that encrypts dashboard
+secrets. Keep it out of Git and back it up separately from `./data`; neither a
+lost key nor a ciphertext file by itself can recover the credentials. (Working
+from a clone of the repo instead? `cp .env.example .env` and swap the compose
+file's `image:` line for `build: .`.)
 
 ### Step 2 — fill in your `.env`
 Edit `.env` and set the only two values that matter up front:
@@ -128,7 +134,12 @@ On **Settings → Connections**:
 3. Click each service's **Test** button — you want a green dot before moving on.
 4. Optionally add StremThru / MediaFusion, or any other addon under **Custom
    addons** (paste its `…/manifest.json` URL and Test it).
-5. Click **Save**, then **Restart addon** to apply.
+5. Optionally enable **Jellyfin library**. Enter the internal base URL the
+   container can reach (for example `http://jellyfin:8096`) and the username
+   and password for a dedicated Jellyfin user. Give that user only the library
+   access and playback permissions it needs, then use **Test** to verify login.
+6. Click **Save**, then **Restart addon** to apply. Sensitive values entered in
+   the dashboard are encrypted at rest and redacted from exports.
 
 ### Step 6 — choose how streams are handled
 On **Settings → Stream path**, pick one:
@@ -148,7 +159,9 @@ autostream.example.com {
 ```
 Set `ADDON_PUBLIC_URL=https://autostream.example.com` in `.env` and restart.
 The dashboard stays 404 to the public (the local-only guard blocks proxied
-requests); only the secret-gated addon URLs are reachable from outside.
+requests); only the secret-gated addon URLs are reachable from outside. A
+connected Jellyfin server does not need its own public URL: Auto Stream serves
+library playback through its authenticated, Range-capable proxy.
 
 ### Step 8 — install in your player
 Add these in your player → Addons (swap in your base URL and `ADDON_SECRET`):
@@ -178,7 +191,11 @@ Install the fast and best-quality addons side by side — they share one search.
 - **Usenet lane** — add Newznab indexers (`NZB_INDEXERS`) + nzbdav creds in
   Settings. Expect it to be fiddly; usenet is ~40% reliable by nature and the
   probe correctly drops the misses.
-- **Library** — add your Jellio (Jellyfin) URL so titles you own play first.
+- **Library** — add `JELLYFIN_URL`, `JELLYFIN_USERNAME`, and
+  `JELLYFIN_PASSWORD` so titles you own play first. The addon uses Jellyfin's
+  native API and its own signed playback proxy; Jellio is not required and the
+  Jellyfin token never appears in the player URL. Enter the password through
+  the dashboard so it is encrypted rather than storing it in plaintext `.env`.
 - **Auto-acquire** — point Radarr/Sonarr/Jellyseerr so titles nothing can stream
   get requested automatically. If those run in another Compose project, see the
   `networks:` note in `docker-compose.yml`.
@@ -203,6 +220,10 @@ Everything is file- and API-driven, so no clicking is required:
   `{"values": {KEY: VALUE, …}}`; test with `POST
   /api/settings/test/<service>`; export with `GET /api/settings/export.env`;
   apply with `POST /api/settings/restart`. Unknown keys are rejected.
+- **Secrets via API:** send secret values only over the authenticated dashboard
+  API (and HTTPS if the dashboard is exposed). Sensitive values are sealed with
+  AES-256-GCM before `config.json` is written and are redacted on export. Do not
+  put `JELLYFIN_PASSWORD` in plaintext `.env` for a normal deployment.
 - **Precedence:** stored config (`data/config.json`) overrides `.env`, which
   overrides code defaults. Changes apply on **restart**.
 - **Verify programmatically:** `GET /health/ready` → `{"ok":true,…}`; open a title's
@@ -223,6 +244,13 @@ Everything is file- and API-driven, so no clicking is required:
   `TRUSTED_PROXIES`.
 - **Player can't play the stream** — check `ADDON_PUBLIC_URL` is reachable from
   the player's device (it's baked into the proxied playback URLs).
+- **Jellyfin login passes but local playback fails** — confirm `JELLYFIN_URL`
+  is reachable from inside the Stream Picker container and that the dedicated
+  user has permission to play that library. The player itself does not need to
+  reach Jellyfin.
+- **Encrypted settings stop loading after a move** — restore the matching
+  32-byte master key mounted at `/run/secrets/stream_picker_config_key`. The
+  ciphertext deliberately cannot be decrypted with a replacement key.
 - **Settings didn't take effect** — they apply on **restart**; use the dashboard's
   Restart button or `docker compose restart`.
 - **Health check** — `docker compose ps`, `docker compose logs -f`, and the

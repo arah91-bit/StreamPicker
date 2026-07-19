@@ -1434,7 +1434,7 @@ def invalidate(media_id: str) -> None:
 
 
 def _as_verified(lib: list[dict]) -> list[tuple[dict, None]]:
-    """Local library (Jellio) files are reliable, so they enter the verified
+    """Local Jellyfin library files are reliable, so they enter the verified
     tier as (stream, None) and get quality-sorted alongside probe-verified
     online streams — never pinned first. A faster or higher-quality online
     source therefore outranks a lower-res library copy in both pickers."""
@@ -1810,7 +1810,7 @@ async def _race_fast(media: str, media_id: str, profile: dict, runtime: float,
             streams = task.result() or []
         except Exception:
             streams = []
-        # Local is usually excellent, but stale Jellyfin/Jellio URLs still
+        # Local is usually excellent, but stale Jellyfin items can still
         # happen. Put library files through the same byte gate as every other
         # source before allowing one to become the automatic first result.
         _add_streams(streams)
@@ -1932,7 +1932,7 @@ async def _race_fast(media: str, media_id: str, profile: dict, runtime: float,
 
 async def pick(media: str, media_id: str, profile_name: str = "full") -> list[dict]:
     # Local library is a fast, reliable source, so the fast picker uses it too:
-    # query Jellio alongside the online search and put any library hit first.
+    # query Jellyfin alongside the online search and put any library hit first.
     started = time.monotonic()
     lib_task = (asyncio.create_task(library.streams(media, media_id))
                 if library.enabled() else None)
@@ -1940,7 +1940,7 @@ async def pick(media: str, media_id: str, profile_name: str = "full") -> list[di
     if lib_task:
         try:
             # A ready/cached library answer is effectively free. If online has
-            # already produced a verified #1, never delay it waiting on Jellio;
+            # already produced a verified #1, never delay it waiting on Jellyfin;
             # otherwise let the library use only the remainder of the safety cap.
             if lib_task.done():
                 lib = lib_task.result()
@@ -2329,7 +2329,7 @@ async def pick_slow(media: str, media_id: str,
         logger.info(f"cache hit for {cache_key}")
         return hit
 
-    # Local library (Jellio) — a fast, reliable source; fire it now, use later.
+    # Local Jellyfin library — a fast, reliable source; fire it now, use later.
     lib_task = (asyncio.create_task(library.streams(media, media_id))
                 if library.enabled() else None)
 
