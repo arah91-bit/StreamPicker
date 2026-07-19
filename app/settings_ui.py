@@ -13,9 +13,10 @@ values — is set in monospace; human copy is in the system sans.
 """
 
 import html
+import json
 import os
 
-from app import adminui, config, knobs
+from app import adminui, config, debrid, knobs
 
 ADDON_NAME = os.environ.get("ADDON_NAME", "Auto Stream")
 
@@ -52,6 +53,18 @@ padding:14px 16px;border-bottom:1px solid var(--line)}
 .envk{font:10.5px var(--mono);color:var(--mut);opacity:.65;margin-left:8px}
 .ctl{display:flex;align-items:center;gap:10px;flex-shrink:0}
 output{font:13px var(--mono);min-width:64px;text-align:right}
+.brctl{display:flex;align-items:center;gap:10px}
+.brctl .br-range{width:150px}
+.br-num{width:62px;font:13px var(--mono);text-align:right;padding:5px 6px;
+background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:7px}
+.br-num::-webkit-outer-spin-button,.br-num::-webkit-inner-spin-button{margin:0}
+.brctl output{min-width:72px}
+.yrctl{display:flex;align-items:center;gap:9px}
+.yr-word{color:var(--mut);font-size:13px}
+.yr-num{width:74px;font:13px var(--mono);text-align:right;padding:5px 6px;
+background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:7px}
+.yr-num:disabled{cursor:not-allowed}
+.yrctl.off .yr-word,.yrctl.off .yr-num{opacity:.4}
 
 .swi{appearance:none;-webkit-appearance:none;width:42px;height:24px;margin:0;
 border-radius:99px;background:var(--line);position:relative;cursor:pointer;
@@ -94,7 +107,35 @@ text-transform:uppercase}
 
 .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(310px,1fr));
 gap:12px}
+details.conng{border-top:1px solid var(--line)}
+details.conng:first-of-type{border-top:0}
+details.conng>summary{cursor:pointer;padding:11px 2px;list-style:none;
+display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+details.conng>summary::-webkit-details-marker{display:none}
+details.conng>summary::before{content:'▸';color:var(--mut);font-size:11px;
+align-self:center}
+details.conng[open]>summary::before{content:'▾'}
+details.conng>summary:hover .conngtitle{color:var(--accent)}
+.conngtitle{font-weight:600;font-size:14.5px}
+.connghint{color:var(--mut);font-size:12.5px;flex:1;min-width:120px}
+.conngcount{color:var(--mut);font:11px var(--mono);white-space:nowrap}
+details.conng>.cards{margin:2px 0 16px}
 .conn{padding:14px 16px;display:flex;flex-direction:column;gap:10px}
+.keylink{font-size:12px;color:var(--accent);text-decoration:none;white-space:nowrap}
+.keylink:hover{text-decoration:underline}
+.debridrow{display:flex;align-items:center;gap:10px;padding:10px 0;
+border-bottom:1px solid var(--line)}
+.debridrow:last-of-type{border-bottom:0}
+.badge2{font:700 10px var(--mono);color:var(--accent);background:var(--accent-soft);
+border-radius:6px;padding:3px 7px;letter-spacing:.03em;flex-shrink:0}
+.debridname{font-weight:600;font-size:14px;min-width:92px}
+.debridkey{flex:1;min-width:120px}
+.debridadd{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:12px;
+padding-top:14px;border-top:1px solid var(--line)}
+.debridadd input{flex:1;min-width:140px}
+.debridfoot{display:flex;align-items:center;gap:10px;margin-top:12px;flex-wrap:wrap}
+.debridres{font:11.5px var(--mono);color:var(--mut);overflow-wrap:anywhere;flex:1}
+.debridres.ok{color:var(--good)}.debridres.bad{color:var(--bad)}
 .chead{display:flex;justify-content:space-between;gap:10px;align-items:baseline}
 .cname{font-weight:600}
 .crole{color:var(--mut);font-size:12px;margin-top:1px}
@@ -217,10 +258,40 @@ $$('input[name=streammode]').forEach(r=>r.addEventListener('change',
  ()=>setMode(r.value,false)));
 
 document.addEventListener('input',e=>{
- if(e.target.matches('input[type=range]')){
+ if(e.target.matches('input[type=range]')&&!e.target.closest('.brctl')){
   const o=e.target.closest('.ctl').querySelector('output');
   if(o)o.textContent=e.target.value+(e.target.dataset.unit||'');}
  if(e.target.dataset.key!==undefined||e.target.name==='streammode')refreshBar();
+});
+
+/* Max-bitrate style control: a slider and a number box drive one saved value,
+   and its floor (0) reads as an off-switch label ("Unlimited") instead of "0". */
+function brSync(box,from){
+ const rng=box.querySelector('.br-range'),num=box.querySelector('.br-num'),
+   out=box.querySelector('output');
+ if(from==='range')num.value=rng.value; else rng.value=(num.value||0);
+ const v=parseFloat(num.value||'0');
+ out.textContent=(!v)?num.dataset.zero:(num.value+num.dataset.unit);
+}
+$$('.brctl').forEach(box=>{
+ box.querySelector('.br-range').addEventListener('input',
+  ()=>{brSync(box,'range');refreshBar();});
+ box.querySelector('.br-num').addEventListener('input',()=>brSync(box,'num'));
+});
+
+/* Feature-switch-with-a-year control (accept DVD for old titles): a toggle and
+   a year box drive one hidden saved value — 0 when off, the year when on. */
+$$('.yrctl').forEach(box=>{
+ const on=box.querySelector('.yr-on'),num=box.querySelector('.yr-num'),
+   hid=box.querySelector('input[type=hidden]');
+ function sync(fire){
+  num.disabled=!on.checked;box.classList.toggle('off',!on.checked);
+  hid.value=on.checked?String(parseInt(num.value||'0',10)||0):'0';
+  if(fire)hid.dispatchEvent(new Event('input',{bubbles:true}));
+ }
+ on.addEventListener('change',()=>sync(true));
+ num.addEventListener('input',()=>sync(true));
+ sync(false);
 });
 
 async function post(url,body){
@@ -325,6 +396,89 @@ $('#addonlist').addEventListener('click',async e=>{
 });
 renderAddons();
 
+/* debrid manager: a provider list that POSTs to /api/settings/debrid, which
+   rewrites the keys inside the Comet + StremThru URLs server-side (the stored
+   keys never reach the browser — a blank key means "keep the stored one"). */
+const DBOX=$('#debridmgr');
+if(DBOX){
+ const DATA=JSON.parse($('#debrid-data').textContent);
+ const PROV={};DATA.providers.forEach(p=>PROV[p.id]=p);
+ let ROWS=DATA.current.map(id=>({service:id,hasKey:true,key:''}));
+ const used=()=>new Set(ROWS.map(r=>r.service));
+ function renderPicker(){
+  const u=used(),avail=DATA.providers.filter(p=>!u.has(p.id));
+  $('#debrid_pick').innerHTML=avail.length
+   ?avail.map(p=>`<option value='${p.id}'>${hesc(p.label)}</option>`).join('')
+   :"<option value=''>all added</option>";
+  $('#debrid_pick').disabled=$('#debrid_add').disabled=!avail.length;
+  $('#debrid_newkey').disabled=!avail.length;
+  syncKeyLink();
+ }
+ function syncKeyLink(){
+  const p=PROV[$('#debrid_pick').value],link=$('#debrid_keylink');
+  if(p){link.href=p.key_url;link.textContent='where is my '+p.label+' key?';
+   link.hidden=false;
+   $('#debrid_newkey').placeholder='paste your '+p.label+' API key';}
+  else link.hidden=true;
+ }
+ function renderRows(){
+  const list=$('#debridlist');
+  if(!ROWS.length){list.innerHTML=
+    "<div class='addonempty'>No debrid yet — add one below.</div>";
+   renderPicker();return;}
+  list.innerHTML=ROWS.map((r,i)=>{const p=PROV[r.service];
+   const ph=r.hasKey?'kept · hidden — blank keeps it':'paste API key';
+   return `<div class='debridrow' data-i='${i}'>`+
+    `<span class='badge2'>${hesc(p.badge)}</span>`+
+    `<span class='debridname'>${hesc(p.label)}</span>`+
+    `<input type='password' class='debridkey' data-i='${i}' `+
+    `autocomplete='new-password' spellcheck='false' `+
+    `placeholder='${ph}' value='${hesc(r.key)}'>`+
+    `<button type='button' class='addon-del' data-i='${i}' `+
+    `title='Remove'>&times;</button></div>`;}).join('');
+  renderPicker();
+ }
+ function setRes(msg,cls){const r=$('#debridres');
+  r.className='debridres'+(cls?' '+cls:'');r.textContent=msg||'';}
+ $('#debrid_pick').addEventListener('change',syncKeyLink);
+ $('#debrid_add').addEventListener('click',()=>{
+  const id=$('#debrid_pick').value,key=$('#debrid_newkey').value.trim();
+  if(!id)return;
+  if(!key)return setRes('Paste the API key for '+PROV[id].label+'.','bad');
+  ROWS.push({service:id,hasKey:false,key});
+  $('#debrid_newkey').value='';setRes('');renderRows();
+ });
+ $('#debrid_newkey').addEventListener('keydown',
+  e=>{if(e.key==='Enter')$('#debrid_add').click();});
+ $('#debridlist').addEventListener('input',e=>{
+  const k=e.target.closest('.debridkey');if(k)ROWS[+k.dataset.i].key=k.value;});
+ $('#debridlist').addEventListener('click',e=>{
+  const del=e.target.closest('.addon-del');if(!del)return;
+  ROWS.splice(+del.dataset.i,1);setRes('');renderRows();});
+ async function sendDebrids(dry){
+  if(!ROWS.length)return setRes('Add at least one debrid service.','bad');
+  const debrids=ROWS.map(r=>({service:r.service,key:(r.key||'').trim()}));
+  const btn=dry?$('#debrid_test'):$('#debrid_save');
+  btn.disabled=true;setRes(dry?'testing…':'saving…');
+  try{
+   const res=await post('/api/settings/debrid',{debrids,dry_run:dry});
+   const parts=Object.entries(res.results||{}).map(([k,v])=>
+    (v.ok===false?'✗ ':v.ok===true?'✓ ':'• ')+(PROV[k]?PROV[k].label:k));
+   if(dry){setRes(parts.join('   ')||'no checkable keys — save to apply',
+     res.ok?'ok':'bad');}
+   else if(res.ok){
+    ROWS=ROWS.map(r=>({service:r.service,hasKey:true,key:''}));renderRows();
+    setRes('Saved — restart to apply.','ok');
+    $('#savebar').dataset.restart='1';refreshBar();}
+   else setRes('Rejected: '+parts.join('   '),'bad');
+  }catch(e){setRes(e.message,'bad');}
+  btn.disabled=false;
+ }
+ $('#debrid_test').addEventListener('click',()=>sendDebrids(true));
+ $('#debrid_save').addEventListener('click',()=>sendDebrids(false));
+ renderRows();
+}
+
 const advsearch=$('#advsearch');
 if(advsearch)advsearch.addEventListener('input',()=>{
  const q=advsearch.value.trim().toLowerCase();
@@ -363,6 +517,40 @@ def _row(spec: dict) -> str:
         on = val.strip().lower() not in ("", "0", "false", "no", "off")
         ctl = (f"<input type='checkbox' class='swi' data-key='{key}' "
                f"data-init='{'1' if on else '0'}' {'checked' if on else ''}>")
+    elif t == "number" and spec.get("toggle_year"):
+        # A feature switch with an editable year: a toggle plus a year box that
+        # greys out when off. A hidden field carries the saved value (0 when
+        # off, the year when on) so the normal dirty/save path is unchanged.
+        # See the .yrctl handlers in _JS.
+        on = val.strip() not in ("", "0")
+        year = val if on else str(spec.get("on_value") or spec.get("default") or "")
+        ctl = (f"<div class='yrctl{'' if on else ' off'}'>"
+               f"<input type='checkbox' class='swi yr-on' "
+               f"{'checked' if on else ''} "
+               f"aria-label='{_esc(spec['label'])} enabled'>"
+               f"<span class='yr-word'>before</span>"
+               f"<input type='number' class='yr-num' min='{spec.get('year_min', 1940)}' "
+               f"max='{spec['max']}' step='1' value='{_esc(year)}' "
+               f"{'' if on else 'disabled'} "
+               f"aria-label='{_esc(spec['label'])} year'>"
+               f"<input type='hidden' data-key='{key}' data-init='{_esc(val)}' "
+               f"value='{_esc(val)}'></div>")
+    elif t == "number" and spec.get("zero_label"):
+        # A slider you can also type into; its floor doubles as an off switch
+        # ("Unlimited" at 0). The number box carries data-key (the saved value);
+        # the range only mirrors it. See the .brctl handlers in _JS.
+        zero, unit = spec["zero_label"], spec["unit"]
+        disp = zero if val.strip() in ("", "0") else f"{_esc(val)}{_esc(unit)}"
+        ctl = (f"<div class='brctl'>"
+               f"<input type='range' class='br-range' min='{spec['min']}' "
+               f"max='{spec['max']}' step='{spec['step']}' value='{_esc(val)}' "
+               f"aria-label='{_esc(spec['label'])}'>"
+               f"<input type='number' class='br-num' min='{spec['min']}' "
+               f"max='{spec['max']}' step='{spec['step']}' value='{_esc(val)}' "
+               f"data-key='{key}' data-init='{_esc(val)}' "
+               f"data-unit='{_esc(unit)}' data-zero='{_esc(zero)}' "
+               f"aria-label='{_esc(spec['label'])} value'>"
+               f"<output>{disp}</output></div>")
     elif t == "number":
         ctl = (f"<input type='range' min='{spec['min']}' max='{spec['max']}' "
                f"step='{spec['step']}' value='{_esc(val)}' data-key='{key}' "
@@ -542,6 +730,82 @@ def _conn_card(conn: dict) -> str:
             f"<span class='tres'></span></div></div>")
 
 
+def _conn_configured(conn: dict) -> bool:
+    """Whether any of a connection's fields currently holds a value."""
+    return any(config.pending(f["key"]).strip() for f in conn["fields"])
+
+
+def _conn_group(title: str, blurb: str, conns: list[dict], *,
+                start_open: bool) -> str:
+    """One collapsible category of connection cards. Opens by default when it is
+    the primary group or already has something configured, so a fresh instance
+    isn't a wall of empty forms but nothing you've set up ever hides itself."""
+    if not conns:
+        return ""
+    n_set = sum(_conn_configured(c) for c in conns)
+    count = (f"{n_set}/{len(conns)} configured" if n_set
+             else f"{len(conns)} available")
+    cards = "".join(_conn_card(c) for c in conns)
+    open_attr = " open" if (start_open or n_set) else ""
+    return (f"<details class='conng'{open_attr}><summary>"
+            f"<span class='conngtitle'>{_esc(title)}</span>"
+            f"<span class='connghint'>{_esc(blurb)}</span>"
+            f"<span class='conngcount'>{_esc(count)}</span></summary>"
+            f"<div class='cards'>{cards}</div></details>")
+
+
+def _conn_groups() -> str:
+    known = {gid for gid, _t, _b in config.CONNECTION_GROUPS}
+    out = []
+    for i, (gid, title, blurb) in enumerate(config.CONNECTION_GROUPS):
+        conns = [c for c in config.CONNECTIONS if c.get("cat") == gid]
+        out.append(_conn_group(title, blurb, conns, start_open=(i == 0)))
+    # Safety net: any connection without a known category still shows up rather
+    # than silently vanishing from the page.
+    leftovers = [c for c in config.CONNECTIONS if c.get("cat") not in known]
+    out.append(_conn_group("Other", "", leftovers, start_open=False))
+    return "".join(out)
+
+
+def _debrid_manager() -> str:
+    """A friendly editor for the debrid providers embedded in the two torrent
+    lane URLs. The raw Comet/StremThru cards under Connections stay as the
+    escape hatch; this rewrites only the key list and keeps the rest. Stored
+    keys are never emitted — only which providers are configured."""
+    ids = [d["service"] for d in debrid.current(config.pending("FAST_BASE_URL"))]
+    have = set(ids)
+    for d in debrid.stremthru_current(config.pending("STREMTHRU_BASE_URL")):
+        if d["service"] not in have:
+            ids.append(d["service"])
+            have.add(d["service"])
+    data = json.dumps({
+        "current": ids,
+        "providers": [{"id": p["id"], "label": p["label"], "badge": p["badge"],
+                       "key_url": debrid.signup_url(p)}
+                      for p in debrid.PROVIDERS]}, separators=(",", ":"))
+    return (
+        "<h2>Debrid services</h2>"
+        "<p class='blurb'>The providers your two torrent lanes search. Adding or "
+        "removing one here rewrites the keys inside the Comet and StremThru URLs "
+        "and leaves every other setting in them untouched — leave a key blank to "
+        "keep the one already stored. Changes apply on restart.</p>"
+        "<div class='card' id='debridmgr' style='padding:14px 16px'>"
+        "<div id='debridlist'></div>"
+        "<div class='debridadd'>"
+        "<select id='debrid_pick' aria-label='Debrid provider'></select>"
+        "<input id='debrid_newkey' type='password' autocomplete='new-password' "
+        "spellcheck='false' placeholder='API key'>"
+        "<button type='button' class='btn ghost' id='debrid_add'>Add</button>"
+        "<a id='debrid_keylink' class='keylink' target='_blank' "
+        "rel='noopener noreferrer' hidden></a></div>"
+        "<div class='debridfoot'>"
+        "<button type='button' class='btn ghost' id='debrid_test'>Test keys</button>"
+        "<button type='button' class='btn' id='debrid_save'>Save debrids</button>"
+        "<span class='debridres' id='debridres'></span></div>"
+        f"<script type='application/json' id='debrid-data'>{data}</script>"
+        "</div>")
+
+
 def render() -> str:
     restart = "1" if config.restart_pending() else "0"
     sections = _stream_mode()
@@ -549,7 +813,7 @@ def render() -> str:
         if gid == "stream":
             continue
         sections += _settings_section(gid, title, blurb)
-    cards = "".join(_conn_card(c) for c in config.CONNECTIONS)
+    conn_groups = _conn_groups()
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="robots" content="noindex">
@@ -562,11 +826,13 @@ def render() -> str:
 Saved to <code>/data/config.json</code> on the addon's data volume; changes
 apply on restart. Anyone deploying their own instance starts here.</p>
 {sections}
+{_debrid_manager()}
 <h2>Connections</h2>
-<p class="blurb">Every upstream service this instance uses. Test verifies the
-values in the form — including keys you haven't saved yet. Leave a masked
-field blank to keep the stored key.</p>
-<div class="cards">{cards}</div>
+<p class="blurb">Every upstream service this instance uses, grouped by what it
+does — click a heading to open or close that section. Test verifies the values
+in the form — including keys you haven't saved yet. Leave a masked field blank
+to keep the stored key.</p>
+{conn_groups}
 {_custom_addons()}
 {_advanced_section()}
 </div>

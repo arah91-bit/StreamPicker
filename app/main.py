@@ -28,7 +28,7 @@ except ValueError as exc:
     raise RuntimeError(f"invalid stream-picker configuration: {exc}") from exc
 
 from app import (acquire, admin_auth, adminui, anime, connections, dashboard,  # noqa: E402
-                 envref, library, meta, overview, picker, probe, proxy,
+                 debrid, envref, library, meta, overview, picker, probe, proxy,
                  reputation, settings_ui, sources, tbcache, telemetry, usenet,
                  usenet_health, vprobe, wizard)
 
@@ -473,6 +473,28 @@ async def settings_test(service: str, request: Request):
         return await connections.test(service, dict(body.get("values") or {}))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/settings/debrid")
+async def settings_debrid(request: Request):
+    """Edit the debrid provider list embedded in the Comet/StremThru lane URLs,
+    preserving every other setting in them. A blank key keeps the stored one;
+    dry_run only tests the keys. Persists through config.save so the rewritten
+    (secret) URLs are encrypted at rest like any other sensitive value."""
+    await _admin(request, mutation=True)
+    body = await _json_body(request)
+    try:
+        res = await debrid.apply(
+            config.pending("FAST_BASE_URL"),
+            config.pending("STREMTHRU_BASE_URL"),
+            body.get("debrids"),
+            dry_run=bool(body.get("dry_run")))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    values = res.pop("values", None)
+    if values:
+        res["restart_needed"] = config.save(values)["restart_needed"]
+    return res
 
 
 @app.get("/api/settings/export.env")

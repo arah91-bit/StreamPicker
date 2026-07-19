@@ -110,6 +110,21 @@ SETTINGS = [
          label="Fast picker deadline",
          desc="Hard cap on how long the fast picker may hold a request "
               "before answering with what it has."),
+    dict(key="MAX_BITRATE_MBPS", group="picking", type="number",
+         default="0", min=0, max=120, step=5, unit=" Mbps",
+         zero_label="Unlimited", label="Max bitrate",
+         desc="Skip any release whose average bitrate (file size ÷ runtime) "
+              "runs higher than this — handy on a capped or slow connection so "
+              "a 90 Mbps remux is never picked. 0 = unlimited: pick the best "
+              "quality regardless of bitrate."),
+    dict(key="FAST_SD_BEFORE_YEAR", group="picking", type="number",
+         default="2000", min=0, max=2015, step=1, unit="", toggle_year=True,
+         year_min=1940, label="Accept DVD quality for old titles",
+         desc="For anything released before this year, a verified DVD/SD "
+              "stream counts as good enough — so an old, SD-only title (a "
+              "pre-HD TV show, say) returns quickly instead of holding the "
+              "whole deadline hunting for an HD copy that was never made. HD "
+              "still wins whenever it exists. Off = always hold out for HD."),
 
     dict(key="ACQUIRE_ENABLED", group="acquire", type="bool", default="1",
          label="Add missing titles automatically",
@@ -151,31 +166,49 @@ SETTINGS = [
 # field kind: url | text | secret | multiline. Secrets render masked and an
 # empty submit means "keep what's stored". NZB_INDEXERS is one name|url|key
 # per line in the UI, ';'-joined in storage (the format usenet.py parses).
+# Connections are grouped under these collapsible headings on the settings
+# page, in this order. Each connection below carries a matching `cat`. (id,
+# title, blurb)
+CONNECTION_GROUPS = [
+    ("sources", "Debrid & scrapers",
+     "Where streams come from — cached-debrid search and broad scrapers."),
+    ("usenet", "Usenet",
+     "Direct usenet: indexer searches and the mount that streams NZBs."),
+    ("metadata", "Metadata",
+     "Titles, languages and runtimes — how the picker knows what it's matching."),
+    ("library", "Your library",
+     "Titles you already own, checked before any search runs."),
+    ("acquire", "Requests & downloaders",
+     "Fallbacks that fetch a missing title when nothing can stream it yet."),
+]
+
 CONNECTIONS = [
     dict(id="comet", name="Comet", role="Fast lane — cached debrid search",
+        cat="sources",
         fields=[dict(key="FAST_BASE_URL", label="Manifest base URL",
                       kind="url", sensitive=True,
                       hint="Your configured Comet base, without "
                            "/manifest.json. The URL embeds your debrid "
                            "keys — treat it like a password.")]),
     dict(id="stremthru", name="StremThru Torz",
-         role="Long-tail crowdsourced hash index",
+         role="Long-tail crowdsourced hash index", cat="sources",
          fields=[dict(key="STREMTHRU_BASE_URL", label="Manifest base URL",
                       kind="url", sensitive=True,
                       hint="The Torz URL embeds your debrid key in its path — "
                            "treat it like a password.")]),
     dict(id="mediafusion", name="MediaFusion",
          role="Broad scrape — slow first hit, feeds the quality pass",
+         cat="sources",
          fields=[dict(key="MEDIAFUSION_BASE_URL", label="Manifest base URL",
                       kind="url", sensitive=True,
                       hint="A configured MediaFusion URL can encode your "
                            "debrid credentials — treat it like a password.")]),
     dict(id="indexers", name="Usenet indexers",
-         role="Direct usenet searches (Newznab)",
+         role="Direct usenet searches (Newznab)", cat="usenet",
         fields=[dict(key="NZB_INDEXERS", label="One per line: name|api-url|apikey",
                       kind="multiline", sensitive=True)]),
     dict(id="nzbdav", name="nzbdav",
-         role="Mounts NZBs so usenet releases stream directly",
+         role="Mounts NZBs so usenet releases stream directly", cat="usenet",
          fields=[dict(key="NZBDAV_URL", label="Base URL", kind="url"),
                  dict(key="NZBDAV_USER", label="WebDAV user", kind="text"),
                  dict(key="NZBDAV_PASS", label="WebDAV password",
@@ -183,16 +216,18 @@ CONNECTIONS = [
                  dict(key="NZBDAV_API_KEY", label="API key (optional — queue "
                       "visibility)", kind="secret")]),
     dict(id="tmdb", name="TMDB",
-         role="Titles, original language, release dates",
+         role="Titles, original language, release dates", cat="metadata",
          fields=[dict(key="TMDB_API_KEY", label="API key", kind="secret")]),
     dict(id="omdb", name="OMDb",
          role="Independent title, year, type and runtime corroboration",
+         cat="metadata",
          fields=[dict(key="OMDB_API_KEY", label="API key", kind="secret")]),
     dict(id="tvdb", name="TVDB",
-         role="Season-rollover fallback for episode prefetch",
+         role="Season-rollover fallback for episode prefetch", cat="metadata",
          fields=[dict(key="TVDB_API_KEY", label="API key", kind="secret")]),
     dict(id="jellyfin", name="Jellyfin library",
          role="Serves titles you already have — checked before any search",
+        cat="library",
         fields=[dict(key="JELLYFIN_URL", label="Server URL", kind="url",
                      hint="URL reachable by StreamPicker, for example "
                           "http://jellyfin:8096 on a shared Docker network."),
@@ -201,17 +236,19 @@ CONNECTIONS = [
                      hint="Encrypted at rest. Prefer a dedicated playback-only "
                           "Jellyfin account rather than an administrator.")]),
     dict(id="jellyseerr", name="Jellyseerr",
-         role="Preferred path for requesting missing titles",
+         role="Preferred path for requesting missing titles", cat="acquire",
          fields=[dict(key="JELLYSEERR_URL", label="Base URL", kind="url"),
                  dict(key="JELLYSEERR_API_KEY", label="API key",
                       kind="secret")]),
     dict(id="radarr", name="Radarr", role="Direct movie fallback",
+         cat="acquire",
          fields=[dict(key="RADARR_URL", label="Base URL", kind="url"),
                  dict(key="RADARR_API_KEY", label="API key", kind="secret"),
                  dict(key="RADARR_ROOT", label="Root folder", kind="text"),
                  dict(key="RADARR_QUALITY_PROFILE", label="Quality profile",
                       kind="text")]),
     dict(id="sonarr", name="Sonarr", role="Direct series fallback",
+         cat="acquire",
          fields=[dict(key="SONARR_URL", label="Base URL", kind="url"),
                  dict(key="SONARR_API_KEY", label="API key", kind="secret"),
                  dict(key="SONARR_ROOT", label="Root folder", kind="text"),
@@ -228,6 +265,7 @@ _FALSE = ("0", "false", "no", "off", "")
 _INT_KEYS = {
     "BUFFER_CACHE_GB", "BUFFER_AHEAD_GB", "VERIFIED_WANT", "MAX_PROBES",
     "SLOW_MAX_PROBES", "FAST_ENOUGH_4K", "FAST_ENOUGH_1080",
+    "FAST_SD_BEFORE_YEAR",
     "FAST_PROBE_BATCH", "PROBE_HOST_BENCH", "SLOW_CONCURRENCY",
     "SLOW_NZB_PROBES", "SLOW_FINISH_MAX_PROBES", "SLOW_VIDEO_PROBE_N",
     "UNPROVEN_MAX_RES", "PROXY_WRAP_MAX", "PROXY_MAX_FAILOVER",
@@ -239,7 +277,7 @@ _INT_KEYS = {
     "NZB_LANE_REGISTRY_MAX", "TMDB_DIGITAL_ASSUME_DAYS",
     "OMDB_DAILY_BUDGET",
     "REPUTATION_MAX_ENTRIES", "MIN_BLOCK_SESSIONS", "TELEMETRY_MAX_BYTES",
-    "TELEMETRY_SEGMENTS",
+    "TELEMETRY_SEGMENTS", "MAX_BITRATE_MBPS",
 }
 
 _FRACTION_KEYS = {

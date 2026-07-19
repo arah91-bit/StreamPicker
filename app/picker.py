@@ -97,6 +97,11 @@ PROBE_HOST_BENCH = int(os.environ.get("PROBE_HOST_BENCH", "3"))
 # return visit (or the slow addon) gets the best stream immediately.
 ENOUGH_4K = int(os.environ.get("FAST_ENOUGH_4K", "1"))
 ENOUGH_1080 = int(os.environ.get("FAST_ENOUGH_1080", "1"))
+# For a title older than this, DVD/SD is frequently the best master that was
+# ever made, so the fast race accepts a verified SD/720p stream as good-enough —
+# but only once the online sources have all reported and no HD candidate is left
+# to try, so a title that *does* have an HD copy still gets it. 0 disables.
+SD_BEFORE_YEAR = int(os.environ.get("FAST_SD_BEFORE_YEAR", "2000") or 0)
 PROBE_BATCH = int(os.environ.get("FAST_PROBE_BATCH", "3"))
 # Safety cap only; the normal stop condition is the first good verified source.
 FAST_RACE_DEADLINE = float(os.environ.get("FAST_RACE_DEADLINE", "55"))
@@ -175,10 +180,26 @@ ACQUIRE_FOREGROUND_WAIT = float(os.environ.get("ACQUIRE_FOREGROUND_WAIT", "3"))
 # Files some of the household's players can't decode. 10-bit is fine.
 _12BIT_RE = re.compile(r"12[\s._-]?bit", re.IGNORECASE)
 
+# Optional operator cap on a stream's average bitrate (file size ÷ runtime).
+# Entered in the dashboard as megabits/sec; 0 means unlimited. Stored internally
+# as bytes/sec to match the per-profile ceilings below (mobile's 1_500_000 B/s ==
+# 12 Mbit/s). 1 Mbit/s = 125_000 bytes/s.
+_MAX_BITRATE_MBPS = float(os.environ.get("MAX_BITRATE_MBPS", "0") or 0)
+_USER_MAX_BPS = int(_MAX_BITRATE_MBPS * 125_000) if _MAX_BITRATE_MBPS > 0 else None
+
+
+def _cap_bps(base: int | None) -> int | None:
+    """Fold the operator's max-bitrate cap into a profile's own ceiling, keeping
+    whichever is tighter. None means uncapped."""
+    if _USER_MAX_BPS is None:
+        return base
+    return _USER_MAX_BPS if base is None else min(base, _USER_MAX_BPS)
+
+
 PROFILES = {
-    "full": {"max_res": 10_000, "max_bps": None},
+    "full": {"max_res": 10_000, "max_bps": _cap_bps(None)},
     # phones/tablets on cell data: 1080p cap, file bitrate <= ~12 Mbps
-    "mobile": {"max_res": 1080, "max_bps": 1_500_000},
+    "mobile": {"max_res": 1080, "max_bps": _cap_bps(1_500_000)},
 }
 
 _client = httpx.AsyncClient(timeout=None, headers={"User-Agent": "Stremio"})
@@ -1816,6 +1837,16 @@ def _enough(verified: list[tuple[dict, probe.ProbeResult | None]]) -> bool:
     return n4k >= ENOUGH_4K or n1080 >= ENOUGH_1080
 
 
+def _sd_acceptable(profile: content_identity.IdentityProfile | None) -> bool:
+    """Whether DVD/SD is a legitimate ceiling for this title: old enough that an
+    HD master was likely never made. Lets the fast race stop on a verified SD
+    stream instead of probing a whole page of SD rips for an HD copy that does
+    not exist. Unknown year => False (behave exactly as before)."""
+    if not SD_BEFORE_YEAR or profile is None or not profile.years:
+        return False
+    return min(profile.years) < SD_BEFORE_YEAR
+
+
 async def _race_fast(media: str, media_id: str, profile: dict, runtime: float,
                      need_bps, t0: float, lib_task: asyncio.Task | None = None,
                      ) -> tuple[list[tuple[dict, probe.ProbeResult | None]], list[dict]]:
@@ -1849,6 +1880,29 @@ async def _race_fast(media: str, media_id: str, profile: dict, runtime: float,
     host_ok: set[str] = set()          # hosts that have passed at least once
     verified: list[tuple[dict, probe.ProbeResult | None]] = []
     deadline = min(t0 + FAST_RACE_DEADLINE, t0 + TOTAL_DEADLINE)
+
+    # For an old, SD-only title, a verified DVD/SD stream is a fine answer — but
+    # only once the fast (non-usenet) sources have all reported and no HD copy is
+    # left to try, so a title that does have HD still gets it. Probes run
+    # best-first, so by the time an SD stream verifies, any real HD candidate has
+    # already had first crack. The slow usenet lane is never waited on here.
+    sd_ok = _sd_acceptable(_identity_profile_ctx.get())
+
+    def _online_pending() -> bool:
+        return any(source_tasks.get(t) != sources.NZB for t in pending_sources)
+
+    def _hd_pending() -> bool:
+        for s in pool:
+            if s.get("url") not in probed and _resolution(s) > 480:
+                return True
+        return any(_resolution(s) > 480 for s, _ in running_probes.values())
+
+    def _sufficient() -> bool:
+        if _enough(verified):
+            return True
+        if not (sd_ok and verified):
+            return False
+        return not _online_pending() and not _hd_pending()
 
     def _add_streams(streams: list[dict]) -> None:
         changed = False
@@ -1887,7 +1941,7 @@ async def _race_fast(media: str, media_id: str, profile: dict, runtime: float,
         _ingest_library(lib_task)
 
     try:
-        while not _enough(verified) and time.monotonic() < deadline:
+        while not _sufficient() and time.monotonic() < deadline:
             # Direct-NZB returns its first mount immediately and appends later
             # mounts to the shared list. Poll that live list so a failed first
             # release does not hide the second release from this same request.
