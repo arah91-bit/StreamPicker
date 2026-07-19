@@ -52,6 +52,39 @@ _client = httpx.AsyncClient(
     headers={"User-Agent": "Stremio"},
 )
 
+# ── debrid ingestion slots ───────────────────────────────────────────────────
+# A TorBox plan allows only N concurrent downloads *into* the account
+# (subscription-dependent — the user sets their tier's number). Streaming or
+# probing already-cached content is not slot-limited, but requesting a link
+# that is NOT marked cached can make the debrid start a real download that
+# occupies a slot (and keeps downloading server-side after we hang up) — so
+# probes of such links never run more than the configured limit at once. A
+# slot frees the instant body bytes arrive: bytes flowing means the file was
+# cached all along and no download was triggered.
+TORBOX_MAX_DOWNLOADS = max(1, int(os.environ.get("TORBOX_MAX_DOWNLOADS", "3")))
+_INGEST_LIMITS = {"TB": TORBOX_MAX_DOWNLOADS}
+# Semaphores bind to the running event loop on first await, so each tag keeps
+# (loop, semaphore) and re-creates on a new loop — production has one loop
+# forever; tests run many short-lived ones.
+_ingest_slots: dict[str, tuple] = {}
+
+
+def ingest_gate(stream: dict) -> asyncio.Semaphore | None:
+    """The ingestion-slot semaphore this stream's probe must hold, or None.
+    Only debrid links not marked cached are gated — those are the requests
+    that can trigger a download into the account."""
+    tag = telemetry.debrid_tag(stream.get("name") or "")
+    if not tag or tag.endswith("+"):
+        return None
+    limit = _INGEST_LIMITS.get(tag)
+    if not limit:
+        return None
+    loop = asyncio.get_running_loop()
+    entry = _ingest_slots.get(tag)
+    if entry is None or entry[0] is not loop:
+        entry = _ingest_slots[tag] = (loop, asyncio.Semaphore(limit))
+    return entry[1]
+
 
 @dataclass
 class ProbeResult:
@@ -281,17 +314,37 @@ async def _probe_spots(url: str, total: int, ttfb_max: float,
 async def probe(url: str, need_bps: float | None, ttfb_max: float,
                 headers: dict | None = None,
                 expect_secs: float | None = None,
-                verify_size: int | None = None) -> ProbeResult:
+                verify_size: int | None = None,
+                gate: asyncio.Semaphore | None = None) -> ProbeResult:
     """need_bps is the file's real bitrate (size/runtime) or None if unknown.
     `headers` are the stream's declared upstream request headers (proxyHeaders)
     — referer-gated hosts reject bare requests, so probing without them fails
     streams that would play fine through the proxy. `expect_secs` is the
     title's runtime: a stream whose measured duration can't be the title (a
     trailer-length clip, a whole movie for one episode) fails verification
-    however fast it delivers."""
-    r = await _probe_url(url, _required_bps(need_bps), ttfb_max,
-                         time.monotonic(), hops=0, headers=headers,
-                         expect_secs=expect_secs)
+    however fast it delivers. `gate` (see ingest_gate) is the debrid
+    ingestion-slot semaphore: held from request start until the first body
+    byte proves the file was already cached, so links that might start a real
+    download into the account never exceed the plan's concurrent-download
+    allowance. The slot wait happens before the ttfb clock starts."""
+    if gate is not None:
+        await gate.acquire()
+    held = gate is not None
+
+    def _free() -> None:
+        nonlocal held
+        if held:
+            held = False
+            gate.release()
+
+    try:
+        r = await _probe_url(url, _required_bps(need_bps), ttfb_max,
+                             time.monotonic(), hops=0, headers=headers,
+                             expect_secs=expect_secs,
+                             on_body=_free if gate is not None else None)
+    finally:
+        if gate is not None:
+            _free()
     if r.ok and r.head and CODEC_SNIFF and vprobe.enabled():
         try:
             ac, vc, secs, langs = await vprobe.media_info_of(r.head)
@@ -317,7 +370,8 @@ async def _probe_url(url: str, required: float, ttfb_max: float,
                      t0: float, hops: int,
                      media: dict | None = None,
                      headers: dict | None = None,
-                     expect_secs: float | None = None) -> ProbeResult:
+                     expect_secs: float | None = None,
+                     on_body=None) -> ProbeResult:
     """One GET of the probe descent. hops>0 means we're past an HLS playlist,
     probing a media segment: clean EOF short of the 4 MiB window is then a
     complete segment, not truncation. ttfb is always measured from the original
@@ -351,6 +405,8 @@ async def _probe_url(url: str, required: float, ttfb_max: float,
                 now = time.monotonic()
                 if t_first is None:
                     t_first = now
+                    if on_body is not None:
+                        on_body()   # body bytes = no download was triggered
                     if t_first - t0 > ttfb_max:
                         return ProbeResult(
                             False, ttfb=t_first - t0, **ni,
@@ -458,7 +514,7 @@ async def _probe_url(url: str, required: float, ttfb_max: float,
         next_required = float(media["media_bps"]) / 8 * SAFETY_FACTOR
     return await _probe_url(urljoin(playlist_url, uri), next_required, ttfb_max,
                             t0, hops + 1, media=media, headers=headers,
-                            expect_secs=expect_secs)
+                            expect_secs=expect_secs, on_body=on_body)
 
 
 async def probe_batch(
@@ -483,7 +539,8 @@ async def probe_batch(
             *(probe(s["url"], need_bps_of(s), ttfb_max,
                     headers=hlsproxy.request_headers(s),
                     expect_secs=expect_secs,
-                    verify_size=(deep_check_of(s) if deep_check_of else None))
+                    verify_size=(deep_check_of(s) if deep_check_of else None),
+                    gate=ingest_gate(s))
               for s in batch)
         )
         for s, r in zip(batch, results):
@@ -528,7 +585,8 @@ async def probe_race(
                 probe(s["url"], need_bps_of(s), ttfb_max,
                       headers=hlsproxy.request_headers(s),
                       expect_secs=expect_secs,
-                      verify_size=(deep_check_of(s) if deep_check_of else None)))] = (
+                      verify_size=(deep_check_of(s) if deep_check_of else None),
+                      gate=ingest_gate(s)))] = (
                     s, secrets.token_urlsafe(12))
 
     _fill()

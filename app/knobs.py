@@ -68,6 +68,11 @@ CATALOG = [
      "Absolute ceiling on a fast request, including probing."),
     ("PROBE_TTFB_MAX", "fast", "num", "12", _S,
      "Max first-byte wait before a debrid probe is a failure."),
+    ("TORBOX_MAX_DOWNLOADS", "fast", "num", "3", "",
+     "Your TorBox plan's concurrent-download allowance. Probing a TorBox "
+     "link not marked cached can start a real download into the account, so "
+     "at most this many such probes run at once; a slot frees the moment "
+     "bytes prove the link was already cached. Match your subscription tier."),
     ("USENET_TTFB_MAX", "fast", "num", "35", _S,
      "Max first-byte wait for a usenet probe (mounts start slower)."),
     ("USENET_FINISH_WAIT", "fast", "num", "3600", _S,
