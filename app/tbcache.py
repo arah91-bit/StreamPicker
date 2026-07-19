@@ -16,13 +16,20 @@ GET the best one's playback URL once: Comet adds the magnet to TorBox
 *before* it can answer "not cached yet", and TorBox keeps downloading
 server-side after we hang up.
 
+On by default: TorBox's cache is global, so every release one user caches
+becomes instantly available to every TorBox user — running this lane helps
+everyone, not just this household. TB_AUTO_CACHE=0 turns it off (also in
+the dashboard's Advanced tuning).
+
 Restraint, because downloads occupy the plan's TORBOX_MAX_DOWNLOADS slots:
-per-title cooldown (TB_CACHE_TITLE_HOURS) remembering which releases were
-already tried (a retry picks the next-best copy); global pacing that assumes
-each triggered download holds a slot for TB_CACHE_SLOT_SECS; and the trigger
-request itself holds the probe layer's ingestion gate, so probes and
-triggers together never exceed the plan limit. State survives restarts in
-tbcache.json next to the other telemetry stores. TB_AUTO_CACHE=1 enables.
+auto-cache assumes at most TB_CACHE_MAX_SLOTS of them (default 2 of the
+default 3 — one slot always stays free for the user's own activity), each
+triggered download assumed busy for TB_CACHE_SLOT_SECS; per-title cooldown
+(TB_CACHE_TITLE_HOURS) remembers which releases were already tried (a retry
+picks the next-best copy); and the trigger request itself holds the probe
+layer's ingestion gate, so probes and triggers together never exceed the
+plan limit. State survives restarts in tbcache.json next to the other
+telemetry stores.
 """
 
 import asyncio
@@ -38,7 +45,8 @@ from app import probe, telemetry
 
 logger = logging.getLogger("stream-picker")
 
-ENABLED = os.environ.get("TB_AUTO_CACHE", "0") not in ("0", "false", "")
+ENABLED = os.environ.get("TB_AUTO_CACHE", "1") not in ("0", "false", "")
+MAX_SLOTS = max(1, int(os.environ.get("TB_CACHE_MAX_SLOTS", "2")))
 TITLE_COOLDOWN = float(os.environ.get("TB_CACHE_TITLE_HOURS", "24")) * 3600
 SLOT_SECS = float(os.environ.get("TB_CACHE_SLOT_SECS", "900"))
 _SEARCH_TIMEOUT = 45.0
@@ -184,9 +192,10 @@ async def maybe_cache(media: str, media_id: str, best_verified_res: int,
         if ent and now - ent.get("ts", 0) < TITLE_COOLDOWN:
             return
         st["fired"] = [t for t in st["fired"] if now - t < SLOT_SECS]
-        if len(st["fired"]) >= probe.TORBOX_MAX_DOWNLOADS:
-            logger.info(f"tbcache: {key} skipped — assuming all "
-                        f"{probe.TORBOX_MAX_DOWNLOADS} plan slots busy")
+        limit = min(MAX_SLOTS, probe.TORBOX_MAX_DOWNLOADS)
+        if len(st["fired"]) >= limit:
+            logger.info(f"tbcache: {key} skipped — all {limit} "
+                        f"auto-cache slots assumed busy")
             return
         cands = await _uncached_candidates(media, media_id)
         if not cands:

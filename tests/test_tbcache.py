@@ -155,11 +155,35 @@ class MaybeCacheTests(unittest.TestCase):
         self.assertEqual("C.2160p.mkv",
                          self.triggered[1]["behaviorHints"]["filename"])
 
-    def test_slot_pacing_assumes_plan_limit_is_busy(self):
-        tbcache._load()["fired"] = [time.time()] * probe.TORBOX_MAX_DOWNLOADS
+    def test_slot_pacing_stops_at_the_auto_cache_budget(self):
+        # Auto-cache may only assume TB_CACHE_MAX_SLOTS (2) of the plan's
+        # slots — the remainder always stays free for the user's own activity.
+        budget = min(tbcache.MAX_SLOTS, probe.TORBOX_MAX_DOWNLOADS)
+        self.assertLess(budget, probe.TORBOX_MAX_DOWNLOADS)
+        tbcache._load()["fired"] = [time.time()] * budget
         self.cands = [_cand()]
         self._run(best_res=0)
         self.assertEqual([], self.triggered)
+
+    def test_slot_budget_never_exceeds_the_plan_limit(self):
+        orig = tbcache.MAX_SLOTS
+        try:
+            tbcache.MAX_SLOTS = probe.TORBOX_MAX_DOWNLOADS + 5
+            tbcache._load()["fired"] = ([time.time()]
+                                        * probe.TORBOX_MAX_DOWNLOADS)
+            self.cands = [_cand()]
+            self._run(best_res=0)
+            self.assertEqual([], self.triggered)
+        finally:
+            tbcache.MAX_SLOTS = orig
+
+    def test_enabled_by_default(self):
+        # TB_AUTO_CACHE defaults on: the whole community shares TorBox's
+        # cache, so a fresh install contributes out of the box. _orig[0] is
+        # the module's import-time ENABLED, before setUp's override.
+        self.assertIsNone(os.environ.get("TB_AUTO_CACHE"))
+        self.assertTrue(self._orig[0])
+        self.assertEqual(2, int(os.environ.get("TB_CACHE_MAX_SLOTS", "2")))
 
     def test_state_survives_reload(self):
         self.cands = [_cand()]
