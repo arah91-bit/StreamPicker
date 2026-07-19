@@ -171,6 +171,13 @@ UI becomes `;`-joined in storage):
 
 **Metadata** — `"TMDB_API_KEY": "…"`, `"OMDB_API_KEY": "…"`, `"TVDB_API_KEY": "…"`.
 
+**Anime episode matching** — on by default (`ANIME_ENABLED`). Reconciles
+absolute / per-cour / seasonal numbering for anime so the right episode is
+confirmed and a wrong-season file isn't auto-played, using cached anime-lists +
+Kitsu (+ Jikan as a best-effort secondary, `ANIME_JIKAN`). No keys required; it
+needs only outbound network. Set `ANIME_ENABLED=0` to fall back to plain
+filename `S×E` parsing.
+
 **Public address** (reverse proxy / tunnel / blank for LAN):
 `"ADDON_PUBLIC_URL": "https://streams.example.com"`.
 

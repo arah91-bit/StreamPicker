@@ -178,6 +178,29 @@ Everything else — cache size, read-ahead depth, how hard the pickers verify,
 the audio-language gate, auto-adding missing titles, and so on — is a switch or
 a slider on the same page.
 
+## Anime episode matching
+
+Anime is the hard case for "is this the episode I asked for?": the same episode
+is numbered differently by everyone. Stremio asks in seasonal order (`S03E13`),
+most fansub/scene releases use a continuous **absolute** number (`Attack on
+Titan - 50`), and MyAnimeList/Kitsu number each broadcast cour from 1 — and one
+TVDB season can be several cours. Left unreconciled, a picker either can't
+verify an absolute-numbered release (so it's dropped or, worse, the *wrong*
+episode auto-plays) — which is why autoplay is risky for anime.
+
+Auto Stream reconciles all three. For an anime request it maps your `S×E` to its
+absolute number using the [Fribb/anime-lists](https://github.com/Fribb/anime-lists)
+id/season backbone plus per-cour episode counts and titles from
+[Kitsu](https://kitsu.io) (and, when reachable, MyAnimeList via
+[Jikan](https://github.com/jikan-me/jikan-rest) as a secondary). Then a release
+is **confirmed** when its absolute number, per-cour number, seasonal `S×E`, *or*
+episode title lands on the requested episode (English, romaji and native titles
+all match), and a decisively different episode is **contradicted**. The upshot:
+the correct absolute-numbered release can auto-play, and a wrong-season file
+won't. All sources are cached and strictly best-effort — if they're unreachable
+the picker falls back to plain filename matching. Toggle with `ANIME_ENABLED`
+(and `ANIME_JIKAN` for the MyAnimeList secondary).
+
 ## Updating
 
 ```bash

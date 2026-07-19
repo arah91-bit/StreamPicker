@@ -30,6 +30,10 @@ EXCLUDE = {
     "NZB_HEALTH_DB": "derived from the data directory",
     "NOTICE_URL": "internal, derived from the public base URL",
     "NOTICE_URL_THEATRICAL": "internal, derived from the public base URL",
+    "ANIME_LISTS_URL": "anime-lists source URL; advanced override",
+    "ANIME_KITSU_BASE": "Kitsu API base URL; advanced override",
+    "ANIME_JIKAN_BASE": "Jikan API base URL; advanced override",
+    "ANIME_NEG_TTL": "internal negative-cache window for anime lookups",
 }
 
 # Advanced groups render in this order. (id, title)
@@ -274,6 +278,21 @@ CATALOG = [
      "HLS with the token kept server-side. Off: such titles are dropped from "
      "library results rather than handed over as audio-only. Needs the "
      "Jellyfin user's 'allow video transcoding' permission enabled."),
+    ("ANIME_ENABLED", "acquire", "bool", "1", "",
+     "Anime-aware episode matching: reconcile absolute ('Show - 50'), seasonal "
+     "(S03E13) and per-cour numbering so the right episode is confirmed and a "
+     "wrong-season file isn't auto-played. Uses cached anime-lists + Kitsu; "
+     "off falls back to plain filename S/E parsing."),
+    ("ANIME_JIKAN", "acquire", "bool", "1", "",
+     "Also consult Jikan (MyAnimeList) as a secondary source for anime episode "
+     "counts when Kitsu is missing a value. Strictly best-effort — Jikan is "
+     "often rate-limited or down, so it never blocks a pick."),
+    ("ANIME_META_TTL", "acquire", "num", "86400", _S,
+     "How long a resolved anime show's cour/episode map is cached."),
+    ("ANIME_LISTS_TTL_HOURS", "acquire", "num", "24", "h",
+     "How often the anime-lists id/season backbone is refreshed."),
+    ("ANIME_TIMEOUT", "acquire", "num", "6", _S,
+     "Per-request timeout for anime metadata (Kitsu/Jikan) lookups."),
     ("ACQUIRE_DEDUP_TTL", "acquire", "num", "1800", _S,
      "Window in which repeat requests for a title won't re-add it."),
     ("ACQUIRE_FOREGROUND_WAIT", "acquire", "num", "3", _S,

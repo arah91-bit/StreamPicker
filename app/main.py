@@ -27,9 +27,9 @@ try:
 except ValueError as exc:
     raise RuntimeError(f"invalid stream-picker configuration: {exc}") from exc
 
-from app import (acquire, admin_auth, adminui, connections, dashboard, envref,  # noqa: E402
-                 library, meta, overview, picker, probe, proxy, reputation,
-                 settings_ui, sources, tbcache, telemetry, usenet,
+from app import (acquire, admin_auth, adminui, anime, connections, dashboard,  # noqa: E402
+                 envref, library, meta, overview, picker, probe, proxy,
+                 reputation, settings_ui, sources, tbcache, telemetry, usenet,
                  usenet_health, vprobe, wizard)
 
 NOTICE_FILE = pathlib.Path(__file__).parent / "static" / "notice.mp4"
@@ -72,7 +72,7 @@ async def _lifespan(_app: FastAPI):
             ("proxy", proxy), ("picker", picker), ("probe", probe),
             ("metadata", meta), ("library", library), ("acquire", acquire),
             ("video probe", vprobe), ("sources", sources), ("usenet", usenet),
-            ("tbcache", tbcache),
+            ("tbcache", tbcache), ("anime", anime),
         ):
             shutdown = getattr(module, "shutdown", None)
             if shutdown is not None:

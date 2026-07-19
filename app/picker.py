@@ -44,9 +44,9 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from app import (acquire, content_identity, decode_health, library, meta, probe,
-                 reputation, sources, tbcache, telemetry, usenet as nzb_lane,
-                 vprobe)
+from app import (acquire, anime, content_identity, decode_health, library, meta,
+                 probe, reputation, sources, tbcache, telemetry,
+                 usenet as nzb_lane, vprobe)
 
 logger = logging.getLogger("stream-picker")
 
@@ -692,6 +692,10 @@ _identity_profile_ctx: ContextVar[content_identity.IdentityProfile | None] = \
     ContextVar("identity_profile", default=None)
 _identity_logged_ctx: ContextVar[set[str] | None] = \
     ContextVar("identity_logged", default=None)
+# Anime episode expectation for this request (absolute/seasonal/per-cour), or
+# None when the title is not mapped anime. Set beside the identity profile.
+_anime_ctx: ContextVar["anime.Expectation | None"] = \
+    ContextVar("anime_expectation", default=None)
 # Identity, rather than a truthy value, makes this impossible to forge through
 # an upstream addon's JSON response.  Raw streams are still scrubbed at every
 # ingestion boundary so even a same-named private field cannot linger.
@@ -935,12 +939,49 @@ def _assess_stream_identity(
                     content_identity.COMPATIBLE,
                     content_identity.EVIDENCE_COMPATIBLE, 2)
 
+    result = _anime_override(result, s, filename, label)
+
     s[_IDENTITY_STATE_KEY] = result.state
     s[_IDENTITY_RANK_KEY] = result.rank
     s[_IDENTITY_EVIDENCE_KEY] = result.evidence
     s[_IDENTITY_TEXT_KEY] = filename or label
     if record:
         _record_identity_once(s, result, " | ".join(filter(None, (filename, label))))
+    return result
+
+
+def _anime_override(result: content_identity.IdentityAssessment, s: dict,
+                    filename: str, label: str) -> content_identity.IdentityAssessment:
+    """Reconcile absolute/per-cour anime numbering with the filename verdict.
+
+    Anime releases lead with ``[group]`` and set the episode off with a bare
+    absolute number (``- 50``), which the ordinary filename gate can neither
+    anchor a title to nor read as an episode — so it wrongly contradicts them.
+    When the title is one of this show's known titles (English/romaji/native)
+    *and* the episode is confirmed by absolute/per-cour number or episode title,
+    promote to strong so the correct release can auto-play; a decisively
+    different episode is contradicted.  One-way and conservative: it requires a
+    positive show-title match (never rescues a wrong show) and never downgrades a
+    trusted source or an already-strong verdict.
+    """
+    expectation = _anime_ctx.get()
+    if expectation is None or s.get("_source_key") == "library":
+        return result
+    text = " ".join(filter(None, (filename, label)))
+    verdict = anime.assess(expectation, text)
+    if (verdict == anime.CONTRADICT
+            and result.state != content_identity.STRONG):
+        return content_identity.IdentityAssessment(
+            content_identity.CONTRADICTION, content_identity.EVIDENCE_CONTRADICTION,
+            content_identity.EVIDENCE_RANKS[content_identity.EVIDENCE_CONTRADICTION])
+    if verdict == anime.CONFIRM and result.state != content_identity.STRONG:
+        profile = _identity_profile_ctx.get()
+        titles = expectation.show_titles + (profile.aliases if profile else ())
+        if (result.state == content_identity.COMPATIBLE
+                or anime.title_present(titles, text)):
+            return content_identity.IdentityAssessment(
+                content_identity.STRONG, content_identity.EVIDENCE_ANIME,
+                content_identity.EVIDENCE_RANKS[content_identity.EVIDENCE_ANIME])
     return result
 
 
@@ -1298,7 +1339,34 @@ async def _resolve_identity_profile(
             media=media, imdb_id=parts[0], aliases=(),
             season=season, episode=episode)
     _set_identity_profile(profile)
+    await _set_anime_expectation(media, media_id, profile, timeout)
     return profile
+
+
+async def _set_anime_expectation(
+        media: str, media_id: str,
+        profile: content_identity.IdentityProfile,
+        timeout: float | None) -> None:
+    """Install the anime episode expectation for this request, if any. Bounded
+    and fail-open: a slow or unreachable anime source just leaves it unset, and
+    the picker keeps its ordinary filename identity."""
+    expectation = None
+    try:
+        if anime.ENABLED and media != "movie" and profile.season is not None:
+            budget = min(timeout, 5.0) if timeout else 5.0
+            show = await asyncio.wait_for(
+                anime.resolve(media, media_id, profile.season), budget)
+            if show is not None:
+                expectation = show.expectation(profile.season, profile.episode)
+                if expectation is not None:
+                    logger.info("anime %s: S%dE%d ↔ absolute #%d%s", media_id,
+                                profile.season, profile.episode,
+                                expectation.absolute,
+                                " (split season)" if expectation.split_season else "")
+    except Exception:
+        expectation = None
+    _anime_ctx.set(expectation)
+
 
 async def _runtime_seconds(media: str, media_id: str) -> float:
     """Exact OMDb movie/episode runtime, then Cinemeta, then strict fallback.
