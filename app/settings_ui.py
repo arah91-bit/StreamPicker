@@ -157,6 +157,10 @@ border:1px solid var(--line)}
 display:flex;align-items:center;gap:14px;background:var(--card);
 border:1px solid var(--line);border-radius:12px;padding:10px 16px;
 box-shadow:0 6px 24px rgba(0,0,0,.14);z-index:10;max-width:92vw}
+.savebar-top{position:sticky;top:72px;bottom:auto;left:auto;transform:none;
+margin:-4px 0 22px;max-width:none;justify-content:space-between;z-index:20;
+box-shadow:0 2px 10px rgba(0,0,0,.06)}
+@media(max-width:520px){.savebar-top{position:static;top:auto;margin:0 0 20px}}
 .savebar .msg{font-size:13.5px}
 .savebar .msg b{font-weight:600}
 .savebar .err{color:var(--bad);font-size:12.5px;max-width:340px}
@@ -241,15 +245,17 @@ function dirtyControls(){
   return ctlValue(el)!==el.dataset.init});
 }
 function refreshBar(){
- const n=dirtyControls().length,bar=$('#savebar');
- if(n){bar.hidden=false;$('#barmsg').innerHTML=
-   `<b>${n} unsaved change${n>1?'s':''}</b>`;
-  $('#savebtn').hidden=false;$('#restartbtn').hidden=true;}
- else if(bar.dataset.restart==='1'){bar.hidden=false;
-  $('#barmsg').innerHTML='Saved — <b>restart to apply</b>';
-  $('#savebtn').hidden=true;$('#restartbtn').hidden=false;}
- else bar.hidden=true;
- $('#barerr').textContent='';
+ const n=dirtyControls().length;
+ $$('.savebar').forEach(bar=>{
+  const msg=bar.querySelector('.msg'),save=bar.querySelector('.savebtn'),
+    restart=bar.querySelector('.restartbtn');
+  if(n){bar.hidden=false;msg.innerHTML=`<b>${n} unsaved change${n>1?'s':''}</b>`;
+   save.hidden=false;restart.hidden=true;}
+  else if(bar.dataset.restart==='1'){bar.hidden=false;
+   msg.innerHTML='Saved — <b>restart to apply</b>';
+   save.hidden=true;restart.hidden=false;}
+  else bar.hidden=true;
+  bar.querySelector('.err').textContent='';});
 }
 
 /* stream-path mode: one control writing two stored keys */
@@ -297,37 +303,40 @@ async function post(url,body){
  return r.json();
 }
 
-$('#savebtn').addEventListener('click',async()=>{
+async function doSave(){
  const values={};dirtyControls().forEach(el=>values[el.dataset.key]=ctlValue(el));
- $('#savebtn').disabled=true;
+ const saves=$$('.savebar .savebtn');saves.forEach(b=>b.disabled=true);
  try{
   const res=await post('/api/settings/save',{values});
   dirtyControls().forEach(el=>{
    if(el.dataset.secret){el.dataset.init='';el.placeholder='kept · just saved';el.value='';}
    else el.dataset.init=ctlValue(el);});
-  $('#savebar').dataset.restart=res.restart_needed?'1':'0';
- }catch(e){$('#barerr').textContent=e.message;}
- $('#savebtn').disabled=false;refreshBar();
-});
+  $$('.savebar').forEach(b=>b.dataset.restart=res.restart_needed?'1':'0');
+ }catch(e){$$('.savebar .err').forEach(el=>el.textContent=e.message);}
+ saves.forEach(b=>b.disabled=false);refreshBar();
+}
+$$('.savebar .savebtn').forEach(b=>b.addEventListener('click',doSave));
 
-$('#restartbtn').addEventListener('click',async()=>{
+async function doRestart(){
  let playing=0;
  try{playing=(await(await fetch('/api/settings/status.json')).json()).playing}catch(e){}
  const q=playing>0
   ?`${playing} stream${playing>1?'s':''} playing right now will be cut off. Restart anyway?`
   :'Restart the addon now? It comes back in a few seconds.';
  if(!confirm(q))return;
- $('#restartbtn').disabled=true;$('#barmsg').textContent='Restarting…';
+ $$('.savebar .restartbtn').forEach(b=>b.disabled=true);
+ $$('.savebar .msg').forEach(m=>m.textContent='Restarting…');
  try{await post('/api/settings/restart')}catch(e){}
  const t0=Date.now();
  (async function poll(){
-  if(Date.now()-t0>45000){$('#barmsg').textContent=
-   'Still down — check the container logs.';return;}
+  if(Date.now()-t0>45000){$$('.savebar .msg').forEach(m=>m.textContent=
+   'Still down — check the container logs.');return;}
   await new Promise(r=>setTimeout(r,1200));
   try{const r=await fetch('/health',{cache:'no-store'});
    if(r.ok)return location.reload();}catch(e){}
   poll();})();
-});
+}
+$$('.savebar .restartbtn').forEach(b=>b.addEventListener('click',doRestart));
 
 $$('.test').forEach(btn=>btn.addEventListener('click',async()=>{
  const card=btn.closest('.conn'),svc=btn.dataset.service;
@@ -554,7 +563,7 @@ if(SBOX){
      :'Prowlarr API key';
     renderEngines();
     setRes('Saved — restart to apply.','ok');
-    $('#savebar').dataset.restart='1';refreshBar();}
+    $$('.savebar').forEach(b=>b.dataset.restart='1');refreshBar();}
    else setRes('Rejected: '+parts.join('   '),'bad');
   }catch(e){setRes(e.message,'bad');}
   btn.disabled=false;}
@@ -909,6 +918,11 @@ def render() -> str:
 <p class="sub">Connect your services and choose how streams are handled.
 Saved to <code>/data/config.json</code> on the addon's data volume; changes
 apply on restart. Anyone deploying their own instance starts here.</p>
+<div class="savebar savebar-top" hidden data-restart="{restart}">
+<span class="msg"></span><span class="err"></span>
+<button class="btn savebtn">Save changes</button>
+<button class="btn warn restartbtn" hidden>Restart addon</button>
+</div>
 {sections}
 {_scrapers()}
 <h2>Connections</h2>
@@ -919,9 +933,9 @@ to keep the stored key.</p>
 {conn_groups}
 {_advanced_section()}
 </div>
-<div class="savebar" id="savebar" hidden data-restart="{restart}">
-<span class="msg" id="barmsg"></span><span class="err" id="barerr"></span>
-<button class="btn" id="savebtn">Save changes</button>
-<button class="btn warn" id="restartbtn" hidden>Restart addon</button>
+<div class="savebar" hidden data-restart="{restart}">
+<span class="msg"></span><span class="err"></span>
+<button class="btn savebtn">Save changes</button>
+<button class="btn warn restartbtn" hidden>Restart addon</button>
 </div>
 <script>{_JS}</script></body></html>"""
