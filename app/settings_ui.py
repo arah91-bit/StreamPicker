@@ -59,12 +59,6 @@ output{font:13px var(--mono);min-width:64px;text-align:right}
 background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:7px}
 .br-num::-webkit-outer-spin-button,.br-num::-webkit-inner-spin-button{margin:0}
 .brctl output{min-width:72px}
-.yrctl{display:flex;align-items:center;gap:9px}
-.yr-word{color:var(--mut);font-size:13px}
-.yr-num{width:74px;font:13px var(--mono);text-align:right;padding:5px 6px;
-background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:7px}
-.yr-num:disabled{cursor:not-allowed}
-.yrctl.off .yr-word,.yrctl.off .yr-num{opacity:.4}
 
 .swi{appearance:none;-webkit-appearance:none;width:42px;height:24px;margin:0;
 border-radius:99px;background:var(--line);position:relative;cursor:pointer;
@@ -277,21 +271,6 @@ $$('.brctl').forEach(box=>{
  box.querySelector('.br-range').addEventListener('input',
   ()=>{brSync(box,'range');refreshBar();});
  box.querySelector('.br-num').addEventListener('input',()=>brSync(box,'num'));
-});
-
-/* Feature-switch-with-a-year control (accept DVD for old titles): a toggle and
-   a year box drive one hidden saved value — 0 when off, the year when on. */
-$$('.yrctl').forEach(box=>{
- const on=box.querySelector('.yr-on'),num=box.querySelector('.yr-num'),
-   hid=box.querySelector('input[type=hidden]');
- function sync(fire){
-  num.disabled=!on.checked;box.classList.toggle('off',!on.checked);
-  hid.value=on.checked?String(parseInt(num.value||'0',10)||0):'0';
-  if(fire)hid.dispatchEvent(new Event('input',{bubbles:true}));
- }
- on.addEventListener('change',()=>sync(true));
- num.addEventListener('input',()=>sync(true));
- sync(false);
 });
 
 async function post(url,body){
@@ -517,24 +496,6 @@ def _row(spec: dict) -> str:
         on = val.strip().lower() not in ("", "0", "false", "no", "off")
         ctl = (f"<input type='checkbox' class='swi' data-key='{key}' "
                f"data-init='{'1' if on else '0'}' {'checked' if on else ''}>")
-    elif t == "number" and spec.get("toggle_year"):
-        # A feature switch with an editable year: a toggle plus a year box that
-        # greys out when off. A hidden field carries the saved value (0 when
-        # off, the year when on) so the normal dirty/save path is unchanged.
-        # See the .yrctl handlers in _JS.
-        on = val.strip() not in ("", "0")
-        year = val if on else str(spec.get("on_value") or spec.get("default") or "")
-        ctl = (f"<div class='yrctl{'' if on else ' off'}'>"
-               f"<input type='checkbox' class='swi yr-on' "
-               f"{'checked' if on else ''} "
-               f"aria-label='{_esc(spec['label'])} enabled'>"
-               f"<span class='yr-word'>before</span>"
-               f"<input type='number' class='yr-num' min='{spec.get('year_min', 1940)}' "
-               f"max='{spec['max']}' step='1' value='{_esc(year)}' "
-               f"{'' if on else 'disabled'} "
-               f"aria-label='{_esc(spec['label'])} year'>"
-               f"<input type='hidden' data-key='{key}' data-init='{_esc(val)}' "
-               f"value='{_esc(val)}'></div>")
     elif t == "number" and spec.get("zero_label"):
         # A slider you can also type into; its floor doubles as an off switch
         # ("Unlimited" at 0). The number box carries data-key (the saved value);

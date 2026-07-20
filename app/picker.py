@@ -97,11 +97,12 @@ PROBE_HOST_BENCH = int(os.environ.get("PROBE_HOST_BENCH", "3"))
 # return visit (or the slow addon) gets the best stream immediately.
 ENOUGH_4K = int(os.environ.get("FAST_ENOUGH_4K", "1"))
 ENOUGH_1080 = int(os.environ.get("FAST_ENOUGH_1080", "1"))
-# For a title older than this, DVD/SD is frequently the best master that was
-# ever made, so the fast race accepts a verified SD/720p stream as good-enough —
-# but only once the online sources have all reported and no HD candidate is left
-# to try, so a title that *does* have an HD copy still gets it. 0 disables.
-SD_BEFORE_YEAR = int(os.environ.get("FAST_SD_BEFORE_YEAR", "2000") or 0)
+# Safety-net grace: once the fast race holds a verified stream that definitely
+# plays, this is how long it keeps looking for a genuinely better one before
+# answering with the best it has. A verified 1080p/4K still returns at once (see
+# _enough); this only bounds the chase for unproven "HD" labels that may never
+# verify. The slow picker does the patient, thorough pass. Seconds.
+FAST_VERIFIED_GRACE = float(os.environ.get("FAST_VERIFIED_GRACE", "5"))
 PROBE_BATCH = int(os.environ.get("FAST_PROBE_BATCH", "3"))
 # Safety cap only; the normal stop condition is the first good verified source.
 FAST_RACE_DEADLINE = float(os.environ.get("FAST_RACE_DEADLINE", "55"))
@@ -1832,19 +1833,9 @@ def _count_tiers(verified: list[tuple[dict, probe.ProbeResult | None]]) -> tuple
 
 
 def _enough(verified: list[tuple[dict, probe.ProbeResult | None]]) -> bool:
-    """First verified, language-eligible high-quality source is the stop bar."""
+    """A verified high-quality (1080p/4K) source returns the fast race at once."""
     n4k, n1080 = _count_tiers(verified)
     return n4k >= ENOUGH_4K or n1080 >= ENOUGH_1080
-
-
-def _sd_acceptable(profile: content_identity.IdentityProfile | None) -> bool:
-    """Whether DVD/SD is a legitimate ceiling for this title: old enough that an
-    HD master was likely never made. Lets the fast race stop on a verified SD
-    stream instead of probing a whole page of SD rips for an HD copy that does
-    not exist. Unknown year => False (behave exactly as before)."""
-    if not SD_BEFORE_YEAR or profile is None or not profile.years:
-        return False
-    return min(profile.years) < SD_BEFORE_YEAR
 
 
 async def _race_fast(media: str, media_id: str, profile: dict, runtime: float,
@@ -1879,30 +1870,21 @@ async def _race_fast(media: str, media_id: str, profile: dict, runtime: float,
     host_fails: dict[str, int] = {}    # per-pick probe failures by host
     host_ok: set[str] = set()          # hosts that have passed at least once
     verified: list[tuple[dict, probe.ProbeResult | None]] = []
+    first_verified_at: float | None = None   # when the safety net first appeared
     deadline = min(t0 + FAST_RACE_DEADLINE, t0 + TOTAL_DEADLINE)
 
-    # For an old, SD-only title, a verified DVD/SD stream is a fine answer — but
-    # only once the fast (non-usenet) sources have all reported and no HD copy is
-    # left to try, so a title that does have HD still gets it. Probes run
-    # best-first, so by the time an SD stream verifies, any real HD candidate has
-    # already had first crack. The slow usenet lane is never waited on here.
-    sd_ok = _sd_acceptable(_identity_profile_ctx.get())
-
-    def _online_pending() -> bool:
-        return any(source_tasks.get(t) != sources.NZB for t in pending_sources)
-
-    def _hd_pending() -> bool:
-        for s in pool:
-            if s.get("url") not in probed and _resolution(s) > 480:
-                return True
-        return any(_resolution(s) > 480 for s, _ in running_probes.values())
-
+    # Completion-first with a safety net. A verified 1080p/4K returns at once
+    # (_enough). Otherwise, the moment the race holds *any* verified stream that
+    # definitely plays, it gives itself only FAST_VERIFIED_GRACE more seconds for
+    # something genuinely better to verify, then answers with the best it has —
+    # so a guaranteed DVD copy is never held hostage to a page of unproven "HD"
+    # scraper labels that may never verify. The slow picker and the background
+    # finisher do the patient, thorough verification.
     def _sufficient() -> bool:
         if _enough(verified):
             return True
-        if not (sd_ok and verified):
-            return False
-        return not _online_pending() and not _hd_pending()
+        return (first_verified_at is not None
+                and time.monotonic() - first_verified_at >= FAST_VERIFIED_GRACE)
 
     def _add_streams(streams: list[dict]) -> None:
         changed = False
@@ -2024,6 +2006,8 @@ async def _race_fast(media: str, media_id: str, profile: dict, runtime: float,
                         if _apply_probe_evidence(vs, vr, runtime):
                             identity_passed.append((vs, vr))
                     verified.extend(identity_passed)
+                    if identity_passed and first_verified_at is None:
+                        first_verified_at = time.monotonic()   # start grace timer
                     if ident and identity_passed:
                         ident_ok.add(ident)
                     if host:

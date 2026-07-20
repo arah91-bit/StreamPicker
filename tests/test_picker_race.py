@@ -3,7 +3,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from app import content_identity, picker, probe, sources
+from app import picker, probe, sources
 
 
 def _stream(name, url):
@@ -129,93 +129,64 @@ class FastRaceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(good["url"], verified[0][0]["url"])
 
 
-    async def test_old_sd_only_title_stops_on_verified_sd(self):
-        # For a pre-2000 title with only DVD/SD rips, a verified SD stream is
-        # sufficient: the race must not sit waiting on a second (hanging) SD
-        # probe hunting for an HD copy that does not exist.
-        good = _sd_stream("GOOD", "https://good.example/video")
-        slow = _sd_stream("SLOW", "https://slow.example/video")
+    async def test_grace_timer_returns_best_verified_and_stops_chasing_hd(self):
+        # Once a stream that definitely plays is in hand, the race gives itself
+        # only FAST_VERIFIED_GRACE more seconds for something better, then
+        # answers — it must not sit on an unproven "HD" label whose probe never
+        # completes (exactly the junk-HLS case that held Magic School Bus 48s).
+        good = _sd_stream("GOOD", "https://good.example/video")   # verifies fast
+        fakehd = _stream("FAKEHD", "https://junk.example/hls")    # 1080p, hangs
 
         async def fake_probe_race(candidates, *_a, outcomes=None, **_k):
             stream = candidates[0]
-            if stream["url"] == slow["url"]:
-                await asyncio.sleep(0.30)          # never wanted; SD is enough
+            if stream["url"] == fakehd["url"]:
+                await asyncio.sleep(5)                # never verifies in time
                 return []
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(0.02)
             return [(stream, probe.ProbeResult(True, ttfb=0.1,
                                                speed_bps=6_000_000))]
 
         started = time.monotonic()
         with (patch("app.picker.sources.search_all", return_value=[sources.FAST]),
-              patch("app.sources.get", return_value=[good, slow]),
+              patch("app.sources.get", return_value=[fakehd, good]),
               patch("app.sources.peek", return_value=[]),
               patch("app.picker.nzb_lane.in_progress", return_value=False),
               patch("app.probe.probe_race", side_effect=fake_probe_race),
               patch("app.reputation.blocked", return_value=False),
-              patch.object(picker, "_sd_acceptable", return_value=True)):
+              patch.object(picker, "FAST_VERIFIED_GRACE", 0.3)):
             verified, _ = await picker._race_fast(
                 "movie", "tt1234567", picker.PROFILES["full"], 7200,
                 lambda _s: 1_000_000, started)
 
+        elapsed = time.monotonic() - started
         self.assertEqual(good["url"], verified[0][0]["url"])
-        self.assertLess(time.monotonic() - started, 0.25)
+        self.assertGreaterEqual(elapsed, 0.3)     # waited the grace window
+        self.assertLess(elapsed, 2.0)             # but not the hanging HD probe
 
-    async def test_old_title_still_waits_for_an_hd_candidate(self):
-        # SD leniency must not settle for SD while a real HD copy is still in
-        # flight — HD wins whenever it exists, even for an old title.
-        hd = _stream("HD", "https://good.example/hd")          # 1080p
-        sd = _sd_stream("SD", "https://good.example/sd")       # 480p
+    async def test_verified_hd_returns_immediately_without_waiting_grace(self):
+        # A verified 1080p trips _enough, so the race returns at once even though
+        # the grace window is long.
+        hd = _stream("HD", "https://good.example/hd")            # 1080p
 
         async def fake_probe_race(candidates, *_a, outcomes=None, **_k):
-            stream = candidates[0]
-            if stream["url"] == sd["url"]:
-                await asyncio.sleep(0.01)
-                return [(stream, probe.ProbeResult(True, ttfb=0.1,
-                                                   speed_bps=2_000_000))]
-            await asyncio.sleep(0.08)                          # HD a touch slower
-            return [(stream, probe.ProbeResult(True, ttfb=0.1,
-                                               speed_bps=20_000_000))]
+            await asyncio.sleep(0.02)
+            return [(candidates[0], probe.ProbeResult(True, ttfb=0.1,
+                                                      speed_bps=20_000_000))]
 
         started = time.monotonic()
         with (patch("app.picker.sources.search_all", return_value=[sources.FAST]),
-              patch("app.sources.get", return_value=[hd, sd]),
+              patch("app.sources.get", return_value=[hd]),
               patch("app.sources.peek", return_value=[]),
               patch("app.picker.nzb_lane.in_progress", return_value=False),
               patch("app.probe.probe_race", side_effect=fake_probe_race),
               patch("app.reputation.blocked", return_value=False),
-              patch.object(picker, "_sd_acceptable", return_value=True)):
+              patch.object(picker, "FAST_VERIFIED_GRACE", 5)):
             verified, _ = await picker._race_fast(
                 "movie", "tt1234567", picker.PROFILES["full"], 7200,
                 lambda _s: 1_000_000, started)
 
-        urls = {v[0]["url"] for v in verified}
-        self.assertIn(hd["url"], urls)          # HD was not skipped for SD
-
-
-class SdAcceptableTests(unittest.TestCase):
-    def _prof(self, years, media="series"):
-        return content_identity.IdentityProfile(
-            media=media, imdb_id="tt0060366", aliases=("Dark Shadows",),
-            years=frozenset(years))
-
-    def test_pre_threshold_title_is_sd_acceptable(self):
-        self.assertTrue(picker._sd_acceptable(self._prof({1966})))
-
-    def test_modern_title_is_not(self):
-        self.assertFalse(picker._sd_acceptable(self._prof({2015})))
-
-    def test_earliest_authoritative_year_decides(self):
-        self.assertTrue(picker._sd_acceptable(self._prof({1966, 2012})))
-
-    def test_unknown_year_is_not_acceptable(self):
-        self.assertFalse(picker._sd_acceptable(self._prof(set())))
-
-    def test_none_profile_is_not_acceptable(self):
-        self.assertFalse(picker._sd_acceptable(None))
-
-    def test_zero_threshold_disables(self):
-        with patch.object(picker, "SD_BEFORE_YEAR", 0):
-            self.assertFalse(picker._sd_acceptable(self._prof({1966})))
+        self.assertEqual(hd["url"], verified[0][0]["url"])
+        self.assertLess(time.monotonic() - started, 1.0)   # did not wait 5s
 
 
 class ProbeRequirementTests(unittest.TestCase):

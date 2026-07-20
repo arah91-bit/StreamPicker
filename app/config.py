@@ -117,14 +117,6 @@ SETTINGS = [
               "runs higher than this — handy on a capped or slow connection so "
               "a 90 Mbps remux is never picked. 0 = unlimited: pick the best "
               "quality regardless of bitrate."),
-    dict(key="FAST_SD_BEFORE_YEAR", group="picking", type="number",
-         default="2000", min=0, max=2015, step=1, unit="", toggle_year=True,
-         year_min=1940, label="Accept DVD quality for old titles",
-         desc="For anything released before this year, a verified DVD/SD "
-              "stream counts as good enough — so an old, SD-only title (a "
-              "pre-HD TV show, say) returns quickly instead of holding the "
-              "whole deadline hunting for an HD copy that was never made. HD "
-              "still wins whenever it exists. Off = always hold out for HD."),
 
     dict(key="ACQUIRE_ENABLED", group="acquire", type="bool", default="1",
          label="Add missing titles automatically",
@@ -265,7 +257,6 @@ _FALSE = ("0", "false", "no", "off", "")
 _INT_KEYS = {
     "BUFFER_CACHE_GB", "BUFFER_AHEAD_GB", "VERIFIED_WANT", "MAX_PROBES",
     "SLOW_MAX_PROBES", "FAST_ENOUGH_4K", "FAST_ENOUGH_1080",
-    "FAST_SD_BEFORE_YEAR",
     "FAST_PROBE_BATCH", "PROBE_HOST_BENCH", "SLOW_CONCURRENCY",
     "SLOW_NZB_PROBES", "SLOW_FINISH_MAX_PROBES", "SLOW_VIDEO_PROBE_N",
     "UNPROVEN_MAX_RES", "PROXY_WRAP_MAX", "PROXY_MAX_FAILOVER",
@@ -336,6 +327,7 @@ _RETIRED_KEYS = {
     "NZB_TIMEOUT", "NZB_IMPORT_SLOT_HOLD",
     "JELLIO_URL", "JELLIO_DIRECT_PLAY", "JELLIO_ENRICH",
     "JELLIO_CACHE_TTL", "JELLIO_NEG_TTL", "JELLIO_TIMEOUT",
+    "FAST_SD_BEFORE_YEAR",   # replaced by FAST_VERIFIED_GRACE (grace timer)
 }
 
 

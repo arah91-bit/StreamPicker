@@ -64,6 +64,12 @@ CATALOG = [
      "Verified 4K streams that make the fast picker stop early."),
     ("FAST_ENOUGH_1080", "fast", "num", "1", "",
      "Verified 1080p streams that make the fast picker stop early."),
+    ("FAST_VERIFIED_GRACE", "fast", "num", "5", _S,
+     "Once the fast picker holds a stream that definitely plays, how long it "
+     "keeps looking for a genuinely better one before answering with the best "
+     "it has. A verified 1080p/4K still returns immediately; this only caps the "
+     "chase for unproven 'HD' that may never verify (the slow picker does the "
+     "thorough pass)."),
     ("FAST_PROBE_BATCH", "fast", "num", "3", "",
      "How many candidates the fast picker probes at once per wave."),
     ("PROBE_HOST_BENCH", "fast", "num", "3", "",
