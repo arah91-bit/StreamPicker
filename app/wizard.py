@@ -88,7 +88,8 @@ def _f(key: str, label: str, kind: str = "text", placeholder: str = "") -> dict:
 
 SOURCE_CARDS = [
     dict(id="indexers", title="Usenet indexers", test="indexers", source=True,
-         blurb="Newznab indexers you have accounts with. One per line.",
+         blurb="Newznab indexers you have accounts with. Switch on the nzbdav "
+               "mount below too — the usenet lane needs both to play anything.",
          fields=[_f("NZB_INDEXERS",
                     "name | api-url | apikey — one indexer per line",
                     "multiline",
@@ -113,11 +114,15 @@ SOURCE_CARDS = [
 
 HELPER_CARDS = [
     dict(id="nzbdav", title="nzbdav", test="nzbdav", source=False,
-         blurb="Mounts usenet releases so they stream directly. "
-               "Pairs with the usenet indexers above.",
-         fields=[_f("NZBDAV_URL", "Base URL", "url", "http://nzbdav:8080"),
+         blurb="Required for the usenet indexers above to play — it mounts "
+               "each release so it streams without downloading. Set up both, "
+               "or neither works.",
+         fields=[_f("NZBDAV_URL", "Base URL", "url", "http://nzbdav:3000"),
                  _f("NZBDAV_USER", "WebDAV user", "text"),
-                 _f("NZBDAV_PASS", "WebDAV password", "secret")]),
+                 _f("NZBDAV_PASS", "WebDAV password", "secret"),
+                 _f("NZBDAV_API_KEY",
+                    "API key (optional — shows the queue in the dashboard)",
+                    "secret")]),
     dict(id="radarr", title="Radarr", test="radarr", source=False,
          blurb="Grabs missing movies on request.",
          fields=[_f("RADARR_URL", "Base URL", "url", "http://radarr:7878"),

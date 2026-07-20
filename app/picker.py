@@ -2164,13 +2164,18 @@ async def _pick_online(media: str, media_id: str,
 # ── slow / best-quality picker ──────────────────────────────────────────────
 
 async def _gather_extras(media: str, media_id: str, wait: float) -> list[dict]:
-    """Collect streams from every user-added addon (app.sources.EXTRAS). Each is
-    joined like any built-in source; failures/timeouts yield nothing and never
-    break the pick."""
-    if not sources.EXTRAS:
+    """Collect streams from every user-added addon (app.sources.EXTRAS) plus the
+    native Prowlarr lane when it is enabled. Each is joined like any built-in
+    source; failures/timeouts yield nothing and never break the pick. Folding
+    Prowlarr in here threads it through every merge site (fast finisher, slow
+    finish, slow foreground) that already concatenates these into the pool."""
+    keys = list(sources.EXTRAS)
+    if sources.has(sources.PROWLARR):
+        keys.append(sources.PROWLARR)
+    if not keys:
         return []
     results = await asyncio.gather(
-        *(sources.get(k, media, media_id, wait=wait) for k in sources.EXTRAS),
+        *(sources.get(k, media, media_id, wait=wait) for k in keys),
         return_exceptions=True)
     out: list[dict] = []
     for r in results:

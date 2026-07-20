@@ -150,9 +150,40 @@ SETTINGS = [
          desc="Comma-separated proxy IPs/CIDRs allowed to supply "
               "X-Forwarded-For. Keep this narrow; forwarded headers from all "
               "other peers are rejected."),
-    # Managed by the "Custom addons" panel, not a generic row (hence hidden).
+    # The three built-in scraper lanes. Configured via the "Sources" catalog at
+    # the top of the page (toggles minting these from the central debrid key),
+    # so they are hidden here — but still real, sensitive, encrypted-at-rest keys
+    # that config.save/clear must accept. Each embeds a debrid key.
+    dict(key="FAST_BASE_URL", group="identity", type="text", kind="url",
+         sensitive=True, hidden=True, default="", label="Comet base URL"),
+    dict(key="STREMTHRU_BASE_URL", group="identity", type="text", kind="url",
+         sensitive=True, hidden=True, default="", label="StremThru base URL"),
+    dict(key="MEDIAFUSION_BASE_URL", group="identity", type="text", kind="url",
+         sensitive=True, hidden=True, default="", label="MediaFusion base URL"),
+    # Optional password for a private MediaFusion instance whose encrypt
+    # endpoint is gated. When set, the Sources catalog can re-mint the
+    # MediaFusion URL (e.g. to inject your Prowlarr); when blank, a private
+    # instance simply keeps its existing configured URL. Not sensitive to
+    # playback, but treated as a secret so it never renders.
+    dict(key="MEDIAFUSION_API_PASSWORD", group="identity", type="text",
+         kind="secret", hidden=True, default="", label="MediaFusion API password"),
+    # Prowlarr: a single indexer backend added in the Sources catalog. It feeds
+    # the native Prowlarr lane (PROWLARR_SOURCE) and is injected into the
+    # MediaFusion config when that engine is on. Absent = every dependent
+    # feature is simply off; nothing breaks.
+    dict(key="PROWLARR_URL", group="identity", type="text", kind="url",
+         hidden=True, default="", label="Prowlarr URL"),
+    dict(key="PROWLARR_API_KEY", group="identity", type="text", kind="secret",
+         hidden=True, default="", label="Prowlarr API key"),
+    dict(key="PROWLARR_SOURCE", group="identity", type="bool", hidden=True,
+         default="0", label="Prowlarr as a source"),
+    # Managed by the "Sources" scraper catalog, not generic rows (hence hidden).
+    # EXTRA_ADDONS carries the minted/custom addon URLs the picker races;
+    # SCRAPERS records which catalog engines are enabled so the panel round-trips.
     dict(key="EXTRA_ADDONS", group="identity", type="addons", default="",
          hidden=True, label="Custom addons"),
+    dict(key="SCRAPERS", group="identity", type="scrapers", default="",
+         hidden=True, label="Scrapers"),
 ]
 
 # field kind: url | text | secret | multiline. Secrets render masked and an
@@ -162,8 +193,8 @@ SETTINGS = [
 # page, in this order. Each connection below carries a matching `cat`. (id,
 # title, blurb)
 CONNECTION_GROUPS = [
-    ("sources", "Debrid & scrapers",
-     "Where streams come from — cached-debrid search and broad scrapers."),
+    # Debrid & scrapers live in the unified "Sources" catalog above the
+    # Connections section (app.scrapers), not as connection cards.
     ("usenet", "Usenet",
      "Direct usenet: indexer searches and the mount that streams NZBs."),
     ("metadata", "Metadata",
@@ -175,26 +206,10 @@ CONNECTION_GROUPS = [
 ]
 
 CONNECTIONS = [
-    dict(id="comet", name="Comet", role="Fast lane — cached debrid search",
-        cat="sources",
-        fields=[dict(key="FAST_BASE_URL", label="Manifest base URL",
-                      kind="url", sensitive=True,
-                      hint="Your configured Comet base, without "
-                           "/manifest.json. The URL embeds your debrid "
-                           "keys — treat it like a password.")]),
-    dict(id="stremthru", name="StremThru Torz",
-         role="Long-tail crowdsourced hash index", cat="sources",
-         fields=[dict(key="STREMTHRU_BASE_URL", label="Manifest base URL",
-                      kind="url", sensitive=True,
-                      hint="The Torz URL embeds your debrid key in its path — "
-                           "treat it like a password.")]),
-    dict(id="mediafusion", name="MediaFusion",
-         role="Broad scrape — slow first hit, feeds the quality pass",
-         cat="sources",
-         fields=[dict(key="MEDIAFUSION_BASE_URL", label="Manifest base URL",
-                      kind="url", sensitive=True,
-                      hint="A configured MediaFusion URL can encode your "
-                           "debrid credentials — treat it like a password.")]),
+    # Comet / StremThru / MediaFusion are configured in the unified "Sources"
+    # scraper catalog (app.scrapers) at the top of the page — toggles that mint
+    # FAST_BASE_URL / STREMTHRU_BASE_URL / MEDIAFUSION_BASE_URL from the central
+    # debrid key — not as connection cards here.
     dict(id="indexers", name="Usenet indexers",
          role="Direct usenet searches (Newznab)", cat="usenet",
         fields=[dict(key="NZB_INDEXERS", label="One per line: name|api-url|apikey",
@@ -269,6 +284,7 @@ _INT_KEYS = {
     "OMDB_DAILY_BUDGET",
     "REPUTATION_MAX_ENTRIES", "MIN_BLOCK_SESSIONS", "TELEMETRY_MAX_BYTES",
     "TELEMETRY_SEGMENTS", "MAX_BITRATE_MBPS",
+    "PROWLARR_RESOLVE_MAX", "PROWLARR_RESOLVE_CONCURRENCY", "PROWLARR_MIN_SEEDERS",
 }
 
 _FRACTION_KEYS = {
@@ -599,6 +615,36 @@ def _normalize(spec: dict, raw: str):
             name = str(it.get("name", "")).strip()[:60] or url
             out.append({"name": name, "url": url})
         return json.dumps(out, separators=(",", ":")) if out else ""
+    if typ == "scrapers":
+        if raw == "":
+            return ""
+        try:
+            items = json.loads(raw)
+        except ValueError:
+            raise ValueError("scrapers: not valid JSON") from None
+        if not isinstance(items, list):
+            raise ValueError("scrapers: expected a JSON list")
+        if len(items) > 64:
+            raise ValueError("scrapers: at most 64 entries are allowed")
+        out = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            sid = str(it.get("id", "")).strip()[:64]
+            if not sid:
+                continue
+            row = {"id": sid}
+            url = str(it.get("url", "")).strip().rstrip("/")
+            if url.endswith("/manifest.json"):
+                url = url[:-len("/manifest.json")].rstrip("/")
+            if url:
+                _http_url("scraper URL", url)
+                row["url"] = url
+            name = str(it.get("name", "")).strip()[:60]
+            if name:
+                row["name"] = name
+            out.append(row)
+        return json.dumps(out, separators=(",", ":")) if out else ""
     if kind == "url":
         return _http_url(spec["key"], raw)
     if spec["key"] == "ADDON_PUBLIC_URL":
@@ -722,3 +768,23 @@ def pending_from(store: dict[str, str], key: str) -> str:
     if key in store:
         return store[key]
     return running(key)
+
+
+def clear(keys: list[str]) -> dict:
+    """Remove these keys' overrides from the store, reverting each to its
+    env/code default. Unlike a blank save() — which for a *sensitive* key means
+    'keep the stored one' — this genuinely deletes it, so the Sources catalog
+    can toggle a lane (e.g. Comet's FAST_BASE_URL) off. Unknown keys are
+    rejected so this stays a scoped primitive, not a generic delete-any-env."""
+    store = _read()
+    removed = []
+    for key in keys:
+        if key not in _SPECS:
+            raise ValueError(f"unknown setting: {str(key)[:40]}")
+        if key in store:
+            store.pop(key)
+            removed.append(key)
+    _validate_effective(store)
+    if removed:
+        _write(store)
+    return {"cleared": removed, "restart_needed": restart_pending()}

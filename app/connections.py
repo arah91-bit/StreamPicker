@@ -94,6 +94,65 @@ async def _addon(overrides: dict) -> dict:
         return _fail(t0, e)
 
 
+async def _scraper(overrides: dict) -> dict:
+    """Test one scraper engine from the unified Sources catalog: mint its URL
+    from the submitted debrid rows, then prove it actually serves streams for a
+    universally-cached title (falling back to a manifest check for a niche addon
+    that simply has no copy of the probe title). Never reflects the minted URL —
+    it embeds the debrid key."""
+    from app import config, scrapers, wizard
+    engine_id = str((overrides or {}).get("id", "")).strip()
+    custom = str((overrides or {}).get("url", "")).strip()
+    debrids = (overrides or {}).get("debrids")
+    t0 = time.monotonic()
+    try:
+        base = await scrapers.mint_for_test(
+            engine_id, custom, debrids,
+            config.pending("FAST_BASE_URL"),
+            config.pending("STREMTHRU_BASE_URL"),
+            config.pending("MEDIAFUSION_BASE_URL"))
+    except ValueError as e:
+        return _fail(t0, str(e))
+    t0 = time.monotonic()
+    try:
+        r = await _client.get(f"{base}/stream/movie/{wizard._CHECK_TITLE}.json",
+                              timeout=45)
+        if r.status_code == 200:
+            real = [s for s in (r.json().get("streams") or [])
+                    if s.get("url") or s.get("infoHash")]
+            if real:
+                return _ok(t0, f"{len(real)} streams found")
+    except Exception:
+        pass
+    # No cached copy of the probe title (or a slow scraper): fall back to
+    # confirming it's a reachable stream addon by its manifest.
+    return await _addon({"url": base})
+
+
+async def _prowlarr(overrides: dict) -> dict:
+    """Authenticated Prowlarr check: list the indexers the API key can see, so a
+    bad URL or key fails clearly and the operator learns how many indexers back
+    this source."""
+    base = _val("PROWLARR_URL", overrides).rstrip("/")
+    key = _val("PROWLARR_API_KEY", overrides)
+    t0 = time.monotonic()
+    if not base:
+        return _fail(t0, "no URL configured")
+    if not key:
+        return _fail(t0, "no API key configured")
+    try:
+        r = await _client.get(f"{base}/api/v1/indexer",
+                              headers={"X-Api-Key": key})
+        r.raise_for_status()
+        indexers = r.json()
+        if not isinstance(indexers, list):
+            return _fail(t0, "unexpected response — is this a Prowlarr URL?")
+        enabled = [i for i in indexers if i.get("enable")]
+        return _ok(t0, f"{len(enabled)}/{len(indexers)} indexers enabled")
+    except Exception as e:
+        return _fail(t0, e)
+
+
 async def _tmdb(overrides: dict) -> dict:
     key = _val("TMDB_API_KEY", overrides)
     t0 = time.monotonic()
@@ -315,8 +374,11 @@ async def _indexers(overrides: dict) -> dict:
 
 
 _TESTS = {
-    "comet": lambda o: _manifest("FAST_BASE_URL", o),
-    "stremthru": lambda o: _manifest("STREMTHRU_BASE_URL", o),
+    # The settings page tests Comet/StremThru/MediaFusion through the unified
+    # "scraper" test (mint from the debrid key, then prove streams). The
+    # first-run wizard still tests a pasted MediaFusion URL by its manifest.
+    "scraper": _scraper,
+    "prowlarr": _prowlarr,
     "mediafusion": lambda o: _manifest("MEDIAFUSION_BASE_URL", o),
     "jellyfin": _jellyfin,
     "addon": _addon,

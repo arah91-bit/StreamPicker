@@ -16,7 +16,7 @@ import html
 import json
 import os
 
-from app import adminui, config, debrid, knobs
+from app import adminui, config, debrid, knobs, scrapers
 
 ADDON_NAME = os.environ.get("ADDON_NAME", "Auto Stream")
 
@@ -196,6 +196,22 @@ cursor:pointer;padding:0 4px}
 padding-top:14px;border-top:1px solid var(--line)}
 .addonadd input{flex:1;min-width:150px}
 .addonempty{color:var(--mut);font-size:13px;padding:2px 0 4px}
+.srcsub{font:600 11px var(--mono);text-transform:uppercase;letter-spacing:.05em;
+color:var(--mut);margin:0 0 8px}
+.srcsub2{margin-top:20px;padding-top:14px;border-top:1px solid var(--line)}
+.srcsub .advhint{font:400 12px inherit;text-transform:none;letter-spacing:0}
+.engrow{display:flex;align-items:flex-start;gap:12px;flex-wrap:wrap;
+padding:12px 0;border-bottom:1px solid var(--line)}
+.engrow:last-of-type{border-bottom:0}
+.engrow .swi,.engrow .badge2{margin-top:2px}
+.engrow .dot{margin-top:9px}
+.enginfo{flex:1;min-width:120px}
+.engname{font-weight:600;font-size:14px}
+.engblurb{color:var(--mut);font-size:12.5px;margin-top:2px}
+.engwarn{color:var(--warn);font-size:12px;margin-top:5px}
+.engurl{margin-top:8px}
+.engurl input{font:12px var(--mono)}
+.engrow .tres{flex-basis:100%;text-align:right}
 
 :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
@@ -329,83 +345,58 @@ $$('.test').forEach(btn=>btn.addEventListener('click',async()=>{
  btn.disabled=false;
 }));
 
-/* custom addons: a small editable list writing one hidden EXTRA_ADDONS field */
-const addonval=$('#addonval');
+/* Sources catalog: one panel POSTing {debrids, engines} to
+   /api/settings/scrapers, which mints every enabled engine from the central
+   debrid key and rewrites the runtime source keys server-side. Stored keys
+   never reach the browser — a blank debrid key means "keep the stored one". */
 function hesc(s){return (s||'').replace(/[&<>"']/g,c=>(
  {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
-let ADDONS=[];try{ADDONS=JSON.parse(addonval.value||'[]')||[]}catch(e){ADDONS=[]}
-function renderAddons(){
- const list=$('#addonlist');
- if(!ADDONS.length){list.innerHTML=
-   "<div class='addonempty'>No custom addons yet — add one below.</div>";return;}
- list.innerHTML=ADDONS.map((a,i)=>
-  `<div class='addonrow' data-i='${i}'><div class='addoninfo'>`+
-  `<span class='addonname'>${hesc(a.name)}</span>`+
-  `<span class='addonurl'>${hesc(a.url)}</span></div>`+
-  `<span class='dot'></span>`+
-  `<button type='button' class='btn ghost addon-test' data-i='${i}'>Test</button>`+
-  `<button type='button' class='addon-del' data-i='${i}' title='Remove'>×</button>`+
-  `<span class='tres'></span></div>`).join('');
-}
-function addonsSync(){
- addonval.value=JSON.stringify(ADDONS);
- addonval.dispatchEvent(new Event('input',{bubbles:true}));
- renderAddons();
-}
-$('#addon_add').addEventListener('click',()=>{
- const name=$('#addon_name').value.trim(),url=$('#addon_url').value.trim();
- if(!url)return;
- ADDONS.push({name:name||url,url});
- $('#addon_name').value='';$('#addon_url').value='';addonsSync();
-});
-$('#addon_url').addEventListener('keydown',e=>{if(e.key==='Enter')$('#addon_add').click();});
-$('#addonlist').addEventListener('click',async e=>{
- const del=e.target.closest('.addon-del');
- if(del){ADDONS.splice(+del.dataset.i,1);addonsSync();return;}
- const t=e.target.closest('.addon-test');
- if(!t)return;
- const row=t.closest('.addonrow'),dot=row.querySelector('.dot'),
-   res=row.querySelector('.tres');
- dot.className='dot run';res.className='tres';res.textContent='testing…';t.disabled=true;
- try{const r=await post('/api/settings/test/addon',{values:{url:ADDONS[+t.dataset.i].url}});
-  dot.className='dot '+(r.ok?'ok':'bad');res.className='tres '+(r.ok?'ok':'bad');
-  res.textContent=`${r.ms} ms · ${r.detail}`;
- }catch(err){dot.className='dot bad';res.className='tres bad';res.textContent=err.message;}
- t.disabled=false;
-});
-renderAddons();
-
-/* debrid manager: a provider list that POSTs to /api/settings/debrid, which
-   rewrites the keys inside the Comet + StremThru URLs server-side (the stored
-   keys never reach the browser — a blank key means "keep the stored one"). */
-const DBOX=$('#debridmgr');
-if(DBOX){
- const DATA=JSON.parse($('#debrid-data').textContent);
+function slug(s){return (s||'').toLowerCase().replace(/[^a-z0-9]+/g,'-')
+ .replace(/^-+|-+$/g,'')||'addon';}
+const SBOX=$('#scrapers');
+if(SBOX){
+ const DATA=JSON.parse($('#scrapers-data').textContent);
  const PROV={};DATA.providers.forEach(p=>PROV[p.id]=p);
- let ROWS=DATA.current.map(id=>({service:id,hasKey:true,key:''}));
- const used=()=>new Set(ROWS.map(r=>r.service));
+ const ENG={};DATA.engines.forEach(e=>ENG[e.id]=e);
+ let DROWS=DATA.debrids.map(id=>({service:id,hasKey:true,key:''}));
+ const ST={};DATA.engines.forEach(e=>ST[e.id]={on:false,url:''});
+ let CUSTOM=[];
+ DATA.enabled.forEach(en=>{
+  if(ENG[en.id])ST[en.id]={on:true,url:en.url||''};
+  else CUSTOM.push({name:en.name||'',url:en.url||''});});
+ const PR={url:(DATA.prowlarr&&DATA.prowlarr.url)||'',
+           hasKey:!!(DATA.prowlarr&&DATA.prowlarr.has_key),key:''};
+ const havePr=()=>!!(PR.url&&(PR.hasKey||PR.key));
+ const haveDebrid=()=>DROWS.length>0;
+ // Why a toggle is grayed out: its Prowlarr backend or a debrid key is missing.
+ const gateReason=e=>{
+  if(e.needs_prowlarr&&!havePr())return 'prowlarr';
+  if(e.needs_debrid&&!haveDebrid()&&!ST[e.id].url)return 'debrid';
+  return '';};
+ const gated=e=>!!gateReason(e);
+ function setRes(msg,cls){const r=$('#scrapersres');
+  r.className='debridres'+(cls?' '+cls:'');r.textContent=msg||'';}
+
+ /* debrid key list */
+ const used=()=>new Set(DROWS.map(r=>r.service));
  function renderPicker(){
   const u=used(),avail=DATA.providers.filter(p=>!u.has(p.id));
   $('#debrid_pick').innerHTML=avail.length
    ?avail.map(p=>`<option value='${p.id}'>${hesc(p.label)}</option>`).join('')
    :"<option value=''>all added</option>";
   $('#debrid_pick').disabled=$('#debrid_add').disabled=!avail.length;
-  $('#debrid_newkey').disabled=!avail.length;
-  syncKeyLink();
- }
+  $('#debrid_newkey').disabled=!avail.length;syncKeyLink();}
  function syncKeyLink(){
   const p=PROV[$('#debrid_pick').value],link=$('#debrid_keylink');
   if(p){link.href=p.key_url;link.textContent='where is my '+p.label+' key?';
-   link.hidden=false;
-   $('#debrid_newkey').placeholder='paste your '+p.label+' API key';}
-  else link.hidden=true;
- }
- function renderRows(){
+   link.hidden=false;$('#debrid_newkey').placeholder='paste your '+p.label+' API key';}
+  else link.hidden=true;}
+ function renderDebrids(){
   const list=$('#debridlist');
-  if(!ROWS.length){list.innerHTML=
-    "<div class='addonempty'>No debrid yet — add one below.</div>";
+  if(!DROWS.length){list.innerHTML=
+    "<div class='addonempty'>No debrid yet — add one below to power the scrapers.</div>";
    renderPicker();return;}
-  list.innerHTML=ROWS.map((r,i)=>{const p=PROV[r.service];
+  list.innerHTML=DROWS.map((r,i)=>{const p=PROV[r.service];
    const ph=r.hasKey?'kept · hidden — blank keeps it':'paste API key';
    return `<div class='debridrow' data-i='${i}'>`+
     `<span class='badge2'>${hesc(p.badge)}</span>`+
@@ -415,47 +406,161 @@ if(DBOX){
     `placeholder='${ph}' value='${hesc(r.key)}'>`+
     `<button type='button' class='addon-del' data-i='${i}' `+
     `title='Remove'>&times;</button></div>`;}).join('');
-  renderPicker();
- }
- function setRes(msg,cls){const r=$('#debridres');
-  r.className='debridres'+(cls?' '+cls:'');r.textContent=msg||'';}
+  renderPicker();}
  $('#debrid_pick').addEventListener('change',syncKeyLink);
  $('#debrid_add').addEventListener('click',()=>{
   const id=$('#debrid_pick').value,key=$('#debrid_newkey').value.trim();
   if(!id)return;
   if(!key)return setRes('Paste the API key for '+PROV[id].label+'.','bad');
-  ROWS.push({service:id,hasKey:false,key});
-  $('#debrid_newkey').value='';setRes('');renderRows();
- });
+  DROWS.push({service:id,hasKey:false,key});
+  $('#debrid_newkey').value='';setRes('');renderDebrids();renderEngines();});
  $('#debrid_newkey').addEventListener('keydown',
   e=>{if(e.key==='Enter')$('#debrid_add').click();});
  $('#debridlist').addEventListener('input',e=>{
-  const k=e.target.closest('.debridkey');if(k)ROWS[+k.dataset.i].key=k.value;});
+  const k=e.target.closest('.debridkey');if(k)DROWS[+k.dataset.i].key=k.value;});
  $('#debridlist').addEventListener('click',e=>{
   const del=e.target.closest('.addon-del');if(!del)return;
-  ROWS.splice(+del.dataset.i,1);setRes('');renderRows();});
- async function sendDebrids(dry){
-  if(!ROWS.length)return setRes('Add at least one debrid service.','bad');
-  const debrids=ROWS.map(r=>({service:r.service,key:(r.key||'').trim()}));
-  const btn=dry?$('#debrid_test'):$('#debrid_save');
+  DROWS.splice(+del.dataset.i,1);setRes('');renderDebrids();renderEngines();});
+
+ /* scraper engine toggles */
+ function renderEngines(){
+  $('#enginelist').innerHTML=DATA.engines.map(e=>{
+   const st=ST[e.id],g=gated(e),on=st.on&&!g;
+   const showUrl=!e.internal&&(e.custom_only||st.url!=='');
+   const ph=e.custom_only?'paste your configured manifest URL'
+     :'custom manifest URL (optional)';
+   const warn=gateReason(e)==='prowlarr'
+     ?'Add your Prowlarr above to switch this on.'
+     :'Add a debrid key above to switch this on.';
+   return `<div class='engrow' data-id='${e.id}'>`+
+    `<input type='checkbox' class='swi engtoggle' data-id='${e.id}' `+
+     `${on?'checked':''} ${g?'disabled':''}>`+
+    `<span class='badge2'>${hesc(e.badge)}</span>`+
+    `<div class='enginfo'>`+
+     `<div class='engname'>${hesc(e.label)} `+
+      `<a class='keylink' href='${hesc(e.docs)}' target='_blank' `+
+      `rel='noopener noreferrer'>docs</a></div>`+
+     `<div class='engblurb'>${hesc(e.blurb)}</div>`+
+     (g?`<div class='engwarn'>${warn}</div>`:'')+
+     (e.internal?'':`<div class='engurl' ${showUrl?'':'hidden'}>`+
+      `<input class='enginput' data-id='${e.id}' spellcheck='false' `+
+       `autocomplete='off' placeholder='${ph}' value='${hesc(st.url)}'></div>`)+
+    `</div>`+
+    `<span class='dot'></span>`+
+    (e.internal?'':`<button type='button' class='btn ghost engadv' `+
+      `data-id='${e.id}'>URL</button>`)+
+    `<button type='button' class='btn ghost engtest' data-id='${e.id}'>Test</button>`+
+    `<span class='tres'></span></div>`;}).join('');}
+ $('#enginelist').addEventListener('change',e=>{
+  const t=e.target.closest('.engtoggle');if(t)ST[t.dataset.id].on=t.checked;});
+ $('#enginelist').addEventListener('input',e=>{
+  const i=e.target.closest('.enginput');if(i)ST[i.dataset.id].url=i.value.trim();});
+ $('#enginelist').addEventListener('click',e=>{
+  const adv=e.target.closest('.engadv');
+  if(adv){const u=adv.closest('.engrow').querySelector('.engurl');
+   if(u){u.hidden=!u.hidden;if(!u.hidden)u.querySelector('input').focus();}return;}
+  const t=e.target.closest('.engtest');if(!t)return;
+  const row=t.closest('.engrow'),id=t.dataset.id;
+  if(ENG[id]&&ENG[id].internal){        // Prowlarr source → test its backend
+   testProwlarr(t,row.querySelector('.dot'),row.querySelector('.tres'));return;}
+  testOne(id,ST[id].url,t,row.querySelector('.dot'),row.querySelector('.tres'));});
+
+ /* custom addons (folded in) */
+ function renderCustom(){
+  const list=$('#customlist');
+  list.innerHTML=CUSTOM.map((c,i)=>
+   `<div class='addonrow' data-i='${i}'><div class='addoninfo'>`+
+   `<span class='addonname'>${hesc(c.name||c.url)}</span>`+
+   `<span class='addonurl'>${hesc(c.url)}</span></div>`+
+   `<span class='dot'></span>`+
+   `<button type='button' class='btn ghost custom-test' data-i='${i}'>Test</button>`+
+   `<button type='button' class='addon-del' data-i='${i}' title='Remove'>&times;</button>`+
+   `<span class='tres'></span></div>`).join('');}
+ $('#custom_add').addEventListener('click',()=>{
+  const name=$('#custom_name').value.trim(),url=$('#custom_url').value.trim();
+  if(!url)return;
+  CUSTOM.push({name:name||url,url});
+  $('#custom_name').value='';$('#custom_url').value='';renderCustom();});
+ $('#custom_url').addEventListener('keydown',
+  e=>{if(e.key==='Enter')$('#custom_add').click();});
+ $('#customlist').addEventListener('click',e=>{
+  const del=e.target.closest('.addon-del');
+  if(del){CUSTOM.splice(+del.dataset.i,1);renderCustom();return;}
+  const t=e.target.closest('.custom-test');if(!t)return;
+  const row=t.closest('.addonrow'),c=CUSTOM[+t.dataset.i];
+  testOne('custom-'+slug(c.name||c.url),c.url,t,
+   row.querySelector('.dot'),row.querySelector('.tres'));});
+
+ /* test one engine/addon — the server mints it from the current debrid rows */
+ async function testOne(id,url,btnEl,dotEl,resEl){
+  const debrids=DROWS.map(r=>({service:r.service,key:(r.key||'').trim()}));
+  dotEl.className='dot run';resEl.className='tres';resEl.textContent='testing…';
+  btnEl.disabled=true;
+  try{const r=await post('/api/settings/test/scraper',{values:{id,url,debrids}});
+   dotEl.className='dot '+(r.ok?'ok':'bad');resEl.className='tres '+(r.ok?'ok':'bad');
+   resEl.textContent=`${r.ms} ms · ${r.detail}`;
+  }catch(err){dotEl.className='dot bad';resEl.className='tres bad';
+   resEl.textContent=err.message;}
+  btnEl.disabled=false;}
+
+ /* Prowlarr backend: one URL + key, tested against its own indexer API. A blank
+    key reuses the stored one. Shared by the Prowlarr block button and the
+    Prowlarr source row's Test button. */
+ async function testProwlarr(btnEl,dotEl,resEl){
+  dotEl.className='dot run';resEl.className='tres';resEl.textContent='testing…';
+  btnEl.disabled=true;
+  try{const r=await post('/api/settings/test/prowlarr',
+        {values:{PROWLARR_URL:PR.url,PROWLARR_API_KEY:PR.key}});
+   dotEl.className='dot '+(r.ok?'ok':'bad');resEl.className='tres '+(r.ok?'ok':'bad');
+   resEl.textContent=`${r.ms} ms · ${r.detail}`;
+  }catch(err){dotEl.className='dot bad';resEl.className='tres bad';
+   resEl.textContent=err.message;}
+  btnEl.disabled=false;}
+ function initProwlarr(){
+  $('#prowlarr_url').value=PR.url;
+  if(PR.hasKey)$('#prowlarr_key').placeholder='kept · hidden — blank keeps it';
+  $('#prowlarr_url').addEventListener('input',ev=>{
+   PR.url=ev.target.value.trim();renderEngines();});
+  $('#prowlarr_key').addEventListener('input',ev=>{
+   PR.key=ev.target.value.trim();renderEngines();});
+  $('#prowlarr_test').addEventListener('click',()=>testProwlarr(
+   $('#prowlarr_test'),$('#prowlarr_dot'),$('#prowlarr_res')));}
+
+ /* collect enabled engines + custom addons, then save/test-keys together */
+ function collectEngines(){
+  const out=[];
+  DATA.engines.forEach(e=>{const st=ST[e.id];
+   if(st.on&&!gated(e))out.push(st.url?{id:e.id,url:st.url}:{id:e.id});});
+  CUSTOM.forEach(c=>out.push({id:'custom-'+slug(c.name||c.url),
+   name:c.name,url:c.url}));
+  return out;}
+ async function sendScrapers(dry){
+  const debrids=DROWS.map(r=>({service:r.service,key:(r.key||'').trim()}));
+  const btn=dry?$('#scrapers_test'):$('#scrapers_save');
   btn.disabled=true;setRes(dry?'testing…':'saving…');
   try{
-   const res=await post('/api/settings/debrid',{debrids,dry_run:dry});
+   const res=await post('/api/settings/scrapers',
+     {debrids,engines:collectEngines(),
+      prowlarr:{url:PR.url,api_key:PR.key},dry_run:dry});
    const parts=Object.entries(res.results||{}).map(([k,v])=>
     (v.ok===false?'✗ ':v.ok===true?'✓ ':'• ')+(PROV[k]?PROV[k].label:k));
-   if(dry){setRes(parts.join('   ')||'no checkable keys — save to apply',
-     res.ok?'ok':'bad');}
+   if(dry)setRes(parts.join('   ')||'no checkable keys — save to apply',
+     res.ok?'ok':'bad');
    else if(res.ok){
-    ROWS=ROWS.map(r=>({service:r.service,hasKey:true,key:''}));renderRows();
+    DROWS=DROWS.map(r=>({service:r.service,hasKey:true,key:''}));renderDebrids();
+    PR.hasKey=PR.url?(PR.hasKey||!!PR.key):false;PR.key='';
+    $('#prowlarr_key').value='';
+    $('#prowlarr_key').placeholder=PR.hasKey?'kept · hidden — blank keeps it'
+     :'Prowlarr API key';
+    renderEngines();
     setRes('Saved — restart to apply.','ok');
     $('#savebar').dataset.restart='1';refreshBar();}
    else setRes('Rejected: '+parts.join('   '),'bad');
   }catch(e){setRes(e.message,'bad');}
-  btn.disabled=false;
- }
- $('#debrid_test').addEventListener('click',()=>sendDebrids(true));
- $('#debrid_save').addEventListener('click',()=>sendDebrids(false));
- renderRows();
+  btn.disabled=false;}
+ $('#scrapers_test').addEventListener('click',()=>sendScrapers(true));
+ $('#scrapers_save').addEventListener('click',()=>sendScrapers(false));
+ renderDebrids();renderEngines();renderCustom();initProwlarr();
 }
 
 const advsearch=$('#advsearch');
@@ -604,29 +709,6 @@ def _adv_row(spec: dict) -> str:
             f"<div class='ctl'>{ctl}</div></div>")
 
 
-def _custom_addons() -> str:
-    val = config.pending("EXTRA_ADDONS")     # JSON string, or ""
-    return (
-        "<h2>Custom addons <span class='advhint'>AIOStreams, a usenet addon, "
-        "any player stream source</span></h2>"
-        "<p class='blurb'>Paste any player addon's manifest URL. Its results "
-        "join the same search, run through the same playback verification, and "
-        "only streams that actually play reach you — everything is ranked "
-        "together by quality, so order doesn't matter.</p>"
-        "<div class='card' style='padding:14px 16px'>"
-        "<div id='addonlist'></div>"
-        "<div class='addonadd'>"
-        "<input id='addon_name' type='text' autocomplete='off' "
-        "placeholder='Name (e.g. AIOStreams)'>"
-        "<input id='addon_url' type='text' spellcheck='false' autocomplete='off' "
-        "placeholder='https://…/manifest.json'>"
-        "<button type='button' class='btn ghost' id='addon_add'>Add</button>"
-        "</div>"
-        f"<input type='hidden' data-key='EXTRA_ADDONS' data-init='{_esc(val)}' "
-        f"value='{_esc(val)}' id='addonval'>"
-        "</div>")
-
-
 def _advanced_section() -> str:
     groups = []
     for gid, title in knobs.GROUPS:
@@ -728,29 +810,45 @@ def _conn_groups() -> str:
     return "".join(out)
 
 
-def _debrid_manager() -> str:
-    """A friendly editor for the debrid providers embedded in the two torrent
-    lane URLs. The raw Comet/StremThru cards under Connections stay as the
-    escape hatch; this rewrites only the key list and keeps the rest. Stored
-    keys are never emitted — only which providers are configured."""
-    ids = [d["service"] for d in debrid.current(config.pending("FAST_BASE_URL"))]
+def _scrapers() -> str:
+    """The unified Sources catalog: a central debrid-key editor on top, then a
+    toggle per scraper engine (each minted from that key), a custom-addon adder,
+    and one Save that rewrites FAST_BASE_URL / STREMTHRU_BASE_URL /
+    MEDIAFUSION_BASE_URL / EXTRA_ADDONS + SCRAPERS server-side. Stored keys are
+    never emitted — only which providers/engines are configured (a custom URL a
+    user pasted themselves is echoed back so they can edit it)."""
+    fast = config.pending("FAST_BASE_URL")
+    stremthru = config.pending("STREMTHRU_BASE_URL")
+    mediafusion = config.pending("MEDIAFUSION_BASE_URL")
+    ids = [d["service"] for d in debrid.current(fast)]
     have = set(ids)
-    for d in debrid.stremthru_current(config.pending("STREMTHRU_BASE_URL")):
+    for d in debrid.stremthru_current(stremthru):
         if d["service"] not in have:
             ids.append(d["service"])
             have.add(d["service"])
     data = json.dumps({
-        "current": ids,
         "providers": [{"id": p["id"], "label": p["label"], "badge": p["badge"],
                        "key_url": debrid.signup_url(p)}
-                      for p in debrid.PROVIDERS]}, separators=(",", ":"))
+                      for p in debrid.PROVIDERS],
+        "debrids": ids,
+        "engines": scrapers.engine_meta(),
+        "enabled": scrapers.current(fast, stremthru, mediafusion,
+                                    config.pending("EXTRA_ADDONS"),
+                                    config.pending("SCRAPERS"),
+                                    config.pending("PROWLARR_SOURCE")),
+        # Prowlarr backend: the URL is safe to echo; the key is a secret, so the
+        # panel only learns whether one is stored (blank submit keeps it).
+        "prowlarr": {"url": config.pending("PROWLARR_URL"),
+                     "has_key": bool(config.pending("PROWLARR_API_KEY"))}},
+        separators=(",", ":"))
     return (
-        "<h2>Debrid services</h2>"
-        "<p class='blurb'>The providers your two torrent lanes search. Adding or "
-        "removing one here rewrites the keys inside the Comet and StremThru URLs "
-        "and leaves every other setting in them untouched — leave a key blank to "
-        "keep the one already stored. Changes apply on restart.</p>"
-        "<div class='card' id='debridmgr' style='padding:14px 16px'>"
+        "<h2>Sources</h2>"
+        "<p class='blurb'>Your debrid key powers every scraper here. Add the key "
+        "once, then switch on the scrapers you want — each is configured for you "
+        "automatically. Under any engine you can paste your own manifest URL to "
+        "go beyond the default. Changes apply on restart.</p>"
+        "<div class='card' id='scrapers' style='padding:14px 16px'>"
+        "<div class='srcsub'>Debrid services</div>"
         "<div id='debridlist'></div>"
         "<div class='debridadd'>"
         "<select id='debrid_pick' aria-label='Debrid provider'></select>"
@@ -759,11 +857,36 @@ def _debrid_manager() -> str:
         "<button type='button' class='btn ghost' id='debrid_add'>Add</button>"
         "<a id='debrid_keylink' class='keylink' target='_blank' "
         "rel='noopener noreferrer' hidden></a></div>"
+        "<div class='srcsub srcsub2'>Prowlarr "
+        "<span class='advhint'>your own indexer backend — optional</span></div>"
+        "<div class='debridadd' style='margin-top:8px'>"
+        "<input id='prowlarr_url' type='text' spellcheck='false' "
+        "autocomplete='off' placeholder='http://prowlarr:9696'>"
+        "<input id='prowlarr_key' type='password' autocomplete='new-password' "
+        "spellcheck='false' placeholder='Prowlarr API key'>"
+        "<button type='button' class='btn ghost' id='prowlarr_test'>Test</button>"
+        "<span class='dot' id='prowlarr_dot'></span>"
+        "<span class='tres' id='prowlarr_res'></span></div>"
+        "<p class='blurb' style='margin:6px 0 0'>Add it once — MediaFusion and "
+        "the Prowlarr source below both use it. Comet reads Prowlarr from its "
+        "own container environment, so point it at Prowlarr in your compose, "
+        "not here.</p>"
+        "<div class='srcsub srcsub2'>Scrapers</div>"
+        "<div id='enginelist'></div>"
+        "<div class='srcsub srcsub2'>Custom addon "
+        "<span class='advhint'>any other player stream source</span></div>"
+        "<div id='customlist'></div>"
+        "<div class='addonadd'>"
+        "<input id='custom_name' type='text' autocomplete='off' "
+        "placeholder='Name (e.g. AIOStreams)'>"
+        "<input id='custom_url' type='text' spellcheck='false' autocomplete='off' "
+        "placeholder='https://…/manifest.json'>"
+        "<button type='button' class='btn ghost' id='custom_add'>Add</button></div>"
         "<div class='debridfoot'>"
-        "<button type='button' class='btn ghost' id='debrid_test'>Test keys</button>"
-        "<button type='button' class='btn' id='debrid_save'>Save debrids</button>"
-        "<span class='debridres' id='debridres'></span></div>"
-        f"<script type='application/json' id='debrid-data'>{data}</script>"
+        "<button type='button' class='btn ghost' id='scrapers_test'>Test keys</button>"
+        "<button type='button' class='btn' id='scrapers_save'>Save sources</button>"
+        "<span class='debridres' id='scrapersres'></span></div>"
+        f"<script type='application/json' id='scrapers-data'>{data}</script>"
         "</div>")
 
 
@@ -787,14 +910,13 @@ def render() -> str:
 Saved to <code>/data/config.json</code> on the addon's data volume; changes
 apply on restart. Anyone deploying their own instance starts here.</p>
 {sections}
-{_debrid_manager()}
+{_scrapers()}
 <h2>Connections</h2>
 <p class="blurb">Every upstream service this instance uses, grouped by what it
 does — click a heading to open or close that section. Test verifies the values
 in the form — including keys you haven't saved yet. Leave a masked field blank
 to keep the stored key.</p>
 {conn_groups}
-{_custom_addons()}
 {_advanced_section()}
 </div>
 <div class="savebar" id="savebar" hidden data-restart="{restart}">

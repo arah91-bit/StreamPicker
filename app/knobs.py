@@ -43,6 +43,7 @@ GROUPS = [
     ("bitrate", "Quality thresholds"),
     ("proxy", "Proxy, buffer & failover"),
     ("usenet", "Direct usenet"),
+    ("prowlarr", "Prowlarr source"),
     ("acquire", "Library & acquire"),
     ("reputation", "Reputation & blocking"),
     ("telemetry", "Telemetry & caches"),
@@ -222,6 +223,19 @@ CATALOG = [
      "Window over which producer slowness is judged."),
     ("BUFFER_SLOW_MARGIN", "proxy", "num", "0.9", "",
      "Fraction of bitrate below which the producer switches source."),
+
+    # ── prowlarr source ──────────────────────────────────────────────────────
+    ("PROWLARR_STORE_URL", "prowlarr", "text", "", "",
+     "StremThru store gateway that resolves Prowlarr magnets to debrid links. "
+     "Blank derives it from the StremThru Torz URL's host."),
+    ("PROWLARR_SEARCH_TIMEOUT", "prowlarr", "num", "60", _S,
+     "Prowlarr search timeout (its indexers live-scrape, so this is generous)."),
+    ("PROWLARR_RESOLVE_MAX", "prowlarr", "num", "12", "",
+     "Most-seeded cached torrents resolved to links per title."),
+    ("PROWLARR_RESOLVE_CONCURRENCY", "prowlarr", "num", "4", "",
+     "Parallel debrid link resolutions."),
+    ("PROWLARR_MIN_SEEDERS", "prowlarr", "num", "1", "",
+     "Skip Prowlarr torrents below this seeder count."),
 
     # ── direct usenet ────────────────────────────────────────────────────────
     ("NZB_MOUNT_MAX", "usenet", "num", "6", "",

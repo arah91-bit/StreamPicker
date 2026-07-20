@@ -26,7 +26,7 @@ import time
 
 import httpx
 
-from app import usenet
+from app import prowlarr, usenet
 
 logger = logging.getLogger("stream-picker")
 
@@ -35,6 +35,9 @@ FAST, STREMTHRU, MEDIAFUSION = "fast", "stremthru", "mediafusion"
 # not an HTTP addon — _run special-cases it, but it shares the same registry so
 # a title is searched/mounted at most once per TTL across both pickers.
 NZB = "nzb"
+# Native Prowlarr lane (app.prowlarr): our own Prowlarr search + debrid resolve,
+# also internal (not an HTTP addon) and, like NZB, slow (Prowlarr live-scrapes).
+PROWLARR = "prowlarr"
 _SOURCE_TRUST_KEY = "_source_trust"
 _NZB_TRUST_SENTINEL = object()
 
@@ -49,6 +52,7 @@ _BASES = {
     # slow/quality build and later fast requests, not the first fast answer.
     MEDIAFUSION: (os.environ.get("MEDIAFUSION_BASE_URL") or "").rstrip("/") or None,
     NZB: "internal" if usenet.enabled() else None,
+    PROWLARR: "internal" if prowlarr.enabled() else None,
 }
 
 # httpx request timeout per source — how long the *underlying* search may run,
@@ -120,8 +124,9 @@ _load_extras()
 
 def search_all() -> list[str]:
     """Every source to search for a title, built-ins + user addons, that is
-    actually configured. NZB stays last (it's the slow direct lane)."""
-    return [k for k in [*BUILTIN_ONLINE, *EXTRAS, NZB] if has(k)]
+    actually configured. The slow internal lanes (Prowlarr, then NZB) stay
+    last."""
+    return [k for k in [*BUILTIN_ONLINE, *EXTRAS, PROWLARR, NZB] if has(k)]
 
 
 # Successful (non-empty) searches are reused for RAW_TTL. Empty results —
@@ -173,6 +178,15 @@ async def _run(key: tuple, base: str, media: str, media_id: str,
             state = str(nzb_state.get("state") or
                         ("ok" if streams else "empty"))
             detail = str(nzb_state.get("detail") or "")[:160]
+        elif source == PROWLARR:   # internal lane, not an HTTP addon
+            # app.prowlarr owns its long-running Prowlarr search + debrid
+            # resolve; like NZB it is deliberately not wrapped in an HTTP
+            # timeout and returns [] rather than raising.
+            streams = await prowlarr.streams(media, media_id)
+            pr_state = prowlarr.outcome(media, media_id)
+            state = str(pr_state.get("state") or
+                        ("ok" if streams else "empty"))
+            detail = str(pr_state.get("detail") or "")[:160]
         else:
             url = f"{base}/stream/{media}/{media_id}.json"
             r = await _client.get(url, timeout=timeout)
@@ -208,6 +222,11 @@ async def _run(key: tuple, base: str, media: str, media_id: str,
         if source == NZB:
             item = dict(stream)
             item[_SOURCE_TRUST_KEY] = _NZB_TRUST_SENTINEL
+        elif source == PROWLARR:
+            # In-process lane: keep our own annotations (there is no untrusted
+            # upstream to strip), but it earns no NZB playability trust — every
+            # resolved link still goes through the normal playback probe.
+            item = dict(stream)
         else:
             item = {k: v for k, v in stream.items()
                     if not str(k).startswith("_")}
@@ -289,6 +308,10 @@ def outcome(source: str, media: str, media_id: str) -> dict:
         return {"state": "running", "detail": "", "finished_at": 0.0}
     if source == NZB:
         live = usenet.outcome(media, media_id)
+        if live.get("state") != "unknown":
+            return live
+    if source == PROWLARR:
+        live = prowlarr.outcome(media, media_id)
         if live.get("state") != "unknown":
             return live
     return dict(_outcomes.get(key) or {

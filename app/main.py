@@ -28,9 +28,9 @@ except ValueError as exc:
     raise RuntimeError(f"invalid stream-picker configuration: {exc}") from exc
 
 from app import (acquire, admin_auth, adminui, anime, connections, dashboard,  # noqa: E402
-                 debrid, envref, library, meta, overview, picker, probe, proxy,
-                 reputation, settings_ui, sources, tbcache, telemetry, usenet,
-                 usenet_health, vprobe, wizard)
+                 envref, library, meta, overview, picker, probe, prowlarr, proxy,
+                 reputation, scrapers, settings_ui, sources, tbcache, telemetry,
+                 usenet, usenet_health, vprobe, wizard)
 
 NOTICE_FILE = pathlib.Path(__file__).parent / "static" / "notice.mp4"
 NOTICE_THEATRICAL_FILE = (pathlib.Path(__file__).parent / "static"
@@ -72,7 +72,7 @@ async def _lifespan(_app: FastAPI):
             ("proxy", proxy), ("picker", picker), ("probe", probe),
             ("metadata", meta), ("library", library), ("acquire", acquire),
             ("video probe", vprobe), ("sources", sources), ("usenet", usenet),
-            ("tbcache", tbcache), ("anime", anime),
+            ("prowlarr", prowlarr), ("tbcache", tbcache), ("anime", anime),
         ):
             shutdown = getattr(module, "shutdown", None)
             if shutdown is not None:
@@ -475,25 +475,39 @@ async def settings_test(service: str, request: Request):
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.post("/api/settings/debrid")
-async def settings_debrid(request: Request):
-    """Edit the debrid provider list embedded in the Comet/StremThru lane URLs,
-    preserving every other setting in them. A blank key keeps the stored one;
-    dry_run only tests the keys. Persists through config.save so the rewritten
-    (secret) URLs are encrypted at rest like any other sensitive value."""
+@app.post("/api/settings/scrapers")
+async def settings_scrapers(request: Request):
+    """Save the unified Sources catalog: mint every enabled scraper engine from
+    the central debrid key and rewrite the runtime source keys (FAST_BASE_URL /
+    STREMTHRU_BASE_URL / MEDIAFUSION_BASE_URL / EXTRA_ADDONS + SCRAPERS),
+    clearing the keys of engines toggled off. A blank debrid key keeps the
+    stored one; dry_run only tests the keys. Persists through config.save so the
+    rewritten (secret) URLs are encrypted at rest. Never echoes a key back."""
     await _admin(request, mutation=True)
     body = await _json_body(request)
     try:
-        res = await debrid.apply(
+        res = await scrapers.apply(
             config.pending("FAST_BASE_URL"),
             config.pending("STREMTHRU_BASE_URL"),
+            config.pending("MEDIAFUSION_BASE_URL"),
+            config.pending("EXTRA_ADDONS"),
             body.get("debrids"),
+            body.get("engines"),
+            prowlarr_submitted=body.get("prowlarr"),
+            prowlarr_url=config.pending("PROWLARR_URL"),
+            prowlarr_key=config.pending("PROWLARR_API_KEY"),
+            mf_api_password=config.pending("MEDIAFUSION_API_PASSWORD"),
             dry_run=bool(body.get("dry_run")))
+        values = res.pop("values", None)
+        clears = res.pop("clears", None)
+        if values:
+            config.save(values)
+        if clears:
+            config.clear(clears)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    values = res.pop("values", None)
-    if values:
-        res["restart_needed"] = config.save(values)["restart_needed"]
+    if values or clears:
+        res["restart_needed"] = config.restart_pending()
     return res
 
 
