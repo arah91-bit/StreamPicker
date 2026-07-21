@@ -409,6 +409,37 @@ the usenet lane answers slower than the debrid lanes. All configured indexers
 are always searched in parallel — the health scores only affect which indexer's
 mount is tried first.
 
+## Speeding up first play
+
+The slow part of a *brand-new* usenet title is nzbdav pulling and checking the
+release's articles over your provider — everything downstream is fast once that
+finishes. Two levers help, one on each side:
+
+**In nzbdav (the bigger lever for a cold title):**
+
+1. **Settings → Usenet → Max connections** — raise this toward the maximum your
+   provider allows (it's on their plan page). nzbdav checks and assembles a
+   release faster with more connections, so the first play of a fresh title
+   comes sooner.
+2. **Add a second provider** on a different network/backbone. It fills the gaps
+   when one provider is missing a release's articles — fewer dead releases, and
+   the check runs across both at once.
+3. Keep nzbdav's article/health checks **on**. They're what make ~40% of
+   releases that actually play the ones you get, instead of ones that stall.
+
+**In stream-picker (helps automatically, no change needed):**
+
+- When you start an episode, it quietly prepares the *next* one in the
+  background, so the following episode usually opens instantly on a binge.
+- The moment a release is ready it warms up its opening, and it reserves one
+  slot for a smaller, quicker-to-ready copy — so a usenet-only title has
+  something playable while the best-quality copy is still coming down.
+
+If a cold, obscure title still takes a bit to start the very first time, that's
+your provider feeding nzbdav — the levers above are where to gain time. The
+defaults are set for a good balance; you only need the Settings page if you want
+to tune further (it explains each option inline).
+
 ## Keeping it up to date
 
 Update the whole stack to the latest images:

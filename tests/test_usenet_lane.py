@@ -189,18 +189,28 @@ class MountedIdentityTests(unittest.TestCase):
         self.assertIsNone(selected[0])
         self.assertEqual("wrong-episode", selected[3])
 
-    def test_obfuscated_basename_is_unknown_unless_exact_attrs_are_trusted(self):
+    def test_obfuscated_basename_trusts_the_title_scoped_release(self):
+        # A release only reaches a mount after search()'s strict title+episode
+        # match, so an obfuscated (unreadable) filename inside it is trusted as
+        # the requested content rather than dropped for want of a readable name.
+        # Echoed Newznab attrs remain a stronger, separately-marked path, and
+        # NZB_TRUST_TITLE_MATCH=0 restores the old "unknown unless attrs" gate.
         for basename in ("a8f4c21d9920b77e9d818ee37a",
                          "qwertyuiopasdfghjklzxcvbnm"):
             with self.subTest(basename=basename):
                 entries = [(f"/content/job/{basename}.mkv", 5_000)]
-                unknown = usenet._pick_video_identity(entries, self.movie())
+                scoped = usenet._pick_video_identity(entries, self.movie())
                 trusted = usenet._pick_video_identity(
                     entries, self.movie(trusted=True))
 
-                self.assertEqual("unknown", unknown[1])
+                self.assertEqual("strong", scoped[1])
+                self.assertIn("release-title-scoped", scoped[2])
                 self.assertEqual("strong", trusted[1])
                 self.assertIn("newznab-imdb", trusted[2])
+
+                with patch.object(usenet, "TRUST_TITLE_MATCH", False):
+                    off = usenet._pick_video_identity(entries, self.movie())
+                self.assertEqual("unknown", off[1])
 
     def test_explicit_inner_title_contradiction_is_never_rescued_by_attrs(self):
         entries = [("/content/job/Another.Movie.2024.1080p.mkv", 5_000)]

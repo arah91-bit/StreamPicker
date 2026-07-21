@@ -255,6 +255,39 @@ class PrefetchCacheRegressionTests(unittest.IsolatedAsyncioTestCase):
         finally:
             never_done.cancel()
 
+    async def test_refresh_drops_stale_list_and_repicks_current_episode(self) -> None:
+        # A prefetched-then-opened (or re-watched) episode can be served off a
+        # list whose signed links are hours old. Playing it must re-search: drop
+        # every stale entry for the id and re-store a freshly-picked list.
+        cur = "tt9999999:1:5"
+        fresh = _stream("Show.S01E05.1080p.WEB-DL-FRESH.mkv")
+        slow_ran: list[str] = []
+
+        async def fast_pick(media, media_id, profile):
+            return [dict(fresh)]
+
+        async def slow_pick(media, media_id, profile):
+            slow_ran.append(media_id)
+            return [dict(fresh)]
+
+        stale_cache = {f"full:series:{cur}": (0.0, [{"stale": True}]),
+                       f"slow:full:series:{cur}": (0.0, [{"stale": True}])}
+        with mock.patch.object(picker, "_cache", stale_cache), \
+                mock.patch.object(picker, "_background", {}), \
+                mock.patch.object(picker, "_prefetching", set()), \
+                mock.patch.object(picker, "_PREFETCH_SETTLE", 0), \
+                mock.patch.object(picker, "pick", new=fast_pick), \
+                mock.patch.object(picker, "pick_slow", new=slow_pick):
+            await picker.refresh("series", cur, "fast")
+
+            # The viewer's (fast) list was re-searched and re-stored fresh...
+            self.assertEqual([dict(fresh)],
+                             picker._cache[f"full:series:{cur}"][1])
+            # ...the stale sibling (slow) entry was invalidated, not left...
+            self.assertNotIn(f"slow:full:series:{cur}", picker._cache)
+            # ...and refresh runs only the viewer's picker, never the slow one.
+            self.assertEqual([], slow_ran)
+
     async def test_hls_real_play_fires_next_episode_prefetch(self) -> None:
         from app import hlsproxy, proxy
         entry = {"id": "tt9999999:1:1", "picker": "slow"}
@@ -523,6 +556,61 @@ class DirectUsenetFilterRegressionTests(unittest.IsolatedAsyncioTestCase):
             selected_keys & {"delivery-4k", "delivery-1080"},
             "mount wave contained only huge remuxes",
         )
+
+    def test_speed_slot_mounts_smallest_real_release_first(self) -> None:
+        # A usenet-only TV title: five big encodes plus one small 720p. The
+        # small one must join the wave AND mount first (index 0), so it becomes
+        # the fast picker's floor while the big releases are still downloading.
+        def ep(key: str, title: str, size_mb: int) -> dict:
+            return {"release_key": key, "title": title,
+                    "size": size_mb * 1_000_000,
+                    "offers": [{"indexer": "idx", "link": f"https://idx/{key}"}]}
+
+        bigs = [ep(f"big-{i}", f"Show.S01E10.1080p.WEB.H264-GRP{i}", 2600)
+                for i in range(5)]
+        small = ep("small-720", "Show.S01E10.720p.WEB.H264-TINY", 380)
+
+        with mock.patch.object(usenet.usenet_health, "status", return_value={}), \
+                mock.patch.object(usenet.usenet_health, "indexer_score",
+                                  return_value=0.5), \
+                mock.patch.object(usenet.usenet_health, "indexer_samples",
+                                  return_value=0):
+            ranked = sorted(bigs + [small], key=usenet._priority, reverse=True)
+            selected = usenet._select_releases(ranked, 6, media="tv")
+
+        keys = [r["release_key"] for r in selected]
+        self.assertIn("small-720", keys)                 # the floor is reserved
+        self.assertEqual("small-720", keys[0])           # ...and mounts first
+        self.assertEqual(6, len(selected))               # five big + one small
+
+    def test_speed_slot_yields_to_a_proven_good_reuse(self) -> None:
+        # A proven-good release mounts first (instant nzbdav reuse, top quality);
+        # the small floor slots in right behind it, not ahead.
+        def ep(key: str, title: str, size_mb: int) -> dict:
+            return {"release_key": key, "title": title,
+                    "size": size_mb * 1_000_000,
+                    "offers": [{"indexer": "idx", "link": f"https://idx/{key}"}]}
+
+        proven = ep("proven-1080", "Show.S01E10.1080p.WEB.H264-PROVEN", 2600)
+        bigs = [ep(f"big-{i}", f"Show.S01E10.1080p.WEB.H264-GRP{i}", 2700)
+                for i in range(4)]
+        small = ep("small-720", "Show.S01E10.720p.WEB.H264-TINY", 380)
+
+        def status(key):
+            return {"successes": 3} if key == "proven-1080" else {}
+
+        with mock.patch.object(usenet.usenet_health, "status", side_effect=status), \
+                mock.patch.object(usenet.usenet_health, "indexer_score",
+                                  return_value=0.5), \
+                mock.patch.object(usenet.usenet_health, "indexer_samples",
+                                  return_value=0):
+            ranked = sorted(bigs + [proven, small],
+                            key=usenet._priority, reverse=True)
+            selected = usenet._select_releases(ranked, 6, media="tv")
+
+        keys = [r["release_key"] for r in selected]
+        self.assertEqual("proven-1080", keys[0])         # proven reuse leads
+        self.assertEqual("small-720", keys[1])           # floor is right behind
 
 
 if __name__ == "__main__":

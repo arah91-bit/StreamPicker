@@ -22,7 +22,7 @@ from urllib.parse import urljoin
 
 import httpx
 
-from app import hlsproxy, telemetry, usenet_health, vprobe
+from app import cfsolver, hlsproxy, telemetry, usenet_health, vprobe
 
 logger = logging.getLogger("stream-picker")
 
@@ -288,6 +288,7 @@ async def _probe_spots(url: str, total: int, ttfb_max: float,
         end = min(start + sample - 1, total - 1)
         req = dict(headers or {})
         req["Range"] = f"bytes={start}-{end}"
+        req = cfsolver.merge_headers(url, req)
         try:
             async with _client.stream("GET", url, headers=req,
                                       timeout=timeout) as resp:
@@ -386,12 +387,16 @@ async def _probe_url(url: str, required: float, ttfb_max: float,
     playlist_url = ""
     req_headers = dict(headers or {})
     req_headers["Range"] = f"bytes=0-{PROBE_BYTES - 1}"
+    req_headers = cfsolver.merge_headers(url, req_headers)
     try:
         async with _client.stream(
             "GET", url, headers=req_headers,
             timeout=timeout,
         ) as resp:
             if resp.status_code not in (200, 206):
+                if cfsolver.looks_challenged(resp.status_code, resp.headers):
+                    cfsolver.note_challenge(url)
+                    return ProbeResult(False, reason="cloudflare-challenged")
                 return ProbeResult(False, reason=f"HTTP {resp.status_code}")
             ni = telemetry.netinfo(resp)
             ctype = resp.headers.get("content-type", "")

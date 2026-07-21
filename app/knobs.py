@@ -42,6 +42,7 @@ GROUPS = [
     ("slow", "Best-quality picker"),
     ("bitrate", "Quality thresholds"),
     ("proxy", "Proxy, buffer & failover"),
+    ("cloudflare", "Cloudflare solver"),
     ("usenet", "Direct usenet"),
     ("prowlarr", "Prowlarr source"),
     ("acquire", "Library & acquire"),
@@ -73,6 +74,10 @@ CATALOG = [
      "thorough pass)."),
     ("FAST_PROBE_BATCH", "fast", "num", "3", "",
      "How many candidates the fast picker probes at once per wave."),
+    ("FAST_SPEED_FIRST", "fast", "bool", "1", "",
+     "Before the fast picker has verified anything, probe fast-to-verify "
+     "direct debrid/HTTP links ahead of NZBs that need a mount, so a floor "
+     "result lands sooner. Reverts to best-quality-first once one verifies."),
     ("PROBE_HOST_BENCH", "fast", "num", "3", "",
      "Probe failures (with no pass) before a host is skipped for the rest of "
      "that pick. 0 disables."),
@@ -97,8 +102,11 @@ CATALOG = [
      "How long a non-empty upstream search result is shared between pickers."),
     ("RAW_NEG_TTL", "fast", "num", "90", _S,
      "How long an empty search result is reused before re-searching."),
-    ("RESULT_CACHE_TTL", "fast", "num", "900", _S,
-     "How long a verified result list may be reused before a full re-pick."),
+    ("RESULT_CACHE_TTL", "fast", "num", "7200", _S,
+     "How long a verified result list may be reused before a full re-pick. Its "
+     "leader is still re-probed after CACHE_REVERIFY_AFTER on every access and "
+     "the list is refreshed on play, so a long window stays honest while a "
+     "prefetched next episode survives even the longest episode."),
     ("CACHE_REVERIFY_AFTER", "fast", "num", "120", _S,
      "Age after which a cached list's top stream is re-probed before reuse."),
     ("CACHE_REVERIFY_TTFB", "fast", "num", "8", _S,
@@ -224,6 +232,19 @@ CATALOG = [
     ("BUFFER_SLOW_MARGIN", "proxy", "num", "0.9", "",
      "Fraction of bitrate below which the producer switches source."),
 
+    # ── cloudflare solver ────────────────────────────────────────────────────
+    ("CF_SOLVER", "cloudflare", "bool", "1", "",
+     "Use FlareSolverr to get past Cloudflare block pages on stream hosts. "
+     "No-op when FlareSolverr is unreachable, so it is safe to leave on."),
+    ("FLARESOLVERR_URL", "cloudflare", "text", "http://flaresolverr:8191/v1", "",
+     "FlareSolverr v1 endpoint. Must share this app's egress IP (same Docker "
+     "host) for its clearance cookie to be valid for our own requests."),
+    ("CF_SOLVER_TTL", "cloudflare", "num", "1800", _S,
+     "How long a solved Cloudflare clearance is reused before re-solving."),
+    ("CF_SOLVER_HOSTS", "cloudflare", "text", "", "",
+     "Space/comma list of hosts to solve for (a bare host also matches its "
+     "subdomains). Blank = auto: solve any host that returns a CF challenge."),
+
     # ── prowlarr source ──────────────────────────────────────────────────────
     ("PROWLARR_STORE_URL", "prowlarr", "text", "", "",
      "StremThru store gateway that resolves Prowlarr magnets to debrid links. "
@@ -248,10 +269,30 @@ CATALOG = [
      "Mounted candidates to expose immediately before returning."),
     ("NZB_MOUNT_EARLY_WAIT", "usenet", "num", "30", _S,
      "Grace period to surface the first mount to a waiting request."),
-    ("NZB_MOUNT_STAGGER", "usenet", "num", "1.5", _S,
+    ("NZB_MOUNT_STAGGER", "usenet", "num", "0.5", _S,
      "Delay between kicking off successive mounts."),
+    ("NZB_PUT_CONCURRENCY", "usenet", "num", "2", "",
+     "Concurrent NZB fetch+PUT writes into nzbdav (shares the NNTP write load); "
+     "the read-only poll that waits out each import is unbounded. Legacy name: "
+     "NZB_IMPORT_CONCURRENCY."),
     ("NZB_IMPORT_CONCURRENCY", "usenet", "num", "2", "",
-     "Concurrent nzbdav imports (shares the NNTP connection cap with playback)."),
+     "Legacy alias for NZB_PUT_CONCURRENCY (used only when the latter is unset)."),
+    ("NZB_MOUNT_POLL_MAX", "usenet", "num", "2.0", _S,
+     "Ceiling on the backoff while polling nzbdav for a mount's video file."),
+    ("NZB_HEAD_WARM", "usenet", "bool", "1", "",
+     "The moment a fresh mount's video appears, fetch its opening bytes in the "
+     "background so nzbdav assembles the first segments while the race runs, "
+     "instead of that ~20-35s assembly landing on the picker's first probe."),
+    ("NZB_PREFETCH_MOUNT", "usenet", "bool", "1", "",
+     "Pre-mount the next episode when one starts playing, so opening it is an "
+     "instant reused mount. 0 keeps prefetch search-only (no NNTP for it)."),
+    ("NZB_PREFETCH_MOUNT_MAX", "usenet", "num", "2", "",
+     "Releases a next-episode prefetch mounts (bounded — it spends article "
+     "checks on an episode that may never be opened; the real open tops up)."),
+    ("NZB_TRUST_TITLE_MATCH", "usenet", "bool", "1", "",
+     "Trust a title+episode-matched release's identity for an obfuscated "
+     "(unreadable-filename) single video inside its mount, instead of dropping "
+     "it. 0 requires echoed Newznab attrs for such files to play."),
     ("NZB_API_POLL_TTL", "usenet", "num", "1.5", _S,
      "How long one nzbdav status snapshot is shared across concurrent imports."),
     ("NZB_LANE_MAX_ACTIVE", "usenet", "num", "32", "",
@@ -266,6 +307,10 @@ CATALOG = [
      "Preferred size ceiling for a 4K episode."),
     ("NZB_TV_TARGET_1080_GB", "usenet", "num", "3", "GB",
      "Preferred size ceiling for a 1080p episode."),
+    ("NZB_SPEED_MIN_MB", "usenet", "num", "80", "MB",
+     "Fast-floor slot: one mount slot goes to the smallest real (>=720p) "
+     "release above this size, mounted first, so a usenet-only title has "
+     "something playable while the big encodes download. 0 disables the slot."),
     ("NZB_MOUNT_FAILURE_BUCKET", "usenet", "num", "1800", _S,
      "Window for grouping transient mount failures into one cooldown."),
     ("NZB_CONTENT_FAILURE_BUCKET", "usenet", "num", "86400", _S,

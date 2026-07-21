@@ -21,6 +21,7 @@ persist in nzbdav, so a re-search or re-open reuses them instantly.
 """
 
 import asyncio
+import contextlib
 import hashlib
 import logging
 import os
@@ -29,6 +30,7 @@ import secrets
 import time
 import unicodedata
 import xml.etree.ElementTree as ET
+from contextvars import ContextVar
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 import httpx
@@ -57,8 +59,39 @@ MOUNT_WAIT = float(os.environ.get("NZB_MOUNT_WAIT", "600"))
 # mounted candidate immediately, while the rest continue into the shared cache.
 MOUNT_RETURN_WANT = int(os.environ.get("NZB_MOUNT_RETURN_WANT", "1"))
 MOUNT_EARLY_WAIT = float(os.environ.get("NZB_MOUNT_EARLY_WAIT", "30"))
-MOUNT_STAGGER = float(os.environ.get("NZB_MOUNT_STAGGER", "1.5"))
-IMPORT_CONCURRENCY = max(1, int(os.environ.get("NZB_IMPORT_CONCURRENCY", "2")))
+MOUNT_STAGGER = float(os.environ.get("NZB_MOUNT_STAGGER", "0.5"))
+# The import slot is held only around the fetch+PUT that writes an NZB into
+# nzbdav's watch folder (where the indexer/write load is), NOT the read-only
+# PROPFIND poll that waits out nzbdav's import — otherwise mounts 3-6 could not
+# even start their reuse-check until a 40-120s predecessor released the slot.
+# NZB_IMPORT_CONCURRENCY is honored as the legacy name for the same setting.
+PUT_CONCURRENCY = max(1, int(os.environ.get(
+    "NZB_PUT_CONCURRENCY",
+    os.environ.get("NZB_IMPORT_CONCURRENCY", "2"))))
+# Poll backoff ceiling while waiting for a mount's video file to appear. A
+# tighter cap detects a just-landed mount sooner than the old fixed 5s.
+MOUNT_POLL_MAX = max(0.5, float(os.environ.get("NZB_MOUNT_POLL_MAX", "2.0")))
+# Head-warming: the instant a fresh mount's video file appears, fetch its
+# opening bytes in the background so nzbdav assembles the first RAR segments
+# (~20-35s over NNTP) while the race runs, instead of serializing that assembly
+# into the picker's first probe. The probe then lands warm. 0 disables.
+HEAD_WARM = os.environ.get("NZB_HEAD_WARM", "1").strip().lower() not in (
+    "0", "false", "no", "off", "")
+_HEAD_WARM_BYTES = 4 * 1024 * 1024
+# Pre-mount the next episode so a binge's episode N+1 is a reused (instant)
+# mount. A prefetch pick mounts at most this many releases (bounded because it
+# spends NNTP article-checks on an episode that may never be played); the real
+# open of that episode later starts a full lane and reuses these instantly.
+PREFETCH_MOUNT = os.environ.get("NZB_PREFETCH_MOUNT", "1").strip().lower() not in (
+    "0", "false", "no", "off", "")
+PREFETCH_MOUNT_MAX = max(1, int(os.environ.get("NZB_PREFETCH_MOUNT_MAX", "2")))
+# When a release already passed search()'s strict title+episode match, trust
+# that identity for an otherwise-unnamed (obfuscated) single video file inside
+# its mount rather than dropping it for want of a readable filename. 0 restores
+# the stricter behaviour (obfuscated files need echoed Newznab attrs to play).
+TRUST_TITLE_MATCH = os.environ.get(
+    "NZB_TRUST_TITLE_MATCH", "1").strip().lower() not in (
+    "0", "false", "no", "off", "")
 # Reserve early mount slots for encodes whose size is plausibly deliverable,
 # while still importing the largest remuxes for the slow/background quality
 # pass.  These are selection targets, not hard caps.
@@ -66,6 +99,12 @@ MOVIE_TARGET_4K = int(float(os.environ.get("NZB_MOVIE_TARGET_4K_GB", "18")) * 1e
 MOVIE_TARGET_1080 = int(float(os.environ.get("NZB_MOVIE_TARGET_1080_GB", "8")) * 1e9)
 TV_TARGET_4K = int(float(os.environ.get("NZB_TV_TARGET_4K_GB", "6")) * 1e9)
 TV_TARGET_1080 = int(float(os.environ.get("NZB_TV_TARGET_1080_GB", "3")) * 1e9)
+# Fast-floor slot: one of the mount slots goes to the smallest real (>=720p)
+# release, mounted first. nzbdav assembles a small 720p far faster than a
+# delivery 1080p/remux, so a usenet-only title has something playable while the
+# big quality releases are still downloading. The size floor excludes samples /
+# fakes that slipped the junk filter. 0 disables the reserved slot.
+SPEED_MIN_SIZE = int(float(os.environ.get("NZB_SPEED_MIN_MB", "80")) * 1e6)
 
 INDEXERS: list[tuple[str, str, str]] = []
 for part in _INDEXER_SPEC.split(";"):
@@ -75,7 +114,29 @@ for part in _INDEXER_SPEC.split(";"):
 
 _client = httpx.AsyncClient(follow_redirects=True,
                             headers={"User-Agent": "stream-picker/1.0"})
-_import_slots = asyncio.Semaphore(IMPORT_CONCURRENCY)
+_put_slots = asyncio.Semaphore(PUT_CONCURRENCY)
+# Set on a prefetch pick's context so a lane it starts mounts only the prefetch
+# budget (or, when 0, mounts nothing). None = a normal foreground lane.
+_prefetch_cap: ContextVar[int | None] = ContextVar(
+    "nzb_prefetch_cap", default=None)
+# Detached head-warm GETs, kept referenced so they are not GC'd mid-flight.
+_warm_tasks: set[asyncio.Task] = set()
+
+
+@contextlib.contextmanager
+def prefetch_scope():
+    """Cap (or suppress) NZB mounts for lanes started inside this context.
+
+    A prefetch pick runs the full picker for the next episode; without this the
+    lane it kicks would mount the whole ``NZB_MOUNT_MAX`` wave for an episode the
+    viewer may never open. The cap propagates into the detached lane task via the
+    context copied at ``create_task`` time."""
+    cap = PREFETCH_MOUNT_MAX if PREFETCH_MOUNT else 0
+    token = _prefetch_cap.set(cap)
+    try:
+        yield
+    finally:
+        _prefetch_cap.reset(token)
 
 
 def enabled() -> bool:
@@ -746,6 +807,22 @@ def _priority(release: dict) -> tuple:
     return clean, res, known_good, _offer_score(release), size
 
 
+def _speed_pick(ranked: list[dict]) -> dict | None:
+    """Smallest real (>=720p, non-junk, above the sample floor) release — the
+    fastest for nzbdav to assemble, reserved as the fast picker's floor. Prefers
+    the smallest size, breaking ties toward the healthier indexer. None when no
+    deliverable small release exists (then every slot stays a quality pick)."""
+    if SPEED_MIN_SIZE <= 0:
+        return None
+    pool = [r for r in ranked
+            if _quality(r)[0]                        # not junk
+            and _quality(r)[1] >= 1                  # 720p or better
+            and int(r.get("size") or 0) >= SPEED_MIN_SIZE]
+    if not pool:
+        return None
+    return min(pool, key=lambda r: (int(r.get("size") or 0), -_offer_score(r)))
+
+
 def _select_releases(releases: list[dict], limit: int,
                      media: str = "movie") -> list[dict]:
     """Build a quality/reliability wave without queueing only giant remuxes.
@@ -824,6 +901,25 @@ def _select_releases(releases: list[dict], limit: int,
         add(r)
         if len(selected) >= limit:
             break
+
+    # Reserve one slot for the fast floor and mount it first. With enough slots
+    # for both, the smallest real release joins the wave (displacing the
+    # lowest-priority quality pick if the wave is already full) and is moved
+    # ahead of the big encodes — but never ahead of a proven-good reuse, which
+    # is both instant and top quality. The served default stays the biggest:
+    # the fast picker returns this floor, the slow picker/finisher upgrade.
+    speed = _speed_pick(ranked) if limit >= 3 else None
+    if speed is not None:
+        sid = identity(speed)
+        if sid not in chosen:
+            if len(selected) >= limit:
+                selected.pop()
+            selected.append(speed)
+            chosen.add(sid)
+        if speed in selected:
+            selected.remove(speed)
+            pos = 1 if selected and known_good(selected[0]) else 0
+            selected.insert(pos, speed)
     return selected
 
 
@@ -1384,6 +1480,14 @@ def _pick_video_identity(
     mismatch_reason = ""
     trusted = bool(release.get("_nzb_attrs_trusted"))
     trusted_evidence = list(release.get("_nzb_attr_evidence") or [])
+    # Every release reaching a mount already passed search()'s strict title +
+    # episode match, so the *release* identity is sound even when the mounted
+    # file carries an obfuscated (unreadable) basename. Trust that for a single
+    # non-pack video rather than dropping it for want of a readable filename; a
+    # pack must still positively name its episode (handled below), and a file
+    # whose name *contradicts* the request is always rejected.
+    title_scoped = (TRUST_TITLE_MATCH and not release.get("_nzb_pack")
+                    and bool(release.get("_nzb_expected")))
     order = {"strong": 3, "compatible": 2, "unknown": 1}
     for video in videos:
         confidence, evidence, reason = _basename_identity(
@@ -1394,6 +1498,9 @@ def _pick_video_identity(
         evidence = list(dict.fromkeys(evidence + trusted_evidence))
         if trusted:
             confidence = "strong"
+        elif title_scoped and confidence == "unknown":
+            confidence = "strong"
+            evidence = list(dict.fromkeys(evidence + ["release-title-scoped"]))
         ranked.append((order[confidence], int(video[1] or 0), video,
                        confidence, evidence))
     if release.get("_nzb_pack"):
@@ -1601,8 +1708,12 @@ async def _mount(release: dict, cat: str, delay: float = 0,
                 dir_path = f"/content/{cat}/{job}"
             if delay > 0:
                 await asyncio.sleep(delay)
-            submitted, fetched_from = await _fetch_and_submit(
-                release, cat, job, failure_seen)
+            # Hold the import slot only for the NZB fetch + watch-folder PUT —
+            # the write load that must not overwhelm nzbdav or the indexer. The
+            # poll-wait below runs outside it.
+            async with _put_slots:
+                submitted, fetched_from = await _fetch_and_submit(
+                    release, cat, job, failure_seen)
             if not submitted:
                 return None
     video, identity_confidence, identity_evidence, identity_reason = (
@@ -1649,7 +1760,7 @@ async def _mount(release: dict, cat: str, delay: float = 0,
                         release, kind, reason, evidence, detail)
                     logger.info(f"nzb mount {job[:40]}: import {reason}")
                     return None
-            poll_delay = min(5.0, poll_delay * 1.65)
+            poll_delay = min(MOUNT_POLL_MAX, poll_delay * 1.65)
     if not video:
         failure_reason = _missing_content_reason(
             entries or [], episode, directory_seen, identity_reason)
@@ -1690,6 +1801,12 @@ async def _mount(release: dict, cat: str, delay: float = 0,
                 stage="nzbdav-mount")
         return None
     href, size = video
+    stream_url = _stream_base() + quote(href)
+    # A just-materialized (non-reused) mount has not served a byte yet; warm its
+    # opening segments now so the picker probe that follows lands fast. A reused
+    # mount is already assembled.
+    if not reused:
+        _fire_head_warm(stream_url)
     size = size or release["size"]
     fname = href.rsplit("/", 1)[-1]
     gb = f"{size / 1e9:.2f} GB" if size else "?"
@@ -1707,7 +1824,7 @@ async def _mount(release: dict, cat: str, delay: float = 0,
         "name": f"NZB\n{release['title'][:60]}",
         "description": (f"Source: {source}\nSize: {gb}\n"
                         f"{release['title']}"),
-        "url": _stream_base() + quote(href),
+        "url": stream_url,
         "behaviorHints": hints,
         "_nzb_release_key": key,
         "_nzb_label": release["title"][:180],
@@ -1722,13 +1839,47 @@ async def _mount(release: dict, cat: str, delay: float = 0,
     }
 
 
+async def _warm_head(url: str) -> None:
+    """Pull a mount's opening bytes so nzbdav assembles its first RAR segments.
+    Best-effort and silent: this only primes nzbdav's cache, the picker's probe
+    remains the authoritative playability gate."""
+    try:
+        async with _client.stream(
+            "GET", url, headers={"Range": f"bytes=0-{_HEAD_WARM_BYTES - 1}"},
+            timeout=httpx.Timeout(connect=10, read=45, write=10, pool=10),
+        ) as resp:
+            if resp.status_code not in (200, 206):
+                return
+            got = 0
+            async for chunk in resp.aiter_bytes():
+                got += len(chunk)
+                if got >= _HEAD_WARM_BYTES:
+                    break
+    except Exception:
+        pass
+
+
+def _fire_head_warm(url: str) -> None:
+    """Schedule a background head-warm for a just-appeared fresh mount."""
+    if not HEAD_WARM:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    task = loop.create_task(_warm_head(url))
+    _warm_tasks.add(task)
+    task.add_done_callback(_warm_tasks.discard)
+
+
 async def _mount_limited(release: dict, cat: str, delay: float = 0,
                          episode: tuple[int, int] | None = None) -> dict | None:
-    """Globally bound complete imports, including their DAV/history polling."""
+    """Stagger the mount start; the fetch+PUT write is bounded inside _mount by
+    the PUT slot, but the read-only PROPFIND poll that waits out nzbdav's import
+    is unbounded so later mounts are not queued behind a slow predecessor."""
     if delay > 0:
         await asyncio.sleep(delay)
-    async with _import_slots:
-        return await _mount(release, cat, 0, episode)
+    return await _mount(release, cat, 0, episode)
 
 
 TRANSIENT_BUCKET = float(os.environ.get("NZB_MOUNT_FAILURE_BUCKET", "1800"))
@@ -1809,7 +1960,9 @@ async def _run_lane(media: str, media_id: str, out: list[dict],
         parts = media_id.split(":")
         episode = ((int(parts[1]), int(parts[2]))
                    if media != "movie" and len(parts) == 3 else None)
-        top = _select_releases(releases, MOUNT_MAX, media)
+        cap = _prefetch_cap.get()
+        limit = min(cap, MOUNT_MAX) if cap else MOUNT_MAX
+        top = _select_releases(releases, limit, media)
         total = len(top)
         order = []
         for release in top:
@@ -1969,6 +2122,11 @@ async def streams(media: str, media_id: str) -> list[dict]:
     lane_key = (media, media_id)
     existing_event = _mount_events.get(lane_key)
     existing_out = _mount_outputs.get(lane_key)
+    # A prefetch pick with mounting disabled must not start a new lane for an
+    # episode that may never be opened; it may still rejoin one already running.
+    if _prefetch_cap.get() == 0 and (
+            existing_event is None or existing_event.is_set()):
+        return existing_out or []
     if existing_event is not None and not existing_event.is_set():
         out = (existing_out if existing_out else
                await wait_for_more(media, media_id, 0, MOUNT_EARLY_WAIT))

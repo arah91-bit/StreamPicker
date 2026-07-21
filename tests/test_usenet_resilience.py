@@ -143,24 +143,43 @@ class DetachedLaneTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("nzb", got[0]["_source_key"])
         self.assertEqual("ok", sources.outcome(sources.NZB, "movie", "tt1")["state"])
 
-    async def test_global_mount_limit_covers_full_mount_lifetime(self) -> None:
+    async def test_put_slot_bounds_the_write_but_not_the_poll_wait(self) -> None:
+        # The import slot is now held only around the NZB fetch+PUT write, not
+        # the read-only poll that waits out nzbdav's import — so a batch of
+        # mounts throttles the writes to the slot count while every mount still
+        # proceeds to (and returns from) its own unbounded poll phase.
         active = 0
         maximum = 0
 
-        async def measured(*_args, **_kwargs):
+        async def measured_put(*_args, **_kwargs):
             nonlocal active, maximum
             active += 1
             maximum = max(maximum, active)
             await asyncio.sleep(0.01)
             active -= 1
-            return None
+            return True, "Example"
 
-        with mock.patch.object(usenet, "_import_slots", asyncio.Semaphore(2)), \
-                mock.patch.object(usenet, "_mount", side_effect=measured):
-            await asyncio.gather(*(
+        video = (("/content/movies/job/v.mkv", 5), "strong",
+                 ["basename-title"], "")
+        with mock.patch.object(usenet, "_put_slots", asyncio.Semaphore(2)), \
+                mock.patch.object(usenet, "HEAD_WARM", False), \
+                mock.patch.object(usenet, "_dav_tree",
+                                  new=mock.AsyncMock(return_value=None)), \
+                mock.patch.object(usenet, "_dav_list",
+                                  new=mock.AsyncMock(return_value=None)), \
+                mock.patch.object(usenet, "_related_attempts",
+                                  new=mock.AsyncMock(return_value=([], []))), \
+                mock.patch.object(usenet, "_history_failure",
+                                  new=mock.AsyncMock(return_value=None)), \
+                mock.patch.object(usenet, "_fetch_and_submit",
+                                  side_effect=measured_put), \
+                mock.patch.object(usenet, "_pick_video_identity",
+                                  return_value=video):
+            mounted = await asyncio.gather(*(
                 usenet._mount_limited(_release(), "movies") for _ in range(7)))
 
-        self.assertEqual(2, maximum)
+        self.assertEqual(2, maximum)                 # writes bounded by the slot
+        self.assertEqual(7, sum(m is not None for m in mounted))  # all proceeded
 
 
 class NzbdavAttemptTests(unittest.IsolatedAsyncioTestCase):
@@ -321,6 +340,108 @@ class PolicyDiagnosticTests(unittest.TestCase):
                       "Movie.2024.BluRay.ISO"):
             with self.subTest(title=title):
                 self.assertFalse(usenet._mountable_release(title))
+
+
+def _titled_release() -> dict:
+    release = _release()
+    release["_nzb_expected"] = {
+        "media": "movie", "media_id": "tt1234567",
+        "titles": ["Example Movie"], "year": 2024,
+    }
+    return release
+
+
+class MountSpeedupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_fresh_mount_head_warms_reused_does_not(self) -> None:
+        # A just-materialized mount primes its opening bytes; a reused (already
+        # assembled) mount does not spend an NNTP read re-warming.
+        entries = [("/content/movies/example/video.mkv", 5_000)]
+        warmed: list[str] = []
+
+        with mock.patch.object(usenet, "_fire_head_warm",
+                               side_effect=lambda url: warmed.append(url)), \
+                mock.patch.object(usenet, "_dav_tree",
+                                  new=mock.AsyncMock(return_value=entries)):
+            await usenet._mount(_titled_release(), "movies")   # reused
+        self.assertEqual([], warmed)
+
+        with mock.patch.object(usenet, "_fire_head_warm",
+                               side_effect=lambda url: warmed.append(url)), \
+                mock.patch.object(usenet, "_dav_tree",
+                                  new=mock.AsyncMock(side_effect=[None, entries])), \
+                mock.patch.object(usenet, "_dav_list",
+                                  new=mock.AsyncMock(return_value=None)), \
+                mock.patch.object(usenet, "_related_attempts",
+                                  new=mock.AsyncMock(return_value=([], []))), \
+                mock.patch.object(usenet, "_history_failure",
+                                  new=mock.AsyncMock(return_value=None)), \
+                mock.patch.object(usenet, "_fetch_and_submit",
+                                  new=mock.AsyncMock(return_value=(True, "Example"))):
+            await usenet._mount(_titled_release(), "movies")   # fresh
+        self.assertEqual(1, len(warmed))
+
+    async def test_head_warm_disabled_schedules_nothing(self) -> None:
+        before = set(usenet._warm_tasks)
+        with mock.patch.object(usenet, "HEAD_WARM", False):
+            usenet._fire_head_warm("https://nzbdav.example/v.mkv")
+        self.assertEqual(before, set(usenet._warm_tasks))
+
+    async def test_obfuscated_single_file_mount_is_strong_when_title_scoped(
+            self) -> None:
+        # The RoboGobo case: an obfuscated filename in a release that matched
+        # the requested title now mounts as strong identity instead of dropping.
+        entries = [("/content/movies/job/akvzvczPaEkR8tzNBlBM5NZwzhU.mkv", 9_000)]
+        with mock.patch.object(usenet, "_dav_tree",
+                               new=mock.AsyncMock(return_value=entries)):
+            stream = await usenet._mount(_titled_release(), "movies")
+
+        self.assertIsNotNone(stream)
+        self.assertEqual("strong", stream["_nzb_identity_confidence"])
+        self.assertIn("release-title-scoped", stream["_nzb_identity_evidence"])
+
+    async def test_prefetch_scope_caps_lane_selection(self) -> None:
+        captured: dict[str, int] = {}
+
+        def fake_select(releases, limit, media):
+            captured["limit"] = limit
+            return []
+
+        out: list[dict] = []
+        event = asyncio.Event()
+        with usenet.prefetch_scope(), \
+                mock.patch.object(usenet, "search",
+                                  new=mock.AsyncMock(return_value=[_release()])), \
+                mock.patch.object(usenet, "_select_releases",
+                                  side_effect=fake_select):
+            await usenet._run_lane("movie", "tt1234567", out, event)
+
+        self.assertEqual(usenet.PREFETCH_MOUNT_MAX, captured["limit"])
+        self.assertTrue(event.is_set())
+
+    async def test_full_lane_uses_mount_max_without_prefetch_scope(self) -> None:
+        captured: dict[str, int] = {}
+
+        def fake_select(releases, limit, media):
+            captured["limit"] = limit
+            return []
+
+        with mock.patch.object(usenet, "search",
+                               new=mock.AsyncMock(return_value=[_release()])), \
+                mock.patch.object(usenet, "_select_releases",
+                                  side_effect=fake_select):
+            await usenet._run_lane("movie", "tt1234567", [], asyncio.Event())
+
+        self.assertEqual(usenet.MOUNT_MAX, captured["limit"])
+
+    async def test_prefetch_disabled_starts_no_new_lane(self) -> None:
+        with mock.patch.object(usenet, "PREFETCH_MOUNT", False), \
+                mock.patch.object(usenet, "enabled", return_value=True), \
+                mock.patch.object(usenet, "_start_lane") as start, \
+                usenet.prefetch_scope():
+            out = await usenet.streams("movie", "tt-never-watched")
+
+        self.assertEqual([], out)
+        start.assert_not_called()
 
 
 if __name__ == "__main__":

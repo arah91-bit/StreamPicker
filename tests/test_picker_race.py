@@ -163,6 +163,94 @@ class FastRaceTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(elapsed, 0.3)     # waited the grace window
         self.assertLess(elapsed, 2.0)             # but not the hanging HD probe
 
+    async def test_speed_first_probes_fast_verifier_before_nzb_mount(self):
+        # Before anything has verified, the opening probe order puts a
+        # fast-to-verify direct link ahead of a same-quality NZB that needs a
+        # mount assembled — so a floor result lands sooner and starts the grace
+        # timer. The NZB is listed first in the (quality-tied, stable) pool.
+        nzb = _stream("NZB", "https://nzbdav.example/video")
+        nzb["_nzb_release_key"] = "nzb:example"
+        http = _stream("HTTP", "https://cdn.example/video")
+        called: list[str] = []
+
+        async def fake_probe_race(candidates, *_a, outcomes=None, **_k):
+            called.append(candidates[0]["url"])
+            return [(candidates[0], probe.ProbeResult(True, ttfb=0.01,
+                                                      speed_bps=20_000_000))]
+
+        started = time.monotonic()
+        with (patch("app.picker.sources.search_all", return_value=[sources.FAST]),
+              patch("app.sources.get", return_value=[nzb, http]),
+              patch("app.sources.peek", return_value=[]),
+              patch("app.picker.nzb_lane.in_progress", return_value=False),
+              patch("app.probe.probe_race", side_effect=fake_probe_race),
+              patch("app.reputation.blocked", return_value=False),
+              patch.object(picker, "PROBE_BATCH", 1),
+              patch.object(picker, "FAST_SPEED_FIRST", True)):
+            await picker._race_fast(
+                "movie", "tt1234567", picker.PROFILES["full"], 7200,
+                lambda _s: 1_000_000, started)
+
+        self.assertEqual(http["url"], called[0])
+
+    async def test_speed_first_off_keeps_best_quality_probe_order(self):
+        # With the flag off, opening order is strict quality-first (stable), so
+        # the NZB listed first is probed first even though it verifies slower.
+        nzb = _stream("NZB", "https://nzbdav.example/video")
+        nzb["_nzb_release_key"] = "nzb:example"
+        http = _stream("HTTP", "https://cdn.example/video")
+        called: list[str] = []
+
+        async def fake_probe_race(candidates, *_a, outcomes=None, **_k):
+            called.append(candidates[0]["url"])
+            return [(candidates[0], probe.ProbeResult(True, ttfb=0.01,
+                                                      speed_bps=20_000_000))]
+
+        started = time.monotonic()
+        with (patch("app.picker.sources.search_all", return_value=[sources.FAST]),
+              patch("app.sources.get", return_value=[nzb, http]),
+              patch("app.sources.peek", return_value=[]),
+              patch("app.picker.nzb_lane.in_progress", return_value=False),
+              patch("app.probe.probe_race", side_effect=fake_probe_race),
+              patch("app.reputation.blocked", return_value=False),
+              patch.object(picker, "PROBE_BATCH", 1),
+              patch.object(picker, "FAST_SPEED_FIRST", False)):
+            await picker._race_fast(
+                "movie", "tt1234567", picker.PROFILES["full"], 7200,
+                lambda _s: 1_000_000, started)
+
+        self.assertEqual(nzb["url"], called[0])
+
+    async def test_fast_race_gives_nzb_the_usenet_ttfb_budget(self):
+        # A fresh nzbdav mount needs 20-35s for its first byte; the race must
+        # probe direct-NZB with USENET_TTFB_MAX, not the 12s debrid budget that
+        # would fail a healthy cold mount. Other candidates keep PROBE_TTFB_MAX.
+        nzb = _stream("NZB", "https://nzbdav.example/video")
+        nzb["_nzb_release_key"] = "nzb:example"
+        http = _stream("HTTP", "https://cdn.example/video")
+        seen: dict[str, float] = {}
+
+        async def fake_probe_race(candidates, need, ttfb, *_a, **_k):
+            seen[candidates[0]["url"]] = ttfb
+            return [(candidates[0], probe.ProbeResult(True, ttfb=0.01,
+                                                      speed_bps=20_000_000))]
+
+        started = time.monotonic()
+        with (patch("app.picker.sources.search_all", return_value=[sources.FAST]),
+              patch("app.sources.get", return_value=[nzb, http]),
+              patch("app.sources.peek", return_value=[]),
+              patch("app.picker.nzb_lane.in_progress", return_value=False),
+              patch("app.probe.probe_race", side_effect=fake_probe_race),
+              patch("app.reputation.blocked", return_value=False),
+              patch.object(picker, "PROBE_BATCH", 3),
+              patch.object(picker, "FAST_SPEED_FIRST", False)):
+            await picker._race_fast(
+                "movie", "tt1234567", picker.PROFILES["full"], 7200,
+                lambda _s: 1_000_000, started)
+
+        self.assertEqual(picker.USENET_TTFB_MAX, seen[nzb["url"]])
+        self.assertEqual(picker.PROBE_TTFB_MAX, seen[http["url"]])
+
     async def test_verified_hd_returns_immediately_without_waiting_grace(self):
         # A verified 1080p trips _enough, so the race returns at once even though
         # the grace window is long.

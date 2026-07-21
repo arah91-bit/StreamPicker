@@ -40,7 +40,7 @@ import httpx
 from starlette.responses import (RedirectResponse, Response,
                                  StreamingResponse)
 
-from app import decode_health, reputation, telemetry
+from app import cfsolver, decode_health, reputation, telemetry
 
 logger = logging.getLogger("stream-picker")
 
@@ -226,7 +226,8 @@ def _spawn(coro) -> None:
 async def _prefetch_one(url: str, rh: dict, candidate_key: str) -> None:
     try:
         async with _buffer_slots:
-            req = _client.build_request("GET", url, headers=rh)
+            req = _client.build_request(
+                "GET", url, headers=cfsolver.merge_headers(url, rh))
             r = await _client.send(req, stream=True)
             try:
                 length = r.headers.get("content-length") or ""
@@ -578,7 +579,7 @@ async def serve_master(token: str, entry: dict, request) -> Response:
             continue
         rh = c.get("rh") or {}
         try:
-            r = await _client.get(c["u"], headers=rh,
+            r = await _client.get(c["u"], headers=cfsolver.merge_headers(c["u"], rh),
                                   timeout=min(10.0, remaining))
         except Exception as e:
             logger.info(f"hls: cand {idx} playlist fetch failed "
@@ -586,6 +587,8 @@ async def serve_master(token: str, entry: dict, request) -> Response:
             bad(c, f"playlist-{type(e).__name__.lower()}")
             continue
         if r.status_code != 200 or len(r.content) > _PLAYLIST_MAX:
+            if cfsolver.looks_challenged(r.status_code, r.headers, r.content):
+                cfsolver.note_challenge(c["u"])
             bad(c, (f"playlist-http-{r.status_code}" if r.status_code != 200
                     else "playlist-too-large"))
             continue
@@ -653,10 +656,13 @@ async def serve_resource(token: str, entry: dict, request) -> Response:
         last_reason = "segment-fetch-failed"
         for attempt in (1, 2):
             try:
-                req = _client.build_request("GET", url, headers=rh)
+                req = _client.build_request(
+                    "GET", url, headers=cfsolver.merge_headers(url, rh))
                 r = await _client.send(req, stream=True)
                 if _range_ok(r, rng):
                     break
+                if cfsolver.looks_challenged(r.status_code, r.headers):
+                    cfsolver.note_challenge(url)
                 last_reason = (f"http-{r.status_code}"
                                if r.status_code not in (200, 206)
                                else "bad-content-range")

@@ -38,8 +38,8 @@ from urllib.parse import urlsplit
 import httpx
 from starlette.responses import Response, StreamingResponse
 
-from app import (content_identity, decode_health, hlsproxy, reputation, telemetry,
-                 usenet_health, vprobe)
+from app import (cfsolver, content_identity, decode_health, hlsproxy, reputation,
+                 telemetry, usenet_health, vprobe)
 
 logger = logging.getLogger("stream-picker")
 
@@ -637,8 +637,17 @@ async def _send(cand: dict | str, range_header: str | None):
         url, headers = cand, {}
     if range_header:
         headers["Range"] = range_header
+    headers = cfsolver.merge_headers(url, headers)
     req = _client.build_request("GET", url, headers=headers)
-    return await _client.send(req, stream=True, follow_redirects=True)
+    resp = await _client.send(req, stream=True, follow_redirects=True)
+    # A Cloudflare block page must never reach the player: callers already fail
+    # over on a non-2xx, and this schedules a background solve so the retry (and
+    # every later fetch of this host) carries clearance and streams real bytes.
+    # A side observation only — never let it interfere with returning the stream.
+    if cfsolver.looks_challenged(getattr(resp, "status_code", 0),
+                                 getattr(resp, "headers", {})):
+        cfsolver.note_challenge(url)
+    return resp
 
 
 def _fwd_headers(resp) -> dict:
@@ -1797,10 +1806,13 @@ async def _get_or_start_entry(token: str, session: dict,
 
 
 async def _fire_prefetch(media_id: str, picker_label: str) -> None:
-    """Ask the picker to prep the next episode. Lazy import to avoid an import
-    cycle (proxy is imported by picker's callers)."""
+    """On play: refresh this episode's own (possibly hours-old, cached) search,
+    then prep the next one. Refresh runs first and light (viewer's picker only)
+    so it clears before the heavier both-pickers prefetch. Lazy import avoids an
+    import cycle (proxy is imported by picker's callers)."""
     try:
         from app import picker
+        await picker.refresh("series", media_id, picker_label)
         await picker.prefetch_next("series", media_id, picker_label)
     except Exception:
         logger.exception(f"prefetch trigger failed for {media_id}")

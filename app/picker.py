@@ -33,6 +33,7 @@ segments, so by the time the user presses play the slow first byte is paid for.
 """
 
 import asyncio
+import contextlib
 import hashlib
 import logging
 import math
@@ -103,14 +104,26 @@ ENOUGH_1080 = int(os.environ.get("FAST_ENOUGH_1080", "1"))
 # _enough); this only bounds the chase for unproven "HD" labels that may never
 # verify. The slow picker does the patient, thorough pass. Seconds.
 FAST_VERIFIED_GRACE = float(os.environ.get("FAST_VERIFIED_GRACE", "5"))
+# Until the race holds its first verified stream (the grace timer can't start
+# without one), probe the fast-to-verify candidates first — direct debrid/HTTP
+# links that first-byte in ~1s — ahead of a same-or-better NZB that needs a
+# mount assembled before it can answer. This gets a floor result verified sooner
+# on a hard title, so the viewer gets a decent stream in seconds while the
+# background finisher and slow picker upgrade the cache to the best NZB. Once
+# something has verified, ordering reverts to strict best-quality-first.
+FAST_SPEED_FIRST = os.environ.get("FAST_SPEED_FIRST", "1").strip().lower() \
+    not in ("0", "false", "no", "off", "")
 PROBE_BATCH = int(os.environ.get("FAST_PROBE_BATCH", "3"))
 # Safety cap only; the normal stop condition is the first good verified source.
 FAST_RACE_DEADLINE = float(os.environ.get("FAST_RACE_DEADLINE", "55"))
 CACHE_TTL = float(os.environ.get("CACHE_TTL", str(6 * 3600)))
 # Release catalogs can live for hours, but a signed playback URL must not be
-# treated as freshly verified for that long. Result lists get a short TTL and
-# their leader is re-probed after the still-shorter freshness window.
-RESULT_CACHE_TTL = min(CACHE_TTL, float(os.environ.get("RESULT_CACHE_TTL", "900")))
+# treated as freshly verified for that long. A result list holds for a couple of
+# hours — long enough that a prefetched next episode survives even the longest
+# episode's playback — but its leader is re-probed on any access past the much
+# shorter freshness window below (and the whole list is refreshed on play), so a
+# stale signed URL is caught before it can reach the player.
+RESULT_CACHE_TTL = min(CACHE_TTL, float(os.environ.get("RESULT_CACHE_TTL", "7200")))
 CACHE_REVERIFY_AFTER = min(
     RESULT_CACHE_TTL, float(os.environ.get("CACHE_REVERIFY_AFTER", "120")))
 CACHE_REVERIFY_TTFB = float(os.environ.get("CACHE_REVERIFY_TTFB", "8"))
@@ -1942,8 +1955,15 @@ async def _race_fast(media: str, media_id: str, profile: dict, runtime: float,
             # hosts first so one wrapper/provider cannot monopolize all slots;
             # a second pass fills any capacity left when diversity is impossible.
             active_hosts = {_probe_host(s) for s, _ in running_probes.values()}
+            # Speed-first opening: before anything has verified, put the
+            # fast-to-verify candidates ahead of NZB-needs-a-mount so a floor
+            # result lands sooner and starts the grace timer. Stable, so quality
+            # order is preserved within each class; reverts once verified.
+            probe_pool = pool
+            if FAST_SPEED_FIRST and first_verified_at is None:
+                probe_pool = sorted(pool, key=_is_direct_nzb)
             for diverse_only in (True, False):
-                for stream in (s for s in pool if s.get("url") not in probed):
+                for stream in (s for s in probe_pool if s.get("url") not in probed):
                     if len(running_probes) >= PROBE_BATCH:
                         break
                     ident = _release_ident(stream)
@@ -1965,8 +1985,16 @@ async def _race_fast(media: str, media_id: str, profile: dict, runtime: float,
                     if host:
                         active_hosts.add(host)
                     outcomes: list = []
+                    # A fresh nzbdav mount spends 20-35s assembling its opening
+                    # segments before the first byte; the 12s debrid budget would
+                    # fail it even when the mount is perfectly healthy, so it only
+                    # surfaced on the slow finisher/a retry. Give direct-NZB the
+                    # usenet first-byte allowance (the race deadline still caps it)
+                    # so a good cold mount verifies inside this fast pass.
+                    ttfb_budget = (USENET_TTFB_MAX if _is_direct_nzb(stream)
+                                   else PROBE_TTFB_MAX)
                     task = asyncio.create_task(probe.probe_race(
-                        [stream], need_bps, PROBE_TTFB_MAX, want=1,
+                        [stream], need_bps, ttfb_budget, want=1,
                         concurrency=1, deadline=deadline, expect_secs=runtime,
                         outcomes=outcomes))
                     running_probes[task] = (stream, outcomes)
@@ -2640,74 +2668,110 @@ def _episode_work_active(media: str, media_id: str) -> bool:
     return nzb_lane.in_progress(media, media_id)
 
 
+async def _prepare_and_cache(media: str, playing_id: str, target_id: str,
+                             picker_label: str,
+                             *, invalidate_first: bool, both: bool,
+                             prefetch_cap: bool = False) -> None:
+    """Shared core for prefetch (next episode) and refresh (this episode).
+
+    Waits for the *playing* episode's own search work (``playing_id``) to drain
+    first — its fast/slow finishers and the nzb lane own the probe slots and NNTP
+    connections the viewer needs, and neither prep may compete with them — then
+    runs the picker(s) for ``target_id`` and stores each result under its own
+    key. No stream bytes are downloaded; the verification probes' few MB are the
+    only transfer. ``both`` runs the slow *and* fast pickers, viewer's first
+    (Stremio shows both addons' lists); ``invalidate_first`` drops any cached
+    result for the target so a refresh re-searches instead of re-storing the
+    stale list. Raw searches and verification evidence are shared, so a second
+    (or a repeat) pick reuses the first one's work."""
+    profile = "mobile" if "mob" in (picker_label or "") else "full"
+    slow = "slow" in (picker_label or "")
+    # Let playback settle first.  The trigger fires at the stream's very first
+    # byte — the moment the start gate is measuring throughput — and a probe
+    # wave there can strangle that measurement into 'too slow' failures (live
+    # incident 2026-07-15: 41s of 502s while a slow merge probed 65 candidates).
+    # The next episode is needed in twenty minutes, not twenty seconds.
+    await asyncio.sleep(_PREFETCH_SETTLE)
+    deadline = time.monotonic() + _PREFETCH_QUIESCE_MAX
+    while (_episode_work_active(media, playing_id)
+           and time.monotonic() < deadline):
+        await asyncio.sleep(_PREFETCH_QUIESCE_POLL)
+    if invalidate_first:
+        invalidate(target_id)
+    # Attribute these probes to the episode being prepped, not the one playing.
+    telemetry.request_ctx.set({"media": media, "media_id": target_id,
+                               "picker": (picker_label or "") + "/prefetch"})
+    # Each result goes only to its own key — a fast delivery-ranked answer must
+    # not freeze into the slow best-quality cache (or vice versa).
+    pickers = [("slow", pick_slow), ("fast", pick)]
+    if not slow:
+        pickers.reverse()
+    if not both:
+        pickers = pickers[:1]        # refresh only the list the viewer is on
+    # A next-episode prefetch caps the NZB lane to the prefetch mount budget so
+    # it does not article-check the whole wave for an episode that may never be
+    # opened; a refresh of the current episode mounts the full wave as usual.
+    lane_scope = (nzb_lane.prefetch_scope() if prefetch_cap
+                  else contextlib.nullcontext())
+    cached = []
+    with lane_scope:
+        for kind, one_pick in pickers:
+            streams = await one_pick(media, target_id, profile)
+            if not streams:
+                logger.info(f"prefetch: no streams for {target_id} ({kind})")
+                continue
+            # A notice (checking/downloading) has a short, separately-managed
+            # lifetime; caching one freezes a transient state into a long answer.
+            if _contains_notice(streams):
+                state = streams[0].get(_NOTICE_STATE_KEY, "notice")
+                logger.info(f"prefetch: {target_id} still {state} ({kind}); "
+                            f"not caching")
+                continue
+            _store(f"slow:{profile}:{media}:{target_id}" if kind == "slow"
+                   else f"{profile}:{media}:{target_id}", streams)
+            top = " ".join((streams[0].get("name") or "").split())[:40]
+            cached.append(f"{kind} #1 {top!r}")
+    if cached:
+        logger.info(f"prefetch: cached {target_id} — " + "; ".join(cached))
+
+
 async def prefetch_next(media: str, media_id: str, picker_label: str) -> None:
-    """Search-and-cache the next episode — fired by the proxy the moment a series
-    episode starts playing. Waits for the playing episode's own search work to
-    finish, then runs BOTH pickers for episode E+1 (the viewer's first), so its
-    full search + verification lands in both result caches; opening the next
-    episode is an instant cache hit with a verified #1 on either addon.
-    Caches only the picked result lists — no stream bytes are downloaded (the
-    verification probes' few MB are the only transfer). Best-effort, deduped per
-    next-episode id."""
+    """Search-and-cache episode E+1 the moment E starts playing, so opening the
+    next episode is an instant cache hit with a verified #1 on either addon.
+    Runs both pickers, viewer's first. Best-effort, deduped per next-episode id."""
     nxt = await _next_episode(media_id)
     if not nxt or nxt in _prefetching:
         return
     _prefetching.add(nxt)
     try:
-        profile = "mobile" if "mob" in (picker_label or "") else "full"
-        slow = "slow" in (picker_label or "")
-        # Let playback settle first.  The trigger fires at the stream's very
-        # first byte — the moment the start gate is measuring throughput —
-        # and a prefetch probe wave there can strangle that measurement into
-        # 'too slow' failures (live incident 2026-07-15: 41s of 502s while
-        # the prefetch's slow merge probed 65 candidates).  The viewer needs
-        # E+1 in twenty minutes, not twenty seconds.
-        await asyncio.sleep(_PREFETCH_SETTLE)
-        deadline = time.monotonic() + _PREFETCH_QUIESCE_MAX
-        while (_episode_work_active(media, media_id)
-               and time.monotonic() < deadline):
-            await asyncio.sleep(_PREFETCH_QUIESCE_POLL)
-        # Attribute the prefetch's probes to the episode being prepped, not the
-        # one currently playing.
-        telemetry.request_ctx.set({"media": media, "media_id": nxt,
-                                   "picker": (picker_label or "") + "/prefetch"})
-        # Both pickers, viewer's first: Stremio installs both addons and shows
-        # both lists on the next open, so a prefetch that primes only one
-        # leaves the other re-running its whole merge in the viewer's face.
-        # Each result goes only to its own key — a fast delivery-ranked answer
-        # must not freeze into the slow best-quality cache (or vice versa);
-        # raw source and verification evidence are already shared, so the
-        # second pick reuses the first one's searches and probes.
-        pickers = [("slow", pick_slow), ("fast", pick)]
-        if not slow:
-            pickers.reverse()
-        cached = []
-        for kind, one_pick in pickers:
-            streams = await one_pick(media, nxt, profile)
-            if not streams:
-                logger.info(f"prefetch: no streams for next episode {nxt} "
-                            f"({kind})")
-                continue
-            # Notices deliberately have short, separately-managed lifetimes.
-            # Putting one in the normal result cache turns a transient
-            # check/download state into a six-hour answer.
-            if _contains_notice(streams):
-                state = streams[0].get(_NOTICE_STATE_KEY, "notice")
-                logger.info(f"prefetch: next episode {nxt} still {state} "
-                            f"({kind}); not caching")
-                continue
-            target = (f"slow:{profile}:{media}:{nxt}" if kind == "slow"
-                      else f"{profile}:{media}:{nxt}")
-            _store(target, streams)
-            top = " ".join((streams[0].get("name") or "").split())[:40]
-            cached.append(f"{kind} #1 {top!r}")
-        if cached:
-            logger.info(f"prefetch: cached next episode {nxt} — "
-                        + "; ".join(cached))
+        await _prepare_and_cache(media, media_id, nxt, picker_label,
+                                 invalidate_first=False, both=True,
+                                 prefetch_cap=True)
     except Exception:
         logger.exception(f"prefetch: failed for {media_id}")
     finally:
         _prefetching.discard(nxt)
+
+
+async def refresh(media: str, media_id: str, picker_label: str) -> None:
+    """Re-run and re-cache *this* episode's own search when it starts playing.
+
+    Because a result list now lives for RESULT_CACHE_TTL (a couple of hours), a
+    prefetched — or simply re-watched — episode can be opened off a list whose
+    signed links are hours old. This drops that stale list and re-searches, so a
+    return to the list (or the sibling addon) gets freshly-verified links, and
+    it re-chains the next-episode prefetch. Only the viewer's own picker is
+    re-run, to stay clear of the playing stream's probe budget. Deduped per id."""
+    if not media_id or media_id in _prefetching:
+        return
+    _prefetching.add(media_id)
+    try:
+        await _prepare_and_cache(media, media_id, media_id, picker_label,
+                                 invalidate_first=True, both=False)
+    except Exception:
+        logger.exception(f"refresh: failed for {media_id}")
+    finally:
+        _prefetching.discard(media_id)
 
 
 async def shutdown() -> None:
