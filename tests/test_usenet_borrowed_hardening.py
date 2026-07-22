@@ -2,8 +2,8 @@
 
 Five behaviors: diacritics/ampersand folding in the title matcher, bare
 archive-part junk rejection, encrypted-archive hard strikes, free-text
-fallback when the imdbid query yields nothing usable, and season packs as a
-last resort with a mount-time episode gate.
+fallback when the imdbid query yields nothing usable, and episode-gated packs
+that remain available without monopolizing the mount wave.
 """
 import contextlib
 import unittest
@@ -147,6 +147,34 @@ class SeasonPackMatchTests(unittest.TestCase):
         self.assertFalse(usenet._season_pack_match(
             "Example.Show.S01E05.1080p", 1, 2))
 
+    def test_complete_show_containers_are_explicit_and_season_aware(self):
+        self.assertTrue(usenet._show_pack_match(
+            "Example.Show.Complete.Series.1080p.WEB-DL", 4))
+        self.assertTrue(usenet._show_pack_match(
+            "Example.Show.S01-S06.1080p.WEB-DL", 4))
+        self.assertFalse(usenet._show_pack_match(
+            "Example.Show.S01-S03.1080p.WEB-DL", 4))
+        self.assertFalse(usenet._show_pack_match(
+            "Example.Show.Collection.1080p.WEB-DL", 4))
+
+    def test_singles_and_packs_share_wave_without_pack_monopoly(self):
+        singles = [{"title": f"Example.Show.S01E02.1080p.WEB-DL-S{i}",
+                    "size": (3 + i) * 1_000_000_000,
+                    "release_key": f"single-{i}",
+                    "offers": [{"indexer": "one"}]}
+                   for i in range(6)]
+        packs = [{"title": f"Example.Show.S01.COMPLETE.1080p.WEB-DL-P{i}",
+                  "size": (30 + i) * 1_000_000_000,
+                  "release_key": f"pack-{i}", "_nzb_pack": True,
+                  "offers": [{"indexer": "one"}]}
+                 for i in range(3)]
+        with patch("app.usenet_health.status", return_value={}), \
+                patch("app.usenet_health.indexer_score", return_value=0.5), \
+                patch("app.usenet_health.indexer_samples", return_value=0):
+            selected = usenet._select_releases(singles + packs, 5, "series")
+        self.assertEqual(5, len(selected))
+        self.assertEqual(1, sum(bool(r.get("_nzb_pack")) for r in selected))
+
     def test_pack_mount_only_serves_explicit_episode_files(self):
         release = {"_nzb_pack": True,
                    "_nzb_expected": {"media": "series",
@@ -236,7 +264,8 @@ class TextQueryTests(unittest.TestCase):
                          usenet._query_text("It's a Test: Story!"))
 
     def test_text_queries_carry_episode_or_year(self):
-        self.assertEqual(["Example Show S01E02", "Example Show S01"],
+        self.assertEqual(["Example Show S01E02", "Example Show S01",
+                          "Example Show Complete"],
                          usenet._text_queries(
                              "series", ["tt1", "1", "2"],
                              ["Example Show"], 2024))
@@ -325,6 +354,23 @@ class SearchFallbackTests(unittest.IsolatedAsyncioTestCase):
             pack_only[0]["title"], pack_only[0]["size"],
             "series", "tt1234567:1"))
 
+    async def test_complete_series_pack_identity_is_show_scoped(self):
+        show_pack = [{
+            "title": "Example.Show.Complete.Series.1080p.WEB-DL",
+            "size": 120_000_000_000, "link": "https://indexer/show-pack",
+            "indexer": "one",
+        }]
+        keys = []
+        for media_id in ("tt1234567:1:2", "tt1234567:4:7"):
+            mock = AsyncMock(return_value=show_pack)
+            with _lane_patches(mock):
+                found = await usenet.search("series", media_id)
+            self.assertEqual(1, len(found))
+            self.assertEqual("series:tt1234567",
+                             found[0]["_nzb_pack_scope"])
+            keys.append(found[0]["release_key"])
+        self.assertEqual(keys[0], keys[1])
+
     def test_season_scope_is_distinct_and_stable(self):
         season = usenet_health._content_scope("series", "tt1234567:1")
         self.assertEqual("series:tt1234567:1", season)
@@ -332,7 +378,7 @@ class SearchFallbackTests(unittest.IsolatedAsyncioTestCase):
                             usenet_health._content_scope("series",
                                                          "tt1234567:1:2"))
 
-    async def test_pack_excluded_when_single_episode_exists(self):
+    async def test_pack_remains_available_when_single_episode_exists(self):
         rows = [{"title": "Example.Show.S01E02.1080p.WEB-DL-GOOD",
                  "size": 4_000_000_000, "link": "https://indexer/good",
                  "indexer": "one"},
@@ -342,8 +388,10 @@ class SearchFallbackTests(unittest.IsolatedAsyncioTestCase):
         mock = AsyncMock(return_value=rows)
         with _lane_patches(mock):
             found = await usenet.search("series", "tt1234567:1:2")
-        self.assertEqual(["Example.Show.S01E02.1080p.WEB-DL-GOOD"],
-                         [r["title"] for r in found])
+        self.assertEqual({"Example.Show.S01E02.1080p.WEB-DL-GOOD",
+                          "Example.Show.S01.COMPLETE.1080p.WEB-DL"},
+                         {r["title"] for r in found})
+        self.assertEqual(1, sum(bool(r.get("_nzb_pack")) for r in found))
 
 
 if __name__ == "__main__":

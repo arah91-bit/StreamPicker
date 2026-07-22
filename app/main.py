@@ -413,6 +413,7 @@ async def stats_json(request: Request, min_n: int = 3):
         "nzb_indexers": usenet_health.indexer_listing(),
         "nzb_blocked": usenet_health.blocked_listing(),
         "nzb_failure_samples": telemetry.aggregate_usenet_failures(recs),
+        "cache": telemetry.aggregate_cache(recs),
     }
 
 

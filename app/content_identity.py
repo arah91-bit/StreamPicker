@@ -86,9 +86,12 @@ _EPISODE_RE = re.compile(
     r"(?<![A-Za-z0-9])(?:S0*(\d{1,3})[^A-Za-z0-9]*E0*(\d{1,4})|"
     r"0*(\d{1,3})x0*(\d{1,4}))(?!\d)", re.I)
 _SEASON_RE = re.compile(r"(?<![A-Za-z0-9])S0*(\d{1,3})(?!\d)", re.I)
-_EXTRA_EP_RE = re.compile(
-    r"^(?:[\s._-]*(?:-|to|through)[\s._-]*(?:S\d{1,3})?E?\d{1,4}\b|"
-    r"[\s._-]*E\d{1,4}\b)", re.I)
+_SEASON_WORD_RE = re.compile(
+    r"(?<![A-Za-z0-9])Seasons?[\s._-]*0*(\d{1,3})(?!\d)", re.I)
+_SEASON_RANGE_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:S0*(\d{1,3})|Seasons?[\s._-]*0*(\d{1,3}))"
+    r"[\s._]*(?:-|to|thru|through)[\s._]*"
+    r"(?:S(?:easons?)?[\s._-]*)?0*(\d{1,3})(?!\d)", re.I)
 
 
 # A safe title boundary is not merely "the expected letters came first".  The
@@ -99,6 +102,7 @@ _TAIL_MARKERS = frozenset({
     "bluray", "bdrip", "brrip", "remux", "hdtv", "dvdrip", "dvd",
     "repack", "proper", "extended", "theatrical", "imax", "internal",
     "hdr", "hdr10", "hdr10plus", "dovi", "dv", "sdr", "complete",
+    "season", "seasons",
     "multi", "dual", "dubbed", "subbed", "hevc", "avc", "x264",
     "x265", "h264", "h265", "av1", "vc1", "aac", "ac3", "eac3",
     "ddp", "dts", "truehd", "atmos", "proper", "rerip",
@@ -248,7 +252,12 @@ def _title_remainder(profile: IdentityProfile,
             if compact != target:
                 continue
             remainder = text_tokens[consumed:]
-            if remainder and not _tail_boundary(remainder[0]):
+            pack_boundary = (len(remainder) >= 2 and (
+                remainder[:2] in (("all", "seasons"),
+                                  ("series", "complete"),
+                                  ("show", "complete"))))
+            if remainder and not (_tail_boundary(remainder[0])
+                                  or pack_boundary):
                 break
             matches.append((len(target), remainder))
             break
@@ -257,18 +266,116 @@ def _title_remainder(profile: IdentityProfile,
     return max(matches, key=lambda item: item[0])[1]
 
 
-def _episode_evidence(text: str) -> tuple[set[tuple[int, int]], set[int], bool]:
-    pairs: set[tuple[int, int]] = set()
+def _episode_details(
+        text: str,
+        ) -> tuple[list[tuple[int, int]], set[int],
+                   list[tuple[tuple[int, int], tuple[int, int]]],
+                   list[tuple[int, int]]]:
+    """Ordered episode mentions, seasons, and inclusive episode ranges.
+
+    Scene names compress bundles in several ways (``S01E01-E06``,
+    ``S01E01-06``, ``S01E01E02``). Keeping their order and ranges separately
+    lets callers distinguish a file that *starts* at the requested episode from
+    a season container that merely contains it.
+    """
+    mentions: list[tuple[int, int]] = []
     seasons = {int(m.group(1)) for m in _SEASON_RE.finditer(text)}
-    multi = False
+    seasons.update(int(m.group(1)) for m in _SEASON_WORD_RE.finditer(text))
+    ranges: list[tuple[tuple[int, int], tuple[int, int]]] = []
+    season_ranges: list[tuple[int, int]] = []
+    for match in _SEASON_RANGE_RE.finditer(text):
+        start = int(match.group(1) or match.group(2))
+        end = int(match.group(3))
+        season_ranges.append((start, end))
+        seasons.update((start, end))
+    consumed_until = -1
     for match in _EPISODE_RE.finditer(text):
+        if match.start() < consumed_until:
+            continue
         season = int(match.group(1) or match.group(3))
         episode = int(match.group(2) or match.group(4))
-        pairs.add((season, episode))
+        first = (season, episode)
+        mentions.append(first)
         seasons.add(season)
-        if _EXTRA_EP_RE.match(text[match.end():]):
-            multi = True
-    return pairs, seasons, multi
+        previous = first
+        pos = match.end()
+        while True:
+            # E-prefixed continuations cover E01-E03, E01E02, and
+            # cross-season S01E06-S02E01 forms.
+            extra = re.match(
+                r"(?P<sep>[\s._-]*(?:(?:to|thru|through)[\s._-]*)?)"
+                r"(?:S0*(?P<season>\d{1,3})[^A-Za-z0-9]*)?"
+                r"E0*(?P<episode>\d{1,4})(?!\d)",
+                text[pos:], re.I)
+            bare = None
+            if extra is None:
+                # The common S01E01-03 shorthand omits the second E. Require
+                # an explicit separator so release-group digits cannot become
+                # accidental episode evidence.
+                bare = re.match(
+                    r"[\s._]*(?:-|to|thru|through)[\s._]*"
+                    r"0*(?P<episode>\d{1,4})(?!\d)",
+                    text[pos:], re.I)
+            if extra is None and bare is None:
+                break
+            if extra is not None:
+                next_season = int(extra.group("season") or season)
+                next_episode = int(extra.group("episode"))
+                separator = extra.group("sep") or ""
+                step = extra.end()
+            else:
+                next_season = season
+                next_episode = int(bare.group("episode"))
+                separator = bare.group(0)
+                step = bare.end()
+            current = (next_season, next_episode)
+            mentions.append(current)
+            seasons.add(next_season)
+            if ("-" in separator
+                    or re.search(r"\b(?:to|thru|through)\b", separator, re.I)):
+                ranges.append((previous, current))
+            previous = current
+            pos += step
+        consumed_until = max(consumed_until, pos)
+    return mentions, seasons, ranges, season_ranges
+
+
+def _episode_evidence(text: str) -> tuple[set[tuple[int, int]], set[int], bool]:
+    mentions, seasons, ranges, _season_ranges = _episode_details(text)
+    return set(mentions), seasons, bool(ranges or len(mentions) > 1)
+
+
+def _episode_relation(text: str, wanted: tuple[int, int]) -> str:
+    """Relationship of release text to one requested episode.
+
+    ``exact`` and ``starts`` are safe for automatic playback. ``contains`` and
+    ``pack`` are useful container evidence but need an exact selected member
+    before they can lead. ``contradiction`` explicitly excludes the request;
+    ``missing`` has no episode information at all.
+    """
+    mentions, seasons, ranges, season_ranges = _episode_details(text)
+    contained = set(mentions)
+    for start, end in ranges:
+        if start[0] == end[0]:
+            lo, hi = sorted((start[1], end[1]))
+            if wanted[0] == start[0] and lo <= wanted[1] <= hi:
+                contained.add(wanted)
+        elif min(start, end) <= wanted <= max(start, end):
+            contained.add(wanted)
+    if mentions:
+        if wanted not in contained:
+            return "contradiction"
+        if len(mentions) == 1 and not ranges:
+            return "exact"
+        return "starts" if mentions[0] == wanted else "contains"
+    if season_ranges:
+        if any(min(start, end) <= wanted[0] <= max(start, end)
+               for start, end in season_ranges):
+            return "pack"
+        return "contradiction"
+    if seasons:
+        return "pack" if seasons == {wanted[0]} else "contradiction"
+    return "missing"
 
 
 def _prefix_regions(remainder: tuple[str, ...]) -> set[str]:
@@ -342,21 +449,18 @@ def classify(profile: IdentityProfile, text: str, *,
     if regions and profile.region_tags and not regions.issubset(profile.region_tags):
         return CONTRADICTION
 
-    pairs, seasons, multi_episode = _episode_evidence(evidence)
+    pairs, seasons, _multi_episode = _episode_evidence(evidence)
     exact_episode = False
+    episode_relation = "missing"
     if profile.media == "movie":
         if pairs or seasons:
             return CONTRADICTION
     elif profile.season is not None:
         wanted = (profile.season, profile.episode)
-        if multi_episode:
+        episode_relation = _episode_relation(evidence, wanted)
+        if episode_relation == "contradiction":
             return CONTRADICTION
-        if pairs:
-            if pairs != {wanted}:
-                return CONTRADICTION
-            exact_episode = True
-        elif seasons and seasons != {profile.season}:
-            return CONTRADICTION
+        exact_episode = episode_relation in {"exact", "starts"}
 
     # Conflicting provider metadata cannot establish confidence from a parsed
     # year alone. Exact per-item IMDb evidence still binds the file to the
@@ -366,8 +470,7 @@ def classify(profile: IdentityProfile, text: str, *,
         if trusted_imdb and (profile.media == "movie"
                              or profile.season is None
                              or trusted_episode
-                             or (profile.season, profile.episode)
-                             in _episode_evidence(evidence)[0]):
+                             or episode_relation in {"exact", "starts"}):
             return STRONG
         return COMPATIBLE
 
@@ -383,12 +486,11 @@ def classify(profile: IdentityProfile, text: str, *,
         episode_proven = exact_episode or trusted_episode
         if not episode_proven:
             return COMPATIBLE
-        # Exact title + exact episode is ordinarily sufficient.  When region or
-        # year metadata exists (remakes/local editions), demand either explicit
-        # matching disambiguation or trusted exact-IMDb context as well.
-        edition_expected = bool(profile.years or profile.region_tags)
-        edition_proven = year_match or region_match or trusted_imdb
-        return STRONG if (not edition_expected or edition_proven) else COMPATIBLE
+        # Most TV scene names omit the show's start year. Exact canonical title
+        # + exact episode is sufficient unless an authoritative year/region was
+        # explicitly contradicted above. Requiring the edition tag to be
+        # repeated turned ordinary SxxExx files into unchecked fallbacks.
+        return STRONG
 
     # Series-level requests have no episode identity to prove.
     return STRONG if (trusted_imdb and (year_match or region_match
@@ -475,10 +577,10 @@ def assess(profile: IdentityProfile, text: str, *,
         if profile.season is None:
             runtime_ok = False
         else:
-            pairs, _, multi = _episode_evidence(_clean_evidence_text(text))
-            exact_episode = (pairs == {(profile.season, profile.episode)}
-                             and not multi)
-            runtime_ok = exact_episode or trusted_episode
+            relation = _episode_relation(
+                _clean_evidence_text(text),
+                (profile.season, profile.episode))
+            runtime_ok = relation in {"exact", "starts"} or trusted_episode
 
     if runtime_ok:
         return IdentityAssessment(STRONG, EVIDENCE_RUNTIME,

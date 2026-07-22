@@ -90,6 +90,44 @@ class PickerIdentityPolicyTests(unittest.TestCase):
         self.assertGreater(picker._quality_key(exact),
                            picker._quality_key(yearless))
 
+    def test_trusted_nzb_does_not_outrank_higher_quality_debrid(self) -> None:
+        """A trusted-indexer NZB (evidence rank 5) must not float above a
+        confirmed higher-quality debrid release (rank 4): among STRONG-identity
+        streams the video ladder decides, not the source's identity evidence."""
+        nzb = _stream(
+            "Ghost.in.the.Shell.1995.720p.BRRip.x264-Group.mkv",
+            "https://nzbdav.invalid/nzb",
+            source=sources.NZB,
+            resolution="720p",
+            size=1_500_000_000,
+        )
+        nzb.update({
+            "_nzb_identity_confidence": content_identity.STRONG,
+            "_nzb_identity_evidence": ["newznab-imdb"],
+            "_nzb_label": "Ghost.in.the.Shell.1995.720p.BRRip.x264-Group",
+            sources._SOURCE_TRUST_KEY: sources._NZB_TRUST_SENTINEL,
+        })
+        remux = _stream(
+            "Ghost.in.the.Shell.1995.1080p.BluRay.REMUX.AVC.TrueHD-HiFi.mkv",
+            "https://comet.invalid/remux",
+            resolution="1080p",
+            size=25_000_000_000,
+        )
+
+        nzb_identity = self._assess(nzb)
+        remux_identity = self._assess(remux)
+        picker._annotate_quality([nzb, remux], 83 * 60)
+
+        self.assertEqual(content_identity.STRONG, nzb_identity.state)
+        self.assertEqual(content_identity.STRONG, remux_identity.state)
+        # The evidence grade still differs — it just no longer outranks video.
+        self.assertGreater(nzb_identity.rank, remux_identity.rank)
+        self.assertGreater(picker._quality_key(remux),
+                           picker._quality_key(nzb))
+        result = probe.ProbeResult(True, ttfb=0.2, speed_bps=10_000_000)
+        assembled = picker._assemble([(nzb, result), (remux, result)], [], None)
+        self.assertEqual(remux["url"], assembled[0]["url"])
+
     def test_exact_trusted_nzb_and_jellyfin_items_can_lead(self) -> None:
         nzb = _stream(
             "8f23c3d76f0842e98c95.mkv",

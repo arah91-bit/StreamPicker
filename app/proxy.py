@@ -1805,17 +1805,36 @@ async def _get_or_start_entry(token: str, session: dict,
         return await _get_or_start_entry_once(token, session, cands)
 
 
-async def _fire_prefetch(media_id: str, picker_label: str) -> None:
-    """On play: refresh this episode's own (possibly hours-old, cached) search,
-    then prep the next one. Refresh runs first and light (viewer's picker only)
-    so it clears before the heavier both-pickers prefetch. Lazy import avoids an
-    import cycle (proxy is imported by picker's callers)."""
+async def _fire_prefetch(media_id: str, picker_label: str,
+                         release_sig: str = "") -> None:
+    """On confirmed startup, credit the playing link and ensure E+1 is warm.
+
+    Playback itself is better evidence than re-searching the current episode.
+    E+1 waits event-driven only while that episode's existing background work is
+    active, then starts immediately. Lazy import avoids the proxy/picker cycle.
+    """
     try:
         from app import picker
-        await picker.refresh("series", media_id, picker_label)
+        telemetry.request_ctx.set({
+            "media": "series", "media_id": media_id,
+            "picker": (picker_label or "") + "/play",
+        })
+        picker.note_playback("series", media_id, picker_label, release_sig)
         await picker.prefetch_next("series", media_id, picker_label)
     except Exception:
         logger.exception(f"prefetch trigger failed for {media_id}")
+
+
+def _schedule_prefetch(entry: dict, release_sig: str = "") -> None:
+    """Single-flight playback hook shared by buffered/direct/HLS startup."""
+    if (not PREFETCH_NEXT or ":" not in (entry.get("id") or "")
+            or entry.get("nextfetched")):
+        return
+    entry["nextfetched"] = True
+    task = asyncio.create_task(_fire_prefetch(
+        entry["id"], entry.get("picker", ""), release_sig))
+    _bg_tasks.add(task)
+    task.add_done_callback(_reap_task)
 
 
 def _cache_headers(e: _Entry, start: int, end: int | None, had_range: bool):
@@ -2124,19 +2143,17 @@ async def serve(token: str, request) -> Response:
                 if _cache_id(c) == _cache_id(source)]
         return await _serve_direct(entry, pool, request, token, source=source)
 
-    # A series episode just started playing: search-and-cache the next episode
-    # now (results only, no stream bytes), so it's an instant hit when opened.
-    if (PREFETCH_NEXT and offset == 0 and ":" in (entry.get("id") or "")
-            and not entry.get("nextfetched")):
-        entry["nextfetched"] = True
-        t = asyncio.create_task(_fire_prefetch(entry["id"], entry.get("picker", "")))
-        _bg_tasks.add(t)
-        t.add_done_callback(_bg_tasks.discard)
-
     if PROXY_BUFFER:
         try:
-            return await _serve_buffered(token, entry, cands, offset, end,
-                                         had_range, request)
+            response = await _serve_buffered(token, entry, cands, offset, end,
+                                             had_range, request)
+            # _serve_buffered has selected/reused a source that passed the proxy
+            # start gate. Trigger only now, not on the player's speculative first
+            # request before we know any link can start.
+            if offset == 0 and response.status_code < 400:
+                selected = _selected_candidate(entry, cands) or {}
+                _schedule_prefetch(entry, selected.get("sig", ""))
+            return response
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -2152,6 +2169,7 @@ async def serve(token: str, request) -> Response:
             return Response(status_code=502)
         idx, cand, resp, it, prebuf, ttfb, net = sel
         _pin_selection(token, entry, cands, cand)
+        _schedule_prefetch(entry, cand.get("sig", ""))
     else:                                          # seek: locked to pinned source
         cand = _selected_candidate(entry, cands)
         if cand is None:

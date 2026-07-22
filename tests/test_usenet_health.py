@@ -12,7 +12,7 @@ import unittest
 from collections.abc import Mapping
 from pathlib import Path
 
-from app import telemetry
+from app import telemetry, usenet_health
 from app.usenet_health import HealthStore, classify_reason, release_key
 
 
@@ -77,6 +77,13 @@ class ReleaseKeyTests(unittest.TestCase):
             uk, release_key(title, size, "series", "tt290978:1:1"))
         # Legacy two-argument identity remains stable for existing databases.
         self.assertEqual(release_key(title, size), release_key(title, size))
+
+    def test_show_scope_is_distinct_from_season_and_episode(self) -> None:
+        show = usenet_health._content_scope("series", "tt0290978")
+        season = usenet_health._content_scope("series", "tt0290978:1")
+        episode = usenet_health._content_scope("series", "tt0290978:1:2")
+        self.assertEqual("series:tt290978", show)
+        self.assertEqual(3, len({show, season, episode}))
 
     def test_probe_reason_classification_separates_decisive_and_transient(self) -> None:
         for reason in ("missing articles", "MISSING ARTICLES", "HTTP 404",

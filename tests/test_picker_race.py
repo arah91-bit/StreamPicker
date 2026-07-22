@@ -17,6 +17,59 @@ def _sd_stream(name, url):
 
 
 class FastRaceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_no_verified_fallback_exposes_no_unverified_candidates(self):
+        candidate = _stream("UNVERIFIED", "https://unknown.example/video")
+        background = {}
+
+        async def finish(*_args, **_kwargs):
+            return None
+
+        with (patch.object(picker, "_background", background),
+              patch.object(picker, "_finish_in_background", side_effect=finish)):
+            streams = picker._fast_checking_notice(
+                "full:movie:tt1234567", "movie", "tt1234567",
+                picker.PROFILES["full"], 7_200, [candidate])
+            await asyncio.gather(*background.values())
+
+        self.assertEqual(1, len(streams))
+        self.assertEqual("checking", streams[0][picker._NOTICE_STATE_KEY])
+        self.assertNotEqual(candidate["url"], streams[0]["url"])
+
+    async def test_fast_metadata_stage_leaves_time_for_byte_probe(self):
+        race_started = asyncio.Event()
+
+        async def no_cache(*_args, **_kwargs):
+            return None
+
+        async def identity(*_args, **_kwargs):
+            await asyncio.sleep(0.01)
+
+        async def slow_metadata(*_args, **_kwargs):
+            await asyncio.sleep(5)
+
+        async def race(*_args, **_kwargs):
+            race_started.set()
+            return [], []
+
+        started = time.monotonic()
+        with (patch.object(picker, "_cached_pick", side_effect=no_cache),
+              patch.object(picker.sources, "search_all", return_value=[]),
+              patch.object(picker, "_resolve_identity_profile",
+                           side_effect=identity),
+              patch.object(picker, "_resolve_accept_langs",
+                           side_effect=slow_metadata),
+              patch.object(picker, "_runtime_seconds",
+                           side_effect=slow_metadata),
+              patch.object(picker, "_race_fast", side_effect=race),
+              patch.object(picker, "_fast_checking_notice", return_value=[]),
+              patch.object(picker, "FAST_METADATA_BUDGET", 0.06),
+              patch.object(picker, "TOTAL_DEADLINE", 0.25),
+              patch.object(picker, "FAST_RACE_DEADLINE", 0.25)):
+            await picker._pick_online("movie", "tt1234567")
+
+        self.assertTrue(race_started.is_set())
+        self.assertLess(time.monotonic() - started, 0.2)
+
     async def test_ready_high_quality_library_is_probed_then_immediate_stop(self):
         library_stream = _stream("LIBRARY", "https://library.example/video")
 

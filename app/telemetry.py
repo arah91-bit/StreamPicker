@@ -570,6 +570,73 @@ def record_tbcache(media_id: str, stream: dict, *, res: int,
     })
 
 
+def record_cache_event(event: str, *, target_id: str = "",
+                       seconds: float | None = None,
+                       age_seconds: float | None = None,
+                       count: int = 0, active: bool | None = None,
+                       detail: str = "") -> None:
+    """Record cache/prewarm control-plane outcomes without retaining URLs.
+
+    These events make the new desired-state prewarmer measurable: how long E+1
+    took to become ready, whether stale leaders survived revalidation, and how
+    many known-dead exact links were avoided.
+    """
+    ctx = request_ctx.get()
+    rec = {
+        "ts": round(time.time(), 1),
+        "kind": "cache",
+        "event": re.sub(r"[^a-z0-9_-]", "", (event or "").lower())[:48],
+        "picker": str(ctx.get("picker", ""))[:60],
+        "media": str(ctx.get("media", ""))[:20],
+        "id": str(ctx.get("media_id", ""))[:80],
+        "target": str(target_id or "")[:80],
+        "count": max(0, int(count or 0)),
+        "detail": re.sub(r"[^A-Za-z0-9 ._+:-]", "", detail or "")[:100],
+    }
+    if seconds is not None:
+        rec["seconds"] = round(max(0.0, float(seconds)), 2)
+    if age_seconds is not None:
+        rec["age_h"] = round(max(0.0, float(age_seconds)) / 3600, 2)
+    if active is not None:
+        rec["active"] = bool(active)
+    _append(rec)
+
+
+def aggregate_cache(recs: list[dict]) -> dict:
+    """Headline stale-cache and next-episode prewarm effectiveness metrics."""
+    rows = [r for r in recs if r.get("kind") == "cache"]
+    by_event: dict[str, int] = {}
+    for row in rows:
+        event = row.get("event") or "unknown"
+        by_event[event] = by_event.get(event, 0) + 1
+    ready_secs = [float(r.get("seconds") or 0) for r in rows
+                  if r.get("event") == "prewarm_ready"
+                  and r.get("seconds") is not None]
+    stale_ok = by_event.get("stale_revalidate_ok", 0)
+    stale_fail = by_event.get("stale_revalidate_fail", 0)
+    stale_attempts = stale_ok + stale_fail
+    return {
+        "events": len(rows),
+        "prewarm_intents": by_event.get("prewarm_intent", 0),
+        "prewarm_ready": by_event.get("prewarm_ready", 0),
+        "prewarm_cache_hits": by_event.get("prewarm_cache_hit", 0),
+        "prewarm_timeouts": by_event.get("prewarm_wait_timeout", 0),
+        "prewarm_seconds_med": _median(ready_secs),
+        "prewarm_seconds_p90": _p90(ready_secs),
+        "stale_attempts": stale_attempts,
+        "stale_revalidated": stale_ok,
+        "stale_success_pct": (round(100 * stale_ok / stale_attempts, 1)
+                              if stale_attempts else 0.0),
+        "probes_avoided": sum(int(r.get("count") or 1) for r in rows
+                              if r.get("event") == "probe_avoided"),
+        "pack_members_verified": by_event.get("pack_member_verified", 0),
+        "pack_members_reused": by_event.get("pack_member_reused", 0),
+        "identity_rejected": by_event.get(
+            "transport_ok_identity_rejected", 0),
+        "by_event": by_event,
+    }
+
+
 def aggregate_play(recs: list[dict], key: str, min_n: int = 1) -> list[dict]:
     """Group real-playback records by identity: how often the source died, how
     often we had to switch away from it, and the real throughput/watched-fraction."""

@@ -78,11 +78,15 @@ CATALOG = [
      "Before the fast picker has verified anything, probe fast-to-verify "
      "direct debrid/HTTP links ahead of NZBs that need a mount, so a floor "
      "result lands sooner. Reverts to best-quality-first once one verifies."),
+    ("FAST_METADATA_BUDGET", "fast", "num", "4", _S,
+     "Most of the fast window metadata identity/language/runtime preparation "
+     "may use before byte probes get their turn."),
     ("PROBE_HOST_BENCH", "fast", "num", "3", "",
      "Probe failures (with no pass) before a host is skipped for the rest of "
      "that pick. 0 disables."),
     ("TOTAL_DEADLINE", "fast", "num", "55", _S,
-     "Absolute ceiling on a fast request, including probing."),
+     "Player-safe outer ceiling on a fast request. Two to ten seconds is only "
+     "the target; the picker keeps waiting for a verified playable stream."),
     ("PROBE_TTFB_MAX", "fast", "num", "12", _S,
      "Max first-byte wait before a debrid probe is a failure."),
     ("TORBOX_MAX_DOWNLOADS", "fast", "num", "3", "",
@@ -102,7 +106,7 @@ CATALOG = [
      "How long a non-empty upstream search result is shared between pickers."),
     ("RAW_NEG_TTL", "fast", "num", "90", _S,
      "How long an empty search result is reused before re-searching."),
-    ("RESULT_CACHE_TTL", "fast", "num", "7200", _S,
+    ("RESULT_CACHE_TTL", "fast", "num", "10800", _S,
      "How long a verified result list may be reused before a full re-pick. Its "
      "leader is still re-probed after CACHE_REVERIFY_AFTER on every access and "
      "the list is refreshed on play, so a long window stays honest while a "
@@ -133,15 +137,17 @@ CATALOG = [
     ("SLOW_TTFB_MAX", "slow", "num", "120", _S,
      "Foreground first-byte patience (capped by the response deadline). High "
      "= give slow high-quality sources the whole gate to prove they play."),
+    ("SLOW_VERIFIED_GRACE", "slow", "num", "20", _S,
+     "After the first playable, identity-valid slow result, how long remaining "
+     "top prospects may settle before the foreground answers."),
     ("SLOW_FINISH_TTFB_MAX", "slow", "num", "120", _S,
      "Background finisher first-byte patience — how long a slow-to-unlock "
      "high-quality source may take to hand over byte 0 and still be cached #1."),
-    ("SLOW_CONCURRENCY", "slow", "num", "16", "",
+    ("SLOW_CONCURRENCY", "slow", "num", "10", "",
      "How many streams the slow picker probes in parallel."),
-    ("SLOW_NZB_PROBES", "slow", "num", "4", "",
-     "Usenet candidates the slow picker will mount+probe per title."),
-    ("SLOW_FINISH_MAX_PROBES", "slow", "num", "24", "",
-     "Probe budget for the background 'finish' pass that keeps digging."),
+    ("SLOW_FINISH_MAX_PROBES", "slow", "num", "10", "",
+     "Top-prospect budget for the background pass that retries unfinished "
+     "leaders and upgrades the three-hour cache."),
     ("SLOW_FINISH_DEADLINE", "slow", "num", "240", _S,
      "How long the background finish pass may run."),
     ("SLOW_VIDEO_PROBE_N", "slow", "num", "4", "",

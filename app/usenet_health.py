@@ -80,6 +80,10 @@ def _content_scope(media: str | None, media_id: str | None) -> str:
     imdb = f"tt{imdb_match.group(1).lstrip('0') or '0'}"
     if kind == "movie":
         return f"movie:{imdb}"
+    if len(parts) == 1:
+        # Show-level scope for a complete-series pack. Exact episode members
+        # are still selected and probed independently before playback.
+        return f"series:{imdb}"
     if len(parts) == 2 and parts[1].strip().isdigit():
         # Season-level scope, used for season packs: the same container
         # legitimately serves every episode of its season, so its mount and

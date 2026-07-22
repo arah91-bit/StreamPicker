@@ -318,6 +318,48 @@ def outcome(source: str, media: str, media_id: str) -> dict:
         "state": "unknown", "detail": "", "finished_at": 0.0})
 
 
+def in_progress(media: str, media_id: str) -> bool:
+    """Whether any shared source search for this title is still running."""
+    return any(key[1:] == (media, media_id) and not task.done()
+               for key, task in _inflight.items())
+
+
+async def wait_complete(media: str, media_id: str, wait: float) -> bool:
+    """Wait event-driven for this title's current source searches to drain.
+
+    Tasks are shielded by ownership in this registry; timing out here merely
+    detaches the waiter and never cancels a search another picker is using.
+    The loop catches a task registered while an earlier snapshot was settling.
+    """
+    deadline = time.monotonic() + max(wait, 0.0)
+    while True:
+        tasks = [task for key, task in _inflight.items()
+                 if key[1:] == (media, media_id) and not task.done()]
+        if not tasks:
+            return True
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return False
+        _, pending = await asyncio.wait(tasks, timeout=left,
+                                        return_when=asyncio.ALL_COMPLETED)
+        if pending:
+            return False
+
+
+def invalidate(media: str, media_id: str) -> int:
+    """Drop completed URL-bearing source lists for one title.
+
+    Result URLs can be signed and expire sooner than the six-hour catalog cache.
+    A stale-result refresh uses retained release evidence to prioritize work, but
+    needs each addon to mint current URLs. In-flight work remains shared and is
+    never cancelled. Returns the number of completed cache entries removed.
+    """
+    keys = [key for key in _raw if key[1:] == (media, media_id)]
+    for key in keys:
+        _raw.pop(key, None)
+    return len(keys)
+
+
 async def get(source: str, media: str, media_id: str,
               wait: float) -> list[dict]:
     """Join the shared search and wait up to `wait` seconds for it. Returns

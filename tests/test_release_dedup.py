@@ -93,21 +93,21 @@ class SlowSliceDedupTests(unittest.TestCase):
 
     def test_wave_covers_distinct_releases_not_copies(self):
         pool = self._pool(releases=10, copies=3)   # 30 candidates, 10 files
-        wave = picker._slow_probe_slice(pool, max_probes=8, nzb_want=0)
+        wave = picker._slow_probe_slice(pool, max_probes=8)
         self.assertEqual(8, len(wave))
         idents = [picker._release_ident(s) for s in wave]
         self.assertEqual(len(idents), len(set(idents)))
 
     def test_best_copy_of_each_release_is_the_one_probed(self):
         pool = self._pool(releases=4, copies=2)
-        wave = picker._slow_probe_slice(pool, max_probes=4, nzb_want=0)
+        wave = picker._slow_probe_slice(pool, max_probes=4)
         # first copy in quality order wins for each release
         self.assertEqual([s["url"] for s in pool if s["url"].endswith("/0")],
                          [s["url"] for s in wave])
 
     def test_duplicates_fill_the_wave_when_pool_is_small(self):
         pool = self._pool(releases=3, copies=3)    # only 3 distinct releases
-        wave = picker._slow_probe_slice(pool, max_probes=6, nzb_want=0)
+        wave = picker._slow_probe_slice(pool, max_probes=6)
         self.assertEqual(6, len(wave))             # topped up with twin copies
         self.assertEqual(len({s["url"] for s in wave}), 6)
         idents = {picker._release_ident(s) for s in wave}
@@ -116,13 +116,13 @@ class SlowSliceDedupTests(unittest.TestCase):
     def test_copies_of_already_verified_releases_are_never_probed(self):
         pool = self._pool(releases=3, copies=3)
         verified_ident = picker._release_ident(pool[0])
-        wave = picker._slow_probe_slice(pool, max_probes=9, nzb_want=0,
+        wave = picker._slow_probe_slice(pool, max_probes=9,
                                         skip_idents={verified_ident})
         self.assertTrue(wave)
         self.assertNotIn(verified_ident,
                          {picker._release_ident(s) for s in wave})
 
-    def test_nzb_quota_still_honored_with_dedup(self):
+    def test_usenet_exploration_place_honored_with_dedup(self):
         online = self._pool(releases=18, copies=1)
         direct = []
         for i in range(3):
@@ -130,10 +130,43 @@ class SlowSliceDedupTests(unittest.TestCase):
                       filename=f"Movie.2024.1080p.WEB-DL-NZB{i}.mkv")
             s["_nzb_release_key"] = f"nzb:release-{i}"
             direct.append(s)
-        wave = picker._slow_probe_slice(online + direct, max_probes=16,
-                                        nzb_want=2)
+        wave = picker._slow_probe_slice(online + direct, max_probes=16)
+        # The lower-ranked lane gets one chance to prove itself without taking
+        # half of a quality-first wave.
         self.assertEqual(16, len(wave))
-        self.assertEqual(2, sum(picker._is_direct_nzb(s) for s in wave))
+        self.assertEqual(1, sum(picker._is_direct_nzb(s) for s in wave))
+
+    def test_three_lane_types_each_get_one_then_quality_fills(self):
+        def mk(name, url, i, *, nzb=False):
+            s = _copy(name, url,
+                      filename=f"Movie.2024.1080p.WEB-DL-R{i}.mkv")
+            if nzb:
+                s["_nzb_release_key"] = f"nzb:release-{i}"
+            return s
+        https = [mk("WebAddon 1080p", f"https://h.example/{i}", i)
+                 for i in range(10)]
+        debrid = [mk("[TB+] DebAddon 1080p", f"https://d.example/{i}", i + 100)
+                  for i in range(10)]
+        usenet = [mk("NZB", f"https://nzbdav.invalid/{i}", i + 200, nzb=True)
+                  for i in range(4)]
+        wave = picker._slow_probe_slice(https + debrid + usenet, max_probes=15)
+        counts = {"usenet": 0, "debrid": 0, "https": 0}
+        for s in wave:
+            counts[picker._lane_of(s)] += 1
+        # One exploratory place per lane; the other twelve follow the original
+        # quality order instead of an arbitrary equal split.
+        self.assertEqual({"usenet": 1, "debrid": 4, "https": 10}, counts)
+
+    def test_single_lane_type_gets_the_whole_wave(self):
+        pool = self._pool(releases=10, copies=1)   # https only
+        wave = picker._slow_probe_slice(pool, max_probes=6)
+        self.assertEqual(6, len(wave))
+        self.assertTrue(all(picker._lane_of(s) == "https" for s in wave))
+
+    def test_native_prowlarr_resolve_is_a_debrid_candidate(self):
+        stream = _copy("Prowlarr 1080p", "https://resolve.example/video")
+        stream["_source_key"] = picker.sources.PROWLARR
+        self.assertEqual("debrid", picker._lane_of(stream))
 
 
 class FastRaceDedupTests(unittest.IsolatedAsyncioTestCase):

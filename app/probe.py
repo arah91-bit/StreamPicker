@@ -22,7 +22,8 @@ from urllib.parse import urljoin
 
 import httpx
 
-from app import cfsolver, hlsproxy, telemetry, usenet_health, vprobe
+from app import (candidate_health, cfsolver, hlsproxy, telemetry,
+                 usenet_health, vprobe)
 
 logger = logging.getLogger("stream-picker")
 
@@ -146,6 +147,7 @@ def _too_slow(got: int, measured: float, required: float) -> bool:
 
 def _record(stream: dict, result: ProbeResult, attempt_id: str) -> None:
     telemetry.record(stream, result)
+    candidate_health.record_probe(stream, result)
     usenet_health.record_probe(stream, result, attempt_id)
 
 
@@ -566,6 +568,7 @@ async def probe_race(
     candidates: list[dict], need_bps_of, ttfb_max: float,
     want: int, concurrency: int = 8, deadline: float | None = None,
     expect_secs: float | None = None, deep_check_of=None, outcomes=None,
+    settle_after: float | None = None, settle_when=None,
 ) -> list[tuple[dict, ProbeResult]]:
     """Like probe_batch, but keeps up to `concurrency` probes in flight at once
     and returns the instant `want` have passed — every still-pending probe is
@@ -574,11 +577,19 @@ async def probe_race(
     never holds up the answer once enough fast ones have verified. Candidates are
     still *started* in preference order, so the best-quality links get first crack
     at the concurrency slots. Bounded by `deadline` (a time.monotonic() value):
-    no new probe starts past it and the wait unblocks at it."""
+    no new probe starts past it and the wait unblocks at it.
+
+    When `settle_after` is set, the first passing result that also satisfies
+    `settle_when(stream, result)` starts a short settling window. Probes keep
+    running during that window so a slightly slower, better candidate can still
+    win; stragglers are cancelled when it expires. This lets a foreground picker
+    answer after it has something verified without waiting on every dead link.
+    The default is unchanged: wait for `want`, exhaustion, or `deadline`."""
     passed: list[tuple[dict, ProbeResult]] = []
     running: dict[asyncio.Task, tuple[dict, str]] = {}
     nxt = 0
     n = len(candidates)
+    settle_deadline: float | None = None
 
     def _fill() -> None:
         nonlocal nxt
@@ -597,8 +608,12 @@ async def probe_race(
     _fill()
     try:
         while running and len(passed) < want:
-            timeout = (None if deadline is None
-                       else max(deadline - time.monotonic(), 0.0))
+            stop_at = deadline
+            if settle_deadline is not None:
+                stop_at = (settle_deadline if stop_at is None
+                           else min(stop_at, settle_deadline))
+            timeout = (None if stop_at is None
+                       else max(stop_at - time.monotonic(), 0.0))
             done, _ = await asyncio.wait(
                 set(running), timeout=timeout,
                 return_when=asyncio.FIRST_COMPLETED)
@@ -618,6 +633,17 @@ async def probe_race(
                 if r.ok:
                     logger.info(f"probe OK  [{r.ttfb:4.1f}s ttfb, {r.speed_bps/1e6:5.1f} MB/s] {label}")
                     passed.append((s, r))
+                    # Eligibility is a per-success side effect for callers such
+                    # as picker._probe_bounded, not merely the condition that
+                    # starts this timer.  Evaluate every passing result so a
+                    # superior stream that lands during the settling window is
+                    # retained.  Only the first eligible success starts the
+                    # fixed window; later successes never extend it.
+                    eligible = (settle_when(s, r)
+                                if settle_when is not None else True)
+                    if (settle_after is not None and settle_deadline is None
+                            and eligible):
+                        settle_deadline = time.monotonic() + max(settle_after, 0.0)
                 else:
                     logger.info(f"probe FAIL ({r.reason}) {label}")
             _fill()

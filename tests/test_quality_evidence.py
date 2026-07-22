@@ -83,5 +83,50 @@ class ProbeEvidenceTests(unittest.TestCase):
             self.assertNotIn(key, clean)
 
 
+class DetailLadderTests(unittest.TestCase):
+    """The sort ranks real picture detail (codec-adjusted video bitrate), not
+    labels: a starved "4K" WEBRip loses to an honest 1080p BluRay, and a
+    "REMUX" tag on a small file can't buy its way up."""
+
+    def _ranked(self, *claims):
+        streams = [_claim(name, size=size) for name, size in claims]
+        picker._annotate_quality(streams, RUNTIME)
+        return [s["name"] for s in sorted(
+            streams, key=picker._quality_key, reverse=True)]
+
+    def test_detail_ladder_remux_web_bluray_webrip(self):
+        ranked = self._ranked(
+            ("Movie 2160p WEBRip", 8_000_000_000),         # ~8.9 Mbps, starved
+            ("Movie 1080p BluRay", 12_000_000_000),        # ~13.3 Mbps
+            ("Movie 2160p WEB-DL", 16_000_000_000),        # ~17.8 Mbps
+            ("Movie 1080p BluRay REMUX", 25_000_000_000),  # ~27.8 Mbps
+            ("Movie 2160p BluRay REMUX", 60_000_000_000),  # ~66.7 Mbps
+        )
+        self.assertEqual([
+            "Movie 2160p BluRay REMUX",
+            "Movie 1080p BluRay REMUX",
+            "Movie 2160p WEB-DL",
+            "Movie 1080p BluRay",
+            "Movie 2160p WEBRip",
+        ], ranked)
+
+    def test_lying_remux_label_loses_to_honest_bluray(self):
+        # ~3.3 Mbps is no remux whatever the filename claims.
+        ranked = self._ranked(
+            ("Movie 1080p BluRay REMUX", 3_000_000_000),
+            ("Movie 1080p BluRay", 12_000_000_000),
+        )
+        self.assertEqual("Movie 1080p BluRay", ranked[0])
+
+    def test_hevc_detail_counts_more_than_raw_bits(self):
+        # 10 Mbps HEVC ≈ 17 Mbps AVC-equivalent — more real detail than the
+        # 13.3 Mbps AVC BluRay, so it leads despite the lower tier name.
+        ranked = self._ranked(
+            ("Movie 1080p BluRay", 12_000_000_000),
+            ("Movie 2160p WEB-DL HEVC", 9_000_000_000),
+        )
+        self.assertEqual("Movie 2160p WEB-DL HEVC", ranked[0])
+
+
 if __name__ == "__main__":
     unittest.main()

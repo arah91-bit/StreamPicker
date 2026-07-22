@@ -35,7 +35,7 @@ from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 import httpx
 
-from app import meta, telemetry, usenet_health
+from app import candidate_health, meta, telemetry, usenet_health
 
 logger = logging.getLogger("stream-picker")
 
@@ -536,6 +536,29 @@ def _season_pack_match(text: str, season: int, episode: int) -> bool:
     return False
 
 
+def _show_pack_match(text: str, season: int) -> bool:
+    """Whether a title explicitly names a whole-show container.
+
+    This is intentionally narrower than generic words such as ``collection``:
+    only an explicit complete-series/all-seasons marker or a season range that
+    spans the requested season qualifies. Mount-time exact-member selection is
+    still the decisive episode safety gate.
+    """
+    t = text or ""
+    if re.search(
+            r"(?<![A-Za-z0-9])(?:complete[\s._-]*(?:series|show|collection)|"
+            r"(?:series|show)[\s._-]*complete|all[\s._-]*seasons)"
+            r"(?![A-Za-z0-9])", t, re.I):
+        return True
+    for match in re.finditer(
+            r"(?<![A-Za-z0-9])S0*(\d{1,3})[\s._-]*(?:-|to|thru|through)"
+            r"[\s._-]*S0*(\d{1,3})(?!\d)", t, re.I):
+        lo, hi = sorted((int(match.group(1)), int(match.group(2))))
+        if lo <= season <= hi:
+            return True
+    return False
+
+
 def _query_text(title: str) -> str:
     """Free-text query form of an authoritative title: diacritics folded,
     apostrophes dropped, sentence punctuation spaced — the shapes indexer
@@ -562,6 +585,11 @@ def _text_queries(media: str, parts: list[str], titles: list[str],
             # match an exact SxxEyy text query; a season-level query recovers
             # them and the strict matchers keep everything else out.
             queries.append(f"{q} S{int(parts[1]):02d}")
+            # Complete-series containers are common for older shows and may
+            # carry no season token at all. This broader query runs only in the
+            # existing no-fetchable-single fallback and still passes strict
+            # title + show-pack + mounted-member identity gates.
+            queries.append(f"{q} Complete")
     return list(dict.fromkeys(queries))
 
 
@@ -632,15 +660,25 @@ async def search(media: str, media_id: str) -> list[dict]:
                 dropped += 1
                 continue
             is_pack = False
+            pack_media_id = ""
+            pack_scope = ""
             if season_episode and not _episode_match(it["title"],
                                                      *season_episode):
-                # A whole-season container is kept aside as a last resort;
-                # the per-file episode check at mount time is its safety gate.
-                if _season_pack_match(it["title"], *season_episode):
+                # Packs remain candidates alongside single episodes, but the
+                # exact per-file episode check at mount time is their safety
+                # gate. Scope a whole-show pack to IMDb and a season pack to
+                # IMDb+season so a verified mount can serve sibling episodes.
+                if _show_pack_match(it["title"], season_episode[0]):
                     is_pack = True
+                    pack_media_id = parts[0]
+                elif _season_pack_match(it["title"], *season_episode):
+                    is_pack = True
+                    pack_media_id = f"{parts[0]}:{parts[1]}"
                 else:
                     dropped += 1
                     continue
+                pack_scope = usenet_health._content_scope(
+                    media, pack_media_id)
             if expected_year:
                 years = {int(y) for y in re.findall(r"(?<!\d)((?:19|20)\d{2})(?!\d)",
                                                     it["title"])}
@@ -650,13 +688,11 @@ async def search(media: str, media_id: str) -> list[dict]:
             if not _mountable_release(it["title"]):
                 dropped += 1
                 continue
-            # A pack is the season container: key it to the season so every
-            # episode of a binge reuses one mount instead of re-importing
-            # the same multi-GB NZB, and so a broken pack is suppressed for
-            # the whole season it fails to serve.
+            # A pack is a shared container: key it to its show/season scope so
+            # sibling episodes reuse one mount and one learned health record.
             key = usenet_health.release_key(
                 it["title"], it["size"], media,
-                f"{parts[0]}:{parts[1]}" if is_pack else media_id)
+                pack_media_id if is_pack else media_id)
             legacy_key = usenet_health.release_key(it["title"], it["size"])
             if key and usenet_health.should_skip(key):
                 suppressed += 1
@@ -699,6 +735,7 @@ async def search(media: str, media_id: str) -> list[dict]:
                        }}
             if is_pack:
                 release["_nzb_pack"] = True
+                release["_nzb_pack_scope"] = pack_scope
             seen[dedup] = release
             (packs if is_pack else releases).append(release)
 
@@ -717,9 +754,9 @@ async def search(media: str, media_id: str) -> list[dict]:
             logger.info(f"nzb search {media_id}: id query yielded nothing "
                         f"usable; free-text fallback recovered "
                         f"{len(releases) - before} release(s)")
-    if not _any_fetchable(releases) and packs:
-        logger.info(f"nzb search {media_id}: no single-episode release; "
-                    f"admitting {len(packs)} season pack(s) as last resort")
+    if packs:
+        logger.info(f"nzb search {media_id}: admitting {len(packs)} "
+                    "episode-gated pack candidate(s)")
         releases.extend(packs)
     if dropped:
         logger.info(f"nzb search {media_id}: dropped {dropped} wrong-title results")
@@ -836,6 +873,14 @@ def _select_releases(releases: list[dict], limit: int,
     if limit <= 0 or not releases:
         return []
     ranked = sorted(releases, key=_priority, reverse=True)
+    ranked_packs = [r for r in ranked if r.get("_nzb_pack")]
+    ranked_singles = [r for r in ranked if not r.get("_nzb_pack")]
+    # With ordinary episode releases available, try at most one new pack in a
+    # wave: packs are valuable (especially for older shows) but importing six
+    # giant containers is exactly the kind of work that can starve playback.
+    # If packs are the only source, retain the former behavior and let the
+    # normal mount limit compare several of them.
+    ordinary_pool = ranked_singles if ranked_singles else ranked_packs
     target_4k, target_1080 = (
         (MOVIE_TARGET_4K, MOVIE_TARGET_1080)
         if media == "movie" else (TV_TARGET_4K, TV_TARGET_1080))
@@ -855,7 +900,8 @@ def _select_releases(releases: list[dict], limit: int,
         return 1 if state.get("successes", 0) else 0
 
     def tier_pool(resolution: int) -> list[dict]:
-        return [r for r in ranked if _quality(r)[:2] == (1, resolution)
+        return [r for r in ordinary_pool
+                if _quality(r)[:2] == (1, resolution)
                 and identity(r) not in chosen]
 
     def delivery_pick(resolution: int, target: int) -> dict | None:
@@ -874,17 +920,24 @@ def _select_releases(releases: list[dict], limit: int,
     add(next((r for r in ranked if known_good(r)), None))
     add(delivery_pick(2, target_1080))
     add(delivery_pick(3, target_4k))
+    if ranked_singles and not any(r.get("_nzb_pack") for r in selected):
+        # One pack gets a real opportunity even when singles exist. Prefer a
+        # previously successful mount, then resolution/reliability; its total
+        # container size is not treated as per-episode bitrate.
+        add(max(ranked_packs, key=lambda r: (
+            known_good(r), _quality(r)[1], _offer_score(r),
+            r.get("release_key") or ""), default=None))
     add(next(iter(tier_pool(3)), None))       # best-quality remux
     add(next(iter(tier_pool(2)), None))       # best remaining 1080p
 
     # Leave the final slot for low-sample exploration when possible.
     reserve = 1 if limit >= 3 else 0
-    for r in ranked:
+    for r in ordinary_pool:
         if len(selected) >= limit - reserve:
             break
         add(r)
 
-    remaining = [r for r in ranked if identity(r) not in chosen
+    remaining = [r for r in ordinary_pool if identity(r) not in chosen
                  and _quality(r)[0] and _quality(r)[1] >= 2]
     if remaining and len(selected) < limit:
         def explore_key(r: dict) -> tuple:
@@ -897,7 +950,7 @@ def _select_releases(releases: list[dict], limit: int,
 
         add(max(remaining, key=explore_key))
 
-    for r in ranked:
+    for r in ordinary_pool:
         add(r)
         if len(selected) >= limit:
             break
@@ -908,7 +961,7 @@ def _select_releases(releases: list[dict], limit: int,
     # ahead of the big encodes — but never ahead of a proven-good reuse, which
     # is both instant and top quality. The served default stays the biggest:
     # the fast picker returns this floor, the slow picker/finisher upgrade.
-    speed = _speed_pick(ranked) if limit >= 3 else None
+    speed = _speed_pick(ranked_singles) if limit >= 3 else None
     if speed is not None:
         sid = identity(speed)
         if sid not in chosen:
@@ -1820,7 +1873,7 @@ async def _mount(release: dict, cat: str, delay: float = 0,
         # range verification compares Content-Range totals exactly; the rounded
         # human-readable GB value is deliberately unsuitable for that gate.
         hints["videoSize"] = int(size)
-    return {
+    stream = {
         "name": f"NZB\n{release['title'][:60]}",
         "description": (f"Source: {source}\nSize: {gb}\n"
                         f"{release['title']}"),
@@ -1837,6 +1890,19 @@ async def _mount(release: dict, cat: str, delay: float = 0,
         "_nzb_mount_secs": round(time.monotonic() - t_start, 1),
         "_nzb_mount_reused": reused,
     }
+    if release.get("_nzb_pack"):
+        expected = release.get("_nzb_expected") or {}
+        stream.update({
+            "_nzb_pack": True,
+            "_nzb_pack_scope": release.get("_nzb_pack_scope") or "",
+            "_nzb_pack_title": str(release.get("title") or "")[:300],
+            "_nzb_pack_size": int(release.get("size") or 0),
+            "_nzb_pack_legacy_key": release.get("legacy_release_key") or "",
+            "_nzb_pack_titles": list(expected.get("titles") or [])[:8],
+            "_nzb_pack_year": expected.get("year") or 0,
+            "_nzb_pack_seeded": bool(release.get("_nzb_pack_seeded")),
+        })
+    return stream
 
 
 async def _warm_head(url: str) -> None:
@@ -1900,6 +1966,39 @@ def _refresh_out(out: list[dict], results: dict[int, dict]) -> None:
     out[:] = [results[i] for i in sorted(results)]
 
 
+def _verified_pack_releases(media_id: str) -> list[dict]:
+    """Reconstruct credential-free releases for persistent mounted-pack reuse."""
+    releases: list[dict] = []
+    for row in candidate_health.pack_seeds(media_id):
+        key = str(row.get("release_key") or "")
+        titles = [str(value) for value in (row.get("titles") or []) if value]
+        if not key.startswith("nzb:") or not titles \
+                or usenet_health.should_skip(key):
+            continue
+        releases.append({
+            "title": str(row.get("title") or ""),
+            "size": int(row.get("size") or 0),
+            "release_key": key,
+            "legacy_release_key": str(row.get("legacy_release_key") or ""),
+            # No credentialed indexer link is persisted. An existing nzbdav
+            # mount resolves immediately; if it vanished, this seed fails and
+            # the concurrently running fresh search supplies a normal offer.
+            "offers": [],
+            "_nzb_attrs_trusted": False,
+            "_nzb_attr_evidence": ["verified-pack-reuse"],
+            "_nzb_pack": True,
+            "_nzb_pack_scope": str(row.get("scope") or ""),
+            "_nzb_pack_seeded": True,
+            "_nzb_expected": {
+                "media": "series",
+                "media_id": media_id,
+                "titles": titles,
+                "year": int(row.get("year") or 0) or None,
+            },
+        })
+    return releases
+
+
 def _prune_mount_registry() -> None:
     """Evict completed lanes without letting one old active key pin the cap."""
     if len(_mount_events) <= LANE_REGISTRY_MAX:
@@ -1936,55 +2035,148 @@ def _lane_task_done(key: tuple[str, str], task: asyncio.Task) -> None:
 
 async def _run_lane(media: str, media_id: str, out: list[dict],
                     done_event: asyncio.Event) -> None:
-    """Registry-owned title job; no requesting picker owns or cancels it."""
+    """Registry-owned title job; no requesting picker owns or cancels it.
+
+    A verified show/season pack is tried from nzbdav immediately while the
+    fresh indexer search runs.  It is only a mount locator: this request must
+    still select an exact episode member and the picker must probe that member.
+    """
     lane_key = (media, media_id)
     started = time.monotonic()
     pending: dict[asyncio.Task, tuple[int, dict]] = {}
     results: dict[int, dict] = {}
     total = 0
+    failures = 0
+    search_task: asyncio.Task | None = None
     _mount_outcomes[lane_key] = {"state": "searching", "detail": "",
                                  "finished_at": 0.0}
     try:
-        releases = await search(media, media_id)
-        successful_searches = int(getattr(releases, "search_ok", 1))
-        failed_searches = int(getattr(releases, "search_failed", 0))
-        if not releases:
-            state = "failed" if successful_searches == 0 and failed_searches else "empty"
-            detail = ("all-indexers-failed" if state == "failed"
-                      else "no-eligible-releases")
-            _mount_outcomes[lane_key] = {
-                "state": state, "detail": detail,
-                "finished_at": time.monotonic()}
-            return
         cat = "movies" if media == "movie" else "tv"
         parts = media_id.split(":")
         episode = ((int(parts[1]), int(parts[2]))
                    if media != "movie" and len(parts) == 3 else None)
         cap = _prefetch_cap.get()
         limit = min(cap, MOUNT_MAX) if cap else MOUNT_MAX
-        top = _select_releases(releases, limit, media)
-        total = len(top)
-        order = []
-        for release in top:
-            best = max((o.get("indexer", "")
-                        for o in release.get("offers") or []),
-                       key=usenet_health.indexer_score, default="")
-            order.append(f"{best}:{usenet_health.indexer_score(best):.2f}")
-        if order:
-            logger.info(f"nzb lane {media_id}: mount priority {' > '.join(order)}")
-        pending = {
-            asyncio.create_task(
-                _mount_limited(release, cat, idx * MOUNT_STAGGER, episode)):
-            (idx, release)
-            for idx, release in enumerate(top)
-        }
-        _mount_outcomes[lane_key] = {
-            "state": "mounting", "detail": f"0/{total}", "finished_at": 0.0}
-        failures = 0
-        while pending:
-            done, _ = await asyncio.wait(set(pending),
-                                         return_when=asyncio.FIRST_COMPLETED)
+
+        # At most two already-verified containers get the head start. They are
+        # cheap DAV reuse checks and count against this lane's normal mount cap.
+        seeds = _select_releases(
+            _verified_pack_releases(media_id), min(2, limit), media)
+        seed_by_key = {r.get("release_key"): r for r in seeds
+                       if r.get("release_key")}
+        seed_failed: set[str] = set()
+        seed_succeeded: set[str] = set()
+        next_idx = 0
+        for release in seeds:
+            task = asyncio.create_task(
+                _mount_limited(release, cat, next_idx * MOUNT_STAGGER, episode))
+            pending[task] = (next_idx, release)
+            next_idx += 1
+        total = len(seeds)
+        if seeds:
+            _mount_outcomes[lane_key] = {
+                "state": "mounting", "detail": f"0/{total}+searching",
+                "finished_at": 0.0}
+
+        # Do not let pack reuse hide new or better releases: discovery runs at
+        # the same time and fills every remaining unique prospect slot.
+        search_task = asyncio.create_task(search(media, media_id))
+        successful_searches = 1
+        failed_searches = 0
+        while pending or search_task is not None:
+            waiting = set(pending)
+            if search_task is not None:
+                waiting.add(search_task)
+            done, _ = await asyncio.wait(
+                waiting, return_when=asyncio.FIRST_COMPLETED)
+
+            # A seed and the indexer search can finish in the same event-loop
+            # turn. Preview only those seed outcomes so fresh selection below
+            # knows whether the slot is occupied or needs a real offered retry;
+            # the common result handler still records/output-orders them once.
             for task in done:
+                item = pending.get(task)
+                if item is None or not item[1].get("_nzb_pack_seeded"):
+                    continue
+                key = item[1].get("release_key") or ""
+                try:
+                    if task.result():
+                        seed_succeeded.add(key)
+                    else:
+                        seed_failed.add(key)
+                except Exception:
+                    seed_failed.add(key)
+
+            if search_task is not None and search_task in done:
+                try:
+                    releases = search_task.result()
+                    successful_searches = int(
+                        getattr(releases, "search_ok", 1))
+                    failed_searches = int(
+                        getattr(releases, "search_failed", 0))
+                except Exception as exc:
+                    releases = []
+                    successful_searches, failed_searches = 0, 1
+                    logger.warning(f"nzb search {media_id}: "
+                                   f"{type(exc).__name__}")
+                search_task = None
+
+                # If discovery rediscovers a seeded pack, attach its live NZB
+                # offers to the running seed.  If the mount locator already
+                # failed, the normal release gets one fresh import attempt.
+                fresh: list[dict] = []
+                pending_seed_keys = {
+                    release.get("release_key")
+                    for task, (_, release) in pending.items()
+                    if task not in done and release.get("_nzb_pack_seeded")}
+                for release in releases:
+                    key = release.get("release_key")
+                    seed = seed_by_key.get(key)
+                    if seed is None:
+                        fresh.append(release)
+                        continue
+                    known = {(o.get("indexer"), o.get("link"))
+                             for o in seed.get("offers") or []}
+                    seed.setdefault("offers", []).extend(
+                        o for o in (release.get("offers") or [])
+                        if (o.get("indexer"), o.get("link")) not in known)
+                    if key in seed_failed:
+                        fresh.append(release)
+
+                occupied = len(seed_succeeded | pending_seed_keys)
+                top = _select_releases(
+                    fresh, max(limit - occupied, 0), media)
+                order = []
+                for release in top:
+                    best = max((o.get("indexer", "")
+                                for o in release.get("offers") or []),
+                               key=usenet_health.indexer_score, default="")
+                    order.append(
+                        f"{best}:{usenet_health.indexer_score(best):.2f}")
+                    task = asyncio.create_task(_mount_limited(
+                        release, cat, next_idx * MOUNT_STAGGER, episode))
+                    pending[task] = (next_idx, release)
+                    next_idx += 1
+                total += len(top)
+                if order:
+                    logger.info(f"nzb lane {media_id}: mount priority "
+                                f"{' > '.join(order)}")
+                if not pending and total == 0:
+                    state = ("failed" if successful_searches == 0
+                             and failed_searches else "empty")
+                    detail = ("all-indexers-failed" if state == "failed"
+                              else "no-eligible-releases")
+                    _mount_outcomes[lane_key] = {
+                        "state": state, "detail": detail,
+                        "finished_at": time.monotonic()}
+                    return
+                _mount_outcomes[lane_key] = {
+                    "state": "mounting", "detail": f"{len(out)}/{total}",
+                    "finished_at": 0.0}
+
+            for task in done:
+                if task is search_task or task not in pending:
+                    continue
                 idx, release = pending.pop(task)
                 try:
                     mounted = task.result()
@@ -2003,16 +2195,26 @@ async def _run_lane(media: str, media_id: str, out: list[dict],
                         reason=reason, detail=detail,
                         evidence=f"lane:{media}:{media_id}:{idx}:{detail}")
                     logger.exception("nzb mount task failed")
+                    if release.get("_nzb_pack_seeded"):
+                        seed_failed.add(release.get("release_key") or "")
                     continue
                 if mounted:
                     results[idx] = mounted
+                    if release.get("_nzb_pack_seeded"):
+                        seed_succeeded.add(release.get("release_key") or "")
+                        logger.info(f"nzb lane {media_id}: reused verified pack "
+                                    "for exact episode member")
                 else:
                     failures += 1
+                    if release.get("_nzb_pack_seeded"):
+                        seed_failed.add(release.get("release_key") or "")
             _refresh_out(out, results)
             _mount_outcomes[lane_key] = {
                 "state": "mounting",
                 "detail": f"{len(out)}/{total}", "finished_at": 0.0}
-        state = "ok" if out else "empty"
+        state = ("ok" if out else
+                 "failed" if successful_searches == 0 and failed_searches
+                 else "empty")
         detail = f"mounted={len(out)} failed={failures} total={total}"
         _mount_outcomes[lane_key] = {
             "state": state, "detail": detail,
@@ -2022,13 +2224,25 @@ async def _run_lane(media: str, media_id: str, out: list[dict],
     except asyncio.CancelledError:
         for task in pending:
             task.cancel()
+        if search_task is not None:
+            search_task.cancel()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
+        if search_task is not None:
+            await asyncio.gather(search_task, return_exceptions=True)
         _mount_outcomes[lane_key] = {
             "state": "cancelled", "detail": "lane-task-cancelled",
             "finished_at": time.monotonic()}
         raise
     except Exception as exc:
+        for task in pending:
+            task.cancel()
+        if search_task is not None:
+            search_task.cancel()
+        if pending or search_task is not None:
+            await asyncio.gather(*pending,
+                                 *([search_task] if search_task else []),
+                                 return_exceptions=True)
         reason, detail = _exception_failure(exc)
         telemetry.record_usenet_failure(
             stage="usenet-lane", decision="transient", reason=reason,

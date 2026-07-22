@@ -10,9 +10,11 @@ temperament:
                   moment it has enough. Bounded by TOTAL_DEADLINE.
 
   * pick_slow() — the *best quality* picker. Optimises for the best stream
-                  that actually plays: it waits for every source to run its
-                  course, merges *all* candidates, ranks them, and probes deep
-                  before answering. Bounded by SLOW_TOTAL_DEADLINE.
+                  that actually plays: it gives slower sources most of the
+                  request window, probes the top prospects together, and after
+                  one verifies lets the wave settle briefly before answering.
+                  Bounded by SLOW_TOTAL_DEADLINE; unfinished leaders continue
+                  in the background.
 
 Crucially they do NOT search independently. Every upstream call goes through
 app.sources, which searches each title at most once and lets both pickers (and
@@ -20,12 +22,13 @@ retries, and other viewers) join that one search. That is what keeps the slow
 picker from doubling API calls and tripping upstream rate limits — its job is
 to dig through the fast picker's search results, not to launch its own.
 
-Candidates are ranked best-quality-first before probing (resolution, then
-source tier a la TRaSH guides: Remux > BluRay > WEB-DL > WEBRip > HDTV), so
-the result is the best quality that actually plays, not just anything that
-plays.
+Candidates are ranked best-quality-first before probing — by measured video
+detail (codec-adjusted bitrate: size- and probe-derived, since resolution and
+"REMUX"/"BluRay" labels are only claims), then resolution, then source tier a
+la TRaSH guides (Remux > BluRay > WEB-DL > WEBRip > HDTV) — so the result is
+the best quality that actually plays, not just anything that plays.
 
-Whenever a deadline forces an early (unverified or partial) answer, a
+Whenever a deadline forces a checking notice or a partial verified answer, a
 background task finishes verification and caches it — a retry or the next
 household viewer gets the verified list instantly. A probe of an nzbdav-backed
 stream also has a useful side effect: it forces nzbdav to fetch the opening
@@ -41,12 +44,14 @@ import os
 import re
 import time
 from contextvars import ContextVar
+from types import SimpleNamespace
 from urllib.parse import urlsplit
 
 import httpx
 
-from app import (acquire, anime, content_identity, decode_health, library, meta,
-                 probe, reputation, sources, tbcache, telemetry,
+from app import (acquire, anime, candidate_health, content_identity,
+                 decode_health, library, meta, probe, reputation, sources,
+                 tbcache, telemetry,
                  usenet as nzb_lane, vprobe)
 
 logger = logging.getLogger("stream-picker")
@@ -66,9 +71,14 @@ ADDON_PUBLIC_URL = os.environ.get("ADDON_PUBLIC_URL",
 NOTICE_URL = os.environ.get("NOTICE_URL") or f"{ADDON_PUBLIC_URL}/notice.mp4"
 
 # The fast picker is completion-first, not clock-first: it returns immediately
-# when the first verified, language-eligible 1080p/4K source passes. This hard
-# ceiling exists only because the player kills addon requests at 60 seconds.
+# when the first verified, language-eligible 1080p/4K source passes. Two to ten
+# seconds is the user-facing target, not a stop condition. The only clock limit
+# is the player-safe outer ceiling; until then it keeps looking for one verified
+# playable source rather than falling back to an unverified candidate.
 TOTAL_DEADLINE = float(os.environ.get("TOTAL_DEADLINE", "55"))
+# Metadata is important for identity/language, but cannot consume the whole fast
+# window before a byte probe even starts. Searches already run concurrently.
+FAST_METADATA_BUDGET = float(os.environ.get("FAST_METADATA_BUDGET", "4"))
 PROBE_TTFB_MAX = float(os.environ.get("PROBE_TTFB_MAX", "12"))
 USENET_TTFB_MAX = float(os.environ.get("USENET_TTFB_MAX", "35"))
 # The hard TTFB gates above only reject sources that won't start at all. This
@@ -114,19 +124,24 @@ FAST_VERIFIED_GRACE = float(os.environ.get("FAST_VERIFIED_GRACE", "5"))
 FAST_SPEED_FIRST = os.environ.get("FAST_SPEED_FIRST", "1").strip().lower() \
     not in ("0", "false", "no", "off", "")
 PROBE_BATCH = int(os.environ.get("FAST_PROBE_BATCH", "3"))
-# Safety cap only; the normal stop condition is the first good verified source.
+# Player-safety cap only; the normal stop condition is the first good verified
+# source, however long that takes within the addon's request window.
 FAST_RACE_DEADLINE = float(os.environ.get("FAST_RACE_DEADLINE", "55"))
 CACHE_TTL = float(os.environ.get("CACHE_TTL", str(6 * 3600)))
 # Release catalogs can live for hours, but a signed playback URL must not be
-# treated as freshly verified for that long. A result list holds for a couple of
+# treated as freshly verified for that long. A result list holds for three
 # hours — long enough that a prefetched next episode survives even the longest
 # episode's playback — but its leader is re-probed on any access past the much
-# shorter freshness window below (and the whole list is refreshed on play), so a
-# stale signed URL is caught before it can reach the player.
-RESULT_CACHE_TTL = min(CACHE_TTL, float(os.environ.get("RESULT_CACHE_TTL", "7200")))
+# shorter freshness window below. Past three hours, old verified candidates are
+# retained only as revalidation/search hints; no expired proof reaches the player.
+RESULT_CACHE_TTL = min(CACHE_TTL, float(os.environ.get("RESULT_CACHE_TTL", "10800")))
 CACHE_REVERIFY_AFTER = min(
     RESULT_CACHE_TTL, float(os.environ.get("CACHE_REVERIFY_AFTER", "120")))
 CACHE_REVERIFY_TTFB = float(os.environ.get("CACHE_REVERIFY_TTFB", "8"))
+# Keep the old result list in memory for one additional day as probe hints. It
+# can never be served from this tier; each URL must pass again, while release
+# success/quality evidence survives durably for 30 days in candidate_health.
+STALE_EVIDENCE_TTL = max(CACHE_TTL, RESULT_CACHE_TTL + 24 * 3600)
 # How long a background finisher waits for the (slow) usenet search to finish.
 USENET_FINISH_WAIT = float(os.environ.get("USENET_FINISH_WAIT", "3600"))
 
@@ -151,23 +166,20 @@ SLOW_PROBE_RESERVE = float(os.environ.get("SLOW_PROBE_RESERVE", "18"))
 # at an arbitrary 35s." The gate still returns whatever verified so far — it never
 # hangs past the deadline. Pure-quality ranking then puts the best survivor #1.
 SLOW_TTFB_MAX = float(os.environ.get("SLOW_TTFB_MAX", "120"))
-# The slow picker doesn't need to probe every link — it only needs the single
-# best-quality one that *works* at #1, plus a few backups. So it probes the top
-# SLOW_MAX_PROBES *by quality*, all at once (the household has no simultaneous-
-# stream cap on its IP), and waits for that slice to settle. Because it verifies
-# the highest-quality candidates and then ranks the verified ones by quality, the
-# stream it puts first is the best quality that actually plays. Dead links drop
-# out of the slice on their own via the probe timeout; the whole pass is bounded
-# by the response/background deadline so a hung link never holds it up.
-SLOW_MAX_PROBES = int(os.environ.get("SLOW_MAX_PROBES", "16"))
-SLOW_CONCURRENCY = int(os.environ.get("SLOW_CONCURRENCY", "16"))
-# Reserve a small part of the foreground probe wave for usable direct-Usenet
-# candidates.  Otherwise a healthy 1080p NZB can sit forever below a dense page
-# of nominal 4K debrid results and never get its one chance to prove itself.
-SLOW_NZB_PROBES = max(0, int(os.environ.get("SLOW_NZB_PROBES", "4")))
+# The slow picker doesn't need to probe every link — it needs the best few
+# *prospects*. Probe about ten distinct releases, primarily in quality order,
+# while reserving one exploratory place for each available transport so label-
+# only HTTPS or a healthy NZB still gets a chance to produce measured evidence.
+SLOW_MAX_PROBES = int(os.environ.get("SLOW_MAX_PROBES", "10"))
+SLOW_CONCURRENCY = int(os.environ.get("SLOW_CONCURRENCY", "10"))
+# Once one candidate has passed both transport and identity verification, keep
+# the rest of the foreground wave alive only this much longer. This catches a
+# slightly slower superior encode without letting dead NZBs consume the full
+# response window. The background pass retries unfinished leaders patiently.
+SLOW_VERIFIED_GRACE = float(os.environ.get("SLOW_VERIFIED_GRACE", "20"))
 # The background finisher is off Nuvio's clock, so it digs a little deeper (past
 # the foreground slice) and refines the cached best-quality answer for the retry.
-SLOW_FINISH_MAX_PROBES = int(os.environ.get("SLOW_FINISH_MAX_PROBES", "24"))
+SLOW_FINISH_MAX_PROBES = int(os.environ.get("SLOW_FINISH_MAX_PROBES", "10"))
 SLOW_FINISH_DEADLINE = float(os.environ.get("SLOW_FINISH_DEADLINE", "240"))
 # Off Nuvio's clock, the finisher can be truly patient with first byte: a big
 # remux behind an uncached debrid unlock, or a usenet mount still assembling its
@@ -178,7 +190,7 @@ SLOW_FINISH_DEADLINE = float(os.environ.get("SLOW_FINISH_DEADLINE", "240"))
 SLOW_FINISH_TTFB_MAX = float(os.environ.get("SLOW_FINISH_TTFB_MAX", "120"))
 # Direct nzbdav probes honor a longer TTFB in the slow/background picker because
 # assembling the opening segments can be slow even when sustained playback is
-# excellent. Fast never waits beyond its seven-second response ceiling.
+# excellent. The fast request's player-safe outer ceiling still bounds it.
 # After the slow picker gives up and hands a title to Sonarr/Radarr, show the
 # "being added" notice fast on retries for this long (the library check still
 # overrides it the moment the download lands).
@@ -219,6 +231,10 @@ PROFILES = {
 _client = httpx.AsyncClient(timeout=None, headers={"User-Agent": "Stremio"})
 
 _cache: dict[str, tuple[float, list[dict]]] = {}
+# Expired result lists are retained up to STALE_EVIDENCE_TTL as *evidence*, never as
+# verified answers. Their top links get one bounded revalidation attempt and
+# their stable release fingerprints/quality facts warm the fresh search.
+_stale_cache: dict[str, tuple[float, list[dict]]] = {}
 _runtime_cache: dict[str, tuple[float, float]] = {}
 _background: dict[str, asyncio.Task] = {}
 # slow cache_key -> (monotonic deadline, kind) for a pending notice, where kind
@@ -625,6 +641,13 @@ def _annotate_quality(streams: list[dict], runtime: float) -> None:
     resolution (`_qbps`: true video bitrate when known, else overall) — so the
     sort key below, which has no runtime, can rank on real quality. Idempotent."""
     for s in streams:
+        # Historical media facts are stable for a release and useful for probe
+        # ordering, but never mark a fresh URL verified. A later live probe
+        # overwrites these hints with current evidence.
+        hint = candidate_health.quality_hint(s)
+        if hint:
+            _apply_probe_quality(s, SimpleNamespace(**hint), runtime)
+        s["_prior_success"] = candidate_health.prior_success(s)
         s["_qbps"] = _video_bps(s, runtime) or 0
         s["_effres"] = _effective_resolution(s, runtime)
 
@@ -675,9 +698,25 @@ def _apply_probe_evidence(s: dict, r, runtime: float) -> bool:
     rule lives in :func:`content_identity.assess`.
     """
     _apply_probe_quality(s, r, runtime)
-    _assess_stream_identity(
+    assessment = _assess_stream_identity(
         s, getattr(r, "media_secs", 0.0) or None, record=True)
-    return _identity_leader(s)
+    accepted = _identity_leader(s)
+    if accepted:
+        # A verified pack is reusable evidence, not a reusable episode URL.
+        # Persist only its credential-free mount locator; the Usenet lane will
+        # still resolve and probe an exact member for every sibling episode.
+        candidate_health.remember_verified_pack(s)
+        if s.get("_nzb_pack"):
+            telemetry.record_cache_event(
+                ("pack_member_reused" if s.get("_nzb_pack_seeded")
+                 else "pack_member_verified"), count=1)
+    else:
+        telemetry.record_cache_event(
+            "transport_ok_identity_rejected", count=1,
+            detail=(f"{s.get('_source_key') or 'unknown'}:"
+                    f"{assessment.state}:{assessment.evidence}:"
+                    f"{int(s.get('_effres') or _resolution(s) or 0)}p"))
+    return accepted
 
 
 # Slow picker only: how many of the current best candidates to ffprobe for their
@@ -712,6 +751,7 @@ async def _refine_video_bitrate(verified: list[tuple[dict, probe.ProbeResult]],
             s["_vbitrate"] = vbr
             s["_qbps"] = _video_bps(s, runtime) or 0
             s["_effres"] = _effective_resolution(s, runtime)
+            candidate_health.remember_stream_quality(s)
             label = " ".join((s.get("name") or "?").split())[:40]
             logger.info(f"vbr refine: {label} -> {vbr / 1e6:.1f} Mbps video,"
                         f" effres {s['_effres']}")
@@ -737,7 +777,7 @@ _anime_ctx: ContextVar["anime.Expectation | None"] = \
 _VERIFIED_SENTINEL = object()
 _INTERNAL_KEYS = ("_effres", "_vbitrate", "_vheight", "_vcodec", "_vcodec_real",
                   "_acodecs", "_audio_langs", "_content_kind", "_qbps",
-                  "_speed", "_ttfb",
+                  "_speed", "_ttfb", "_prior_success",
                   _VERIFIED_STATE_KEY, _NOTICE_STATE_KEY,
                   _IDENTITY_STATE_KEY, _IDENTITY_RANK_KEY,
                   _IDENTITY_EVIDENCE_KEY, _IDENTITY_TEXT_KEY,
@@ -776,7 +816,9 @@ def clean_output(streams: list[dict]) -> list[dict]:
 # ── semantic content identity ───────────────────────────────────────────────
 # A byte probe answers "does this URL play?".  It cannot answer "is this the
 # requested movie/episode?".  These helpers keep that independent identity gate
-# beside the transport gate and make its evidence the first ranking dimension.
+# beside the transport gate. The confirmed/unconfirmed state stays the first
+# ranking dimension; the finer evidence grade only breaks same-quality ties
+# (see _quality_key), so identity proof can never outrank better video.
 _IMDB_TAG_RE = re.compile(r"(?<![A-Za-z0-9])(tt\d{7,10})(?!\d)", re.I)
 _LEADING_BRACKETS_RE = re.compile(r"^\s*(?:\[[^\]\r\n]{0,100}\]\s*)+")
 _LEADING_RANK_RE = re.compile(r"^\s*(?:[\W_]*\d+\s*[·|:]\s*)", re.UNICODE)
@@ -1033,6 +1075,16 @@ def _identity_leader(s: dict) -> bool:
     return s.get(_IDENTITY_STATE_KEY) == content_identity.STRONG
 
 
+def _identity_leader_flag(s: dict) -> int:
+    """Sortable form of the _identity_leader gate: 1 when the content identity
+    is confirmed (STRONG), else 0. This is the only identity component that
+    outranks video quality — the finer 0-5 evidence grade (trusted-IMDb vs
+    canonical parse) only breaks same-quality ties, so a trusted-indexer NZB
+    can no longer float above a higher-quality debrid source on evidence
+    alone. See _quality_key."""
+    return 1 if _identity_leader(s) else 0
+
+
 # Hard-coded (burned-in) foreign subtitles — Chinese/Korean-market WEB rips
 # (a CJK title prefix like "莫离.", or tags like "Chinese-Esub"/HC/KORSUB). They
 # can't be switched off, so the household would rather not see them. DEMOTED
@@ -1201,21 +1253,44 @@ def _decode_ok(s: dict) -> int:
                                       s.get("_vcodec_real") or "") else 1
 
 
+def _detail(s: dict, qbps: float) -> float:
+    """How much real picture information the stream carries, in AVC-equivalent
+    video bits/s: the measured/estimated video bitrate corrected for codec
+    efficiency (HEVC/AV1 carry the same detail in fewer bits). This — not the
+    resolution label, not the source-tier label — is the primary quality
+    measure, because labels lie: an "1080p REMUX" tag on a 4 Mbps file is just
+    text, while the size and the probe's HLS/ffprobe findings say what the file
+    actually is. Detail re-ranks a starved "4K" WEBRip below an honest fat
+    1080p BluRay and a real REMUX (any resolution) above a leaner WEB-DL."""
+    text = " ".join(filter(None, (_stream_text(s), s.get("_vcodec"))))
+    return qbps * _codec_factor(text)
+
+
 def _quality_key(s: dict):
-    # Order: identity evidence, audio, decode-ok, clean-first, then resolution,
-    # bitrate,
-    # then source tier, then custom-format score, then size. Deliberate
+    # Order: identity leader gate, audio, decode-ok, clean-first, then video
+    # DETAIL (codec-adjusted bitrate), resolution, source tier, custom-format
+    # score, the identity evidence grade, then size. Deliberate
     # departures from Radarr's resolution→source→size order, all from the
     # household's feedback:
-    #  * decodability and clean-vs-hardsub are the TOP keys, so a release the
+    #  * identity splits in two: the confirmed/unconfirmed gate
+    #    (_identity_leader_flag) stays first — an attractive but ambiguous
+    #    release never outranks the known requested work — while the 0-5
+    #    evidence grade (trusted-IMDb vs canonical parse) drops below every
+    #    video-quality key, so a trusted-indexer NZB no longer beats a
+    #    higher-quality debrid source on evidence alone; among confirmed
+    #    streams of equal quality it still prefers the cross-validated copy;
+    #  * decodability and clean-vs-hardsub are the TOP quality keys, so a release the
     #    player provably can't open (_decode_ok) or with burned-in foreign
     #    subtitles (_hardsub) sorts below every clean one regardless of
     #    resolution — it only surfaces as a last resort;
-    #  * resolution is the bitrate-*capped* effective one (_effective_resolution),
-    #    so a starved fake/upscaled 4K can't win on nominal pixels; and
-    #  * bitrate (_qbps: true video bitrate when known, else overall) outranks the
-    #    source label, so a fat WEBRip beats a lean WEB-DL at the same resolution
-    #    instead of losing to it on the tier name alone.
+    #  * detail outranks the resolution label: a 4K WEBRip often carries fewer
+    #    real bits than a good 1080p BluRay, and a "REMUX" tag is unverifiable
+    #    text until size/probe evidence backs it. Resolution still breaks the
+    #    near-ties (more pixels hold more detail at equal bitrate) and the
+    #    bitrate-capped effective resolution (_effective_resolution) stays as a
+    #    gate so a starved fake/upscaled 4K can't claim its nominal tier; and
+    #  * the source label (remux > bluray > web-dl > …) only breaks ties within
+    #    the same detail+resolution — a name is a claim, not evidence.
     res = s.get("_effres")
     if res is None:
         res = _resolution(s)
@@ -1223,15 +1298,15 @@ def _quality_key(s: dict):
     if qbps is None:
         qbps = 0
     clean = 0 if _hardsub(s) else 1
-    # audio_ok is the very top key: a wrong-language dub (no English, no original)
-    # sorts below everything acceptable, whatever its resolution — you can't watch
-    # a 4K you don't understand.
+    # audio_ok is the top quality key under the identity gate: a wrong-language
+    # dub (no English, no original) sorts below everything acceptable, whatever
+    # its resolution — you can't watch a 4K you don't understand.
     identity_rank = s.get(_IDENTITY_RANK_KEY)
     if identity_rank is None:
         identity_rank = 5 if _identity_profile_ctx.get() is None else 1
-    return (identity_rank, _audio_ok(s), _decode_ok(s), clean, res, qbps,
-            _source_rank(s),
-            _cf_score(s), _size_bytes(s) or 0)
+    return (_identity_leader_flag(s), _audio_ok(s), _decode_ok(s), clean,
+            _detail(s, qbps), res, _source_rank(s), _cf_score(s), identity_rank,
+            _size_bytes(s) or 0)
 
 
 # ── delivery-aware ranking of *verified* streams ─────────────────────────────
@@ -1245,31 +1320,49 @@ _BAND_LOG = math.log(1 + QUALITY_BAND)
 
 
 def _qbps_bucket(qbps: float) -> int:
-    """Coarsen a bitrate into ~QUALITY_BAND-wide relative buckets, so encodes of
-    effectively-equal quality tie on this key and let measured delivery speed —
-    not a rounding-error of size — break them, while a genuinely fatter encode
-    still lands in a higher bucket and wins outright."""
+    """Coarsen a bitrate (or AVC-equivalent detail score) into ~QUALITY_BAND-wide
+    relative buckets, so encodes of effectively-equal quality tie on this key
+    and let measured delivery speed — not a rounding-error of size — break
+    them, while a genuinely fatter encode still lands in a higher bucket and
+    wins outright."""
     if qbps <= 0:
         return 0
     return round(math.log(qbps) / _BAND_LOG)
 
 
+def _probe_key(s: dict) -> tuple:
+    """Candidate-start order, distinct from final quality ordering.
+
+    A release that verified recently gets first crack only among candidates in
+    the same codec-adjusted detail band. This reuses good evidence without ever
+    letting an old success outrank a materially better encode or count as proof
+    that the candidate's current URL still plays.
+    """
+    leader, audio, decode, clean, detail, res, srank, cf, identity, size = \
+        _quality_key(s)
+    prior = int(s.get("_prior_success") or candidate_health.prior_success(s))
+    return (leader, audio, decode, clean, _qbps_bucket(detail), prior,
+            detail, res, srank, cf, identity, size)
+
+
 def _delivery_key(qkey: tuple, ttfb: float, speed: float):
     """Sort key for a *verified* stream (descending). `clean` (no burned-in
-    foreign subs) stays the very top component so a clean release always outranks
-    a hardsub one, even a slow-starting clean over a fast hardsub — the household
-    would rather wait than watch burned-in subtitles. Below that, two passes fall
-    out of one key: `good_start` sorts every prompt-starting source above every
-    slow-starting one — but when *all* survivors are slow they still rank among
-    themselves, so a slow start beats no stream. Within a start class we keep
-    quality first (resolution, then a *bucketed* bitrate so near-equal encodes
-    tie, then source tier and custom-format score) and only then fall to
-    throughput, so 'when quality is similar, pick the faster-streaming one'.
-    Exact bitrate and size are last, purely deterministic tie-breaks."""
-    identity, audio, decode, clean, res, qbps, srank, cf, size = qkey
+    foreign subs) stays the very top quality component so a clean release always
+    outranks a hardsub one, even a slow-starting clean over a fast hardsub — the
+    household would rather wait than watch burned-in subtitles. Below that, two
+    passes fall out of one key: `good_start` sorts every prompt-starting source
+    above every slow-starting one — but when *all* survivors are slow they still
+    rank among themselves, so a slow start beats no stream. Within a start class
+    we keep measured quality first (a *bucketed* video-detail score so
+    near-equal encodes tie, then resolution, source tier and custom-format
+    score), then the identity evidence grade as a same-quality tiebreak, and
+    only then fall to throughput, so 'when quality is similar, pick the
+    faster-streaming one'. Exact detail and size are last, purely deterministic
+    tie-breaks."""
+    leader, audio, decode, clean, detail, res, srank, cf, identity, size = qkey
     good_start = 1 if ttfb <= GOOD_TTFB else 0
-    return (identity, audio, decode, clean, good_start, res,
-            _qbps_bucket(qbps), srank, cf, speed, qbps, size)
+    return (leader, audio, decode, clean, good_start, _qbps_bucket(detail),
+            res, srank, cf, identity, speed, detail, size)
 
 
 def _verified_key(vr: tuple):
@@ -1285,12 +1378,13 @@ def _verified_key(vr: tuple):
 def _verified_quality_key(vr: tuple):
     """Best-all-around slow order: hard quality first, delivery inside a band."""
     s, r = vr
-    identity, audio, decode, clean, res, qbps, srank, cf, size = _quality_key(s)
+    leader, audio, decode, clean, detail, res, srank, cf, identity, size = \
+        _quality_key(s)
     ttfb = 0.0 if r is None else r.ttfb
     speed = LIBRARY_SPEED if r is None else r.speed_bps
     good_start = 1 if ttfb <= GOOD_TTFB else 0
-    return (identity, audio, decode, clean, res, _qbps_bucket(qbps),
-            good_start, speed, srank, cf, qbps, size)
+    return (leader, audio, decode, clean, _qbps_bucket(detail), res,
+            good_start, speed, srank, cf, identity, detail, size)
 
 
 def _marked_key(s: dict):
@@ -1360,6 +1454,7 @@ async def _resolve_identity_profile(
         media: str, media_id: str,
         timeout: float | None = None) -> content_identity.IdentityProfile:
     """Resolve and install the authoritative request profile, failing closed."""
+    started = time.monotonic()
     try:
         operation = meta.identity_profile(media, media_id)
         profile = (await asyncio.wait_for(operation, timeout)
@@ -1374,7 +1469,9 @@ async def _resolve_identity_profile(
             media=media, imdb_id=parts[0], aliases=(),
             season=season, episode=episode)
     _set_identity_profile(profile)
-    await _set_anime_expectation(media, media_id, profile, timeout)
+    remaining = (None if timeout is None else
+                 max(timeout - (time.monotonic() - started), 0.0))
+    await _set_anime_expectation(media, media_id, profile, remaining)
     return profile
 
 
@@ -1388,7 +1485,10 @@ async def _set_anime_expectation(
     expectation = None
     try:
         if anime.ENABLED and media != "movie" and profile.season is not None:
-            budget = min(timeout, 5.0) if timeout else 5.0
+            budget = min(timeout, 5.0) if timeout is not None else 5.0
+            if budget <= 0:
+                _anime_ctx.set(None)
+                return
             show = await asyncio.wait_for(
                 anime.resolve(media, media_id, profile.season), budget)
             if show is not None:
@@ -1520,8 +1620,16 @@ def _assemble(verified: list[tuple[dict, probe.ProbeResult | None]],
 
 def _store(key: str, streams: list[dict]) -> None:
     _cache[key] = (time.monotonic(), streams)
+    _stale_cache.pop(key, None)
     if len(_cache) > 500:
         _cache.pop(next(iter(_cache)))
+
+
+def _archive_stale(key: str, hit: tuple[float, list[dict]]) -> None:
+    """Retain an expired result as hints, never as current verification."""
+    _stale_cache[key] = hit
+    if len(_stale_cache) > 500:
+        _stale_cache.pop(next(iter(_stale_cache)))
 
 
 def invalidate(media_id: str) -> None:
@@ -1533,7 +1641,9 @@ def invalidate(media_id: str) -> None:
         return
     suffix = f":{media_id}"
     for k in [k for k in _cache if k.endswith(suffix)]:
-        _cache.pop(k, None)
+        hit = _cache.pop(k, None)
+        if hit:
+            _archive_stale(k, hit)
 
 
 def _as_verified(lib: list[dict]) -> list[tuple[dict, None]]:
@@ -1585,6 +1695,7 @@ def _cached_candidate(key: str) -> tuple[float, list[dict]] | None:
     age = time.monotonic() - hit[0]
     if age >= RESULT_CACHE_TTL:
         _cache.pop(key, None)
+        _archive_stale(key, hit)
         return None
     had_verified = any(_is_ranked(s) for s in hit[1])
     live: list[dict] = []
@@ -1606,9 +1717,109 @@ def _cached_candidate(key: str) -> tuple[float, list[dict]] | None:
     return age, normalized
 
 
+def _stale_entry(key: str) -> tuple[float, list[dict]] | None:
+    """Expired result evidence still young enough to warm a fresh decision."""
+    hit = _stale_cache.get(key)
+    if not hit:
+        return None
+    age = time.monotonic() - hit[0]
+    if age >= STALE_EVIDENCE_TTL:
+        _stale_cache.pop(key, None)
+        return None
+    return age, hit[1]
+
+
+def _schedule_cache_refresh(cache_key: str, media: str, media_id: str,
+                            profile: dict, runtime: float, slow: bool) -> None:
+    """Refresh source URLs and improve a revived stale result off-request."""
+    if cache_key in _background:
+        return
+    if slow:
+        coro = _finish_slow(cache_key, media, media_id, profile, runtime)
+    else:
+        coro = _finish_in_background(
+            cache_key, media, media_id, profile, runtime, [])
+    _background[cache_key] = asyncio.create_task(coro)
+
+
+async def _revalidate_stale(key: str, media: str, media_id: str,
+                            profile: dict, slow: bool,
+                            stale: tuple[float, list[dict]]) -> list[dict] | None:
+    """Try old proven leaders once, then continue with freshly minted URLs.
+
+    Old verification is only probe priority. Every stream returned from here has
+    passed again now; unchecked expired URLs are omitted entirely.
+    """
+    age, old_streams = stale
+    await _resolve_identity_profile(media, media_id)
+    runtime = await _runtime_seconds(media, media_id)
+    await _resolve_accept_langs(media, media_id)
+
+    formerly_verified = [_ingested_stream(s) for s in old_streams
+                         if _is_ranked(s)]
+    _annotate_identity(formerly_verified)
+    _annotate_quality(formerly_verified, runtime)
+    eligible = [s for s in formerly_verified
+                if _usable(s, profile, runtime)]
+    skipped = [s for s in eligible if candidate_health.should_skip(s)]
+    candidates = [s for s in eligible
+                  if not candidate_health.should_skip(s)][:2]
+    if skipped:
+        telemetry.record_cache_event(
+            "probe_avoided", target_id=media_id, count=len(skipped),
+            age_seconds=age, detail="stale exact-url cooldown")
+
+    # A result-list expiry must also expire URL-bearing addon responses. Keep the
+    # release evidence above, but make every source mint a current playback URL.
+    sources.invalidate(media, media_id)
+    if not candidates:
+        telemetry.record_cache_event(
+            "stale_revalidate_fail", target_id=media_id,
+            age_seconds=age, detail="no eligible stale links")
+        return None
+
+    ttfb = min(SLOW_TTFB_MAX, 20) if slow else CACHE_REVERIFY_TTFB
+    outcomes: list = []
+    passed = await probe.probe_race(
+        candidates, _need_bps_fn(runtime), ttfb,
+        want=1, concurrency=len(candidates),
+        deadline=time.monotonic() + ttfb, expect_secs=runtime,
+        deep_check_of=(lambda s: _size_bytes(s)
+                       if slow and _is_direct_nzb(s) else None),
+        outcomes=outcomes)
+    verified = [(s, r) for s, r in passed
+                if _apply_probe_evidence(s, r, runtime)]
+    if not verified:
+        telemetry.record_cache_event(
+            "stale_revalidate_fail", target_id=media_id,
+            age_seconds=age, count=len(candidates))
+        return None
+
+    streams = _assemble(
+        verified, [], None,
+        key=_verified_quality_key if slow else _verified_key)
+    _store(key, streams)
+    fast_key = key[len("slow:"):] if slow else key
+    _publish_fast_verified(fast_key, verified)
+    _schedule_cache_refresh(key, media, media_id, profile, runtime, slow)
+    telemetry.record_cache_event(
+        "stale_revalidate_ok", target_id=media_id,
+        age_seconds=age, count=len(candidates))
+    return streams
+
+
 async def _cached_pick(key: str, media: str, media_id: str, profile: dict,
                        slow: bool = False) -> list[dict] | None:
     """Serve a recent result instantly; periodically re-probe its verified #1."""
+    raw = _cache.get(key)
+    if raw and time.monotonic() - raw[0] >= RESULT_CACHE_TTL:
+        _cache.pop(key, None)
+        _archive_stale(key, raw)
+    stale = _stale_entry(key)
+    if stale:
+        return await _revalidate_stale(
+            key, media, media_id, profile, slow, stale)
+
     hit = _cached_candidate(key)
     if not hit:
         return None
@@ -1633,10 +1844,12 @@ async def _cached_pick(key: str, media: str, media_id: str, profile: dict,
     if not passed:
         logger.info(f"cache leader failed revalidation for {key}; repicking")
         invalidate(media_id)
+        sources.invalidate(media, media_id)
         return None
     if not _apply_probe_evidence(top, passed[0][1], runtime):
         logger.info(f"cache leader lost identity eligibility for {key}; repicking")
         invalidate(media_id)
+        sources.invalidate(media, media_id)
         return None
     _cache[key] = (time.monotonic(), streams)
     return streams
@@ -1747,22 +1960,17 @@ def _fast_checking_notice(cache_key: str, media: str, media_id: str,
                           profile: dict, runtime: float,
                           pool: list[dict]) -> list[dict]:
     """Fast picker's fallback when it couldn't verify a single link in its budget:
-    show the 'finding best stream' notice rather than an unverified #1, and make
-    sure the background finisher is running so the retry gets a verified answer
-    from cache. No _notice_until here — the fast race is cheap to re-run, and the
-    cached verified result overrides on the retry the moment the finisher lands."""
+    show only the controlled, playable 'finding best stream' notice — never an
+    upstream candidate that did not pass — and make sure the background finisher
+    is running so the retry gets a verified answer from cache. No _notice_until
+    here: the cached verified result overrides on retry the moment it lands."""
     if cache_key not in _background:
         _background[cache_key] = asyncio.create_task(
             _finish_in_background(cache_key, media, media_id, profile,
                                   runtime, list(pool)))
     logger.info(f"{cache_key}: no verified link in fast budget — 'checking' "
                 f"notice, finisher verifying {len(pool)} candidates in background")
-    # Ambiguous candidates remain visible as lower manual fallbacks, but the
-    # auto-picker sees the safe notice first until one earns strong identity +
-    # transport evidence.
-    lower = [_ingested_stream(s) for s in pool
-             if s.get(_IDENTITY_STATE_KEY) != content_identity.CONTRADICTION]
-    return [_notice_stream("checking"), *lower[:15]]
+    return [_notice_stream("checking")]
 
 
 # ── fast picker ─────────────────────────────────────────────────────────────
@@ -1772,15 +1980,24 @@ async def _finish_in_background(cache_key: str, media: str, media_id: str,
                                 extra: list[dict]) -> None:
     """Finish every source/probe off-request and refresh the fast cache."""
     try:
+        finish_deadline = time.monotonic() + SLOW_FINISH_DEADLINE
+
+        def left() -> float:
+            return max(finish_deadline - time.monotonic(), 0.0)
+
         fast, stremthru, mediafusion, nzb, extras = await asyncio.gather(
-            sources.get(sources.FAST, media, media_id, wait=15),
-            sources.get(sources.STREMTHRU, media, media_id, wait=45),
-            sources.get(sources.MEDIAFUSION, media, media_id, wait=60),
-            sources.get(sources.NZB, media, media_id, wait=USENET_FINISH_WAIT),
-            _gather_extras(media, media_id, wait=60),
+            sources.get(sources.FAST, media, media_id, wait=min(15, left())),
+            sources.get(sources.STREMTHRU, media, media_id, wait=min(45, left())),
+            sources.get(sources.MEDIAFUSION, media, media_id, wait=min(60, left())),
+            sources.get(sources.NZB, media, media_id, wait=min(60, left())),
+            _gather_extras(media, media_id, wait=min(60, left())),
         )
+        # Let progressive mounts add candidates, but reserve enough of the fixed
+        # background budget to probe them. USENET_FINISH_WAIT remains an upper
+        # bound, never an extra hour added on top of SLOW_FINISH_DEADLINE.
         complete_nzb = await nzb_lane.wait_complete(
-            media, media_id, USENET_FINISH_WAIT)
+            media, media_id,
+            min(USENET_FINISH_WAIT, max(left() - USENET_TTFB_MAX, 0.0)))
         if complete_nzb is not None:
             nzb = sources.normalize_nzb(complete_nzb)
         ok, _ = _merge_rank(list(extra) + list(fast), stremthru,
@@ -1793,20 +2010,20 @@ async def _finish_in_background(cache_key: str, media: str, media_id: str,
         if lib:
             lib = _eligible_library(lib, profile, runtime)
         unprobed = [s for s in ok + lib if s.get("url") not in inherited_urls]
-        unprobed.sort(key=_quality_key, reverse=True)
+        unprobed.sort(key=_probe_key, reverse=True)
         finish_slice = _slow_probe_slice(
             unprobed,
             SLOW_FINISH_MAX_PROBES, skip_idents=inherited_idents)
         probed = await _probe_bounded(
             finish_slice, runtime, USENET_TTFB_MAX, len(finish_slice),
-            time.monotonic() + SLOW_FINISH_DEADLINE)
+            finish_deadline)
         verified = _combine_verified(inherited, probed)
         _tb_autocache(media, media_id, verified, runtime)
         if verified:
             # Off-clock, so measure true video bitrate of the leaders too: the
             # cached answer a retry gets should be compression-honest, not
             # label-trusting (matters most for size-less free-addon streams).
-            await _refine_video_bitrate(probed, runtime, 45)
+            await _refine_video_bitrate(probed, runtime, min(45, left()))
             if probed:
                 _publish_fast_verified(cache_key, probed)
             vurls = {s.get("url") for s, _ in verified}
@@ -1959,9 +2176,9 @@ async def _race_fast(media: str, media_id: str, profile: dict, runtime: float,
             # fast-to-verify candidates ahead of NZB-needs-a-mount so a floor
             # result lands sooner and starts the grace timer. Stable, so quality
             # order is preserved within each class; reverts once verified.
-            probe_pool = pool
+            probe_pool = sorted(pool, key=_probe_key, reverse=True)
             if FAST_SPEED_FIRST and first_verified_at is None:
-                probe_pool = sorted(pool, key=_is_direct_nzb)
+                probe_pool = sorted(probe_pool, key=_is_direct_nzb)
             for diverse_only in (True, False):
                 for stream in (s for s in probe_pool if s.get("url") not in probed):
                     if len(running_probes) >= PROBE_BATCH:
@@ -1978,6 +2195,12 @@ async def _race_fast(media: str, media_id: str, profile: dict, runtime: float,
                     if (PROBE_HOST_BENCH and host and host not in host_ok
                             and host_fails.get(host, 0) >= PROBE_HOST_BENCH):
                         probed.add(stream["url"])
+                        continue
+                    if candidate_health.should_skip(stream):
+                        probed.add(stream["url"])
+                        telemetry.record_cache_event(
+                            "probe_avoided", target_id=media_id, count=1,
+                            detail="fast exact-url cooldown")
                         continue
                     probed.add(stream["url"])
                     if ident:
@@ -2070,7 +2293,8 @@ async def pick(media: str, media_id: str, profile_name: str = "full") -> list[di
     started = time.monotonic()
     lib_task = (asyncio.create_task(library.streams(media, media_id))
                 if library.enabled() else None)
-    streams = await _pick_online(media, media_id, profile_name, lib_task=lib_task)
+    streams = await _pick_online(
+        media, media_id, profile_name, lib_task=lib_task, started=started)
     if lib_task:
         try:
             # A ready/cached library answer is effectively free. If online has
@@ -2114,15 +2338,15 @@ async def pick(media: str, media_id: str, profile_name: str = "full") -> list[di
 
 async def _pick_online(media: str, media_id: str,
                        profile_name: str = "full",
-                       lib_task: asyncio.Task | None = None) -> list[dict]:
+                       lib_task: asyncio.Task | None = None,
+                       started: float | None = None) -> list[dict]:
+    t0 = started if started is not None else time.monotonic()
     profile = PROFILES[profile_name]
     cache_key = f"{profile_name}:{media}:{media_id}"
     hit = await _cached_pick(cache_key, media, media_id, profile)
     if hit is not None:
         logger.info(f"cache hit for {cache_key}")
         return hit
-
-    t0 = time.monotonic()
 
     def left() -> float:
         return TOTAL_DEADLINE - (time.monotonic() - t0)
@@ -2134,29 +2358,35 @@ async def _pick_online(media: str, media_id: str,
     for src in sources.search_all():
         sources.start(src, media, media_id)
 
-    # Runtime and language metadata resolve while upstream searches are already
-    # in flight. Bound cold metadata so it cannot consume the whole fast budget.
+    # Runtime and identity/language metadata resolve while upstream searches are
+    # already in flight. Bound the preparation stage so a cold metadata API does
+    # not consume the 2-10 second target window before byte verification starts.
     runtime_task = asyncio.create_task(_runtime_seconds(media, media_id))
     _accept_langs.set(None)
     _original_lang_known.set(False)
+    prep_deadline = min(t0 + FAST_METADATA_BUDGET, t0 + TOTAL_DEADLINE)
+    await _resolve_identity_profile(
+        media, media_id, timeout=max(prep_deadline - time.monotonic(), 0.05))
     try:
-        async with asyncio.timeout(max(min(left(), 8.5), 0.05)):
+        async with asyncio.timeout(max(prep_deadline - time.monotonic(), 0.05)):
             await _resolve_accept_langs(media, media_id)
     except (TimeoutError, asyncio.TimeoutError):
         _accept_langs.set(None)
         _original_lang_known.set(False)
-    # Semantic identity is a hard prerequisite for an automatic result. Resolve
-    # it while the already-started sources search; a timeout installs an exact-
-    # request but alias-empty fail-closed profile, under which only validated
-    # Newznab/Jellyfin IMDb evidence may lead.
-    await _resolve_identity_profile(
-        media, media_id, timeout=max(min(left(), 8.5), 0.05))
+    # Semantic identity is a hard prerequisite for an automatic result. Its
+    # timeout above installs an exact-request but alias-empty fail-closed profile,
+    # under which only validated Newznab/Jellyfin IMDb evidence may lead.
     try:
-        runtime = await asyncio.wait_for(
-            runtime_task, timeout=max(min(left(), 6.5), 0.05))
+        if not runtime_task.done():
+            await asyncio.wait_for(
+                asyncio.shield(runtime_task),
+                timeout=max(prep_deadline - time.monotonic(), 0.05))
+        runtime = runtime_task.result()
     except Exception:
         if not runtime_task.done():
             runtime_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await runtime_task
         runtime = 6600.0 if media == "movie" else 2400.0
     need_bps = _need_bps_fn(runtime)
 
@@ -2249,11 +2479,24 @@ def _is_direct_nzb(s: dict) -> bool:
     return str(s.get("_nzb_release_key") or "").startswith("nzb:")
 
 
+def _lane_of(s: dict) -> str:
+    """Which probe-wave lane a stream belongs to: direct-Usenet mounts, the
+    debrid lanes (comet / stremthru / mediafusion / native Prowlarr resolve,
+    plus any stream carrying a visible debrid service tag like [TB+]), and
+    everything else — free HTTP addons — in the catch-all https lane."""
+    if _is_direct_nzb(s) or s.get("_source_key") == sources.NZB:
+        return "usenet"
+    if s.get("_source_key") in (sources.FAST, sources.STREMTHRU,
+                                sources.MEDIAFUSION, sources.PROWLARR):
+        return "debrid"
+    if telemetry.debrid_tag(s.get("name") or ""):
+        return "debrid"
+    return "https"
+
+
 def _slow_probe_slice(ok: list[dict], max_probes: int,
-                      nzb_want: int = SLOW_NZB_PROBES,
                       skip_idents: set | frozenset = frozenset()) -> list[dict]:
-    """Quality-ordered probe wave — one probe per *distinct release* — with a
-    small direct-Usenet quota.
+    """Quality-first probe wave with one exploratory slot per transport lane.
 
     Several addons often carry the same file (scrapers sharing an upstream), so
     the wave takes the best copy of each release (_release_ident) first, which
@@ -2263,54 +2506,67 @@ def _slow_probe_slice(ok: list[dict], max_probes: int,
     failover evidence). `skip_idents` = releases already verified elsewhere
     (e.g. by the fast picker); their copies need no probe at all.
 
-    The quota only decides what gets *tested*. Final verified results are still
-    sorted by ``_verified_quality_key``, so admitting a lower-quality NZB to the
-    wave cannot make it the slow picker's #1 unless it genuinely ranks highest.
+    The old equal-thirds split could spend five of sixteen foreground checks on
+    much weaker candidates merely because they used another transport. Instead,
+    each available lane gets one representative and every remaining slot goes to
+    the best prospect overall. A type this install does not have consumes no
+    space. This preserves enough diversity to turn a label-only HTTPS stream into
+    measured evidence without sacrificing the quality objective.
+
+    The lanes only decide what gets *tested*. Final verified results are still
+    sorted by ``_verified_quality_key``, so admitting a lower-quality stream to
+    the wave cannot make it #1 unless it genuinely ranks highest.
     """
     limit = max(0, max_probes)
     if not ok or not limit:
         return []
-    seen_idents = {i for i in skip_idents if i}
-    selected: list[dict] = []
-    selected_urls: set[str] = set()
-    for s in ok:                       # pass 1: distinct releases, best copy each
-        if len(selected) >= limit:
-            break
-        ident = _release_ident(s)
-        if ident and ident in seen_idents:
-            continue
-        if ident:
-            seen_idents.add(ident)
-        selected.append(s)
-        selected_urls.add(s.get("url"))
-    if len(selected) < limit:          # pass 2: top up with best duplicate copies
-        for s in ok:
-            if len(selected) >= limit:
-                break
-            if s.get("url") in selected_urls:
-                continue
-            ident = _release_ident(s)
-            if ident and ident in skip_idents:
-                continue               # verified elsewhere — a probe proves nothing
-            selected.append(s)
-            selected_urls.add(s.get("url"))
-    direct = [s for s in ok if _is_direct_nzb(s)]
-    target = min(max(0, nzb_want), limit, len(direct))
-    have = sum(_is_direct_nzb(s) for s in selected)
+    cooled = [s for s in ok if candidate_health.should_skip(s)]
+    if cooled:
+        telemetry.record_cache_event(
+            "probe_avoided", count=len(cooled),
+            detail="slow exact-url cooldown")
+        ok = [s for s in ok if not candidate_health.should_skip(s)]
+    if not ok:
+        return []
+    lanes = {"usenet": [], "debrid": [], "https": []}
+    for s in ok:
+        lanes[_lane_of(s)].append(s)
+    present = [cands for cands in lanes.values() if cands]
+    # If a caller ever asks for fewer probes than there are transports, reserve
+    # the scarce slots for the lanes whose best candidate ranks highest.
+    present.sort(key=lambda cands: _quality_key(cands[0]), reverse=True)
+    present = present[:limit]
 
-    for stream in direct:
-        if have >= target:
+    seen_idents = {i for i in skip_idents if i}
+    selected_urls: set[str] = set()
+
+    def take(cands: list[dict], want: int) -> None:
+        """Best copy per distinct release from `cands`, up to `want` picks."""
+        picked = 0
+        for s in cands:
+            if picked >= want or len(selected_urls) >= limit:
+                return
+            ident = _release_ident(s)
+            if ident and ident in seen_idents:
+                continue
+            if ident:
+                seen_idents.add(ident)
+            selected_urls.add(s.get("url"))
+            picked += 1
+
+    for cands in present:              # one exploratory candidate per lane
+        take(cands, 1)
+    take(ok, limit)                    # every other slot is pure quality order
+    for s in ok:                       # still room? top up with duplicate copies
+        if len(selected_urls) >= limit:
             break
-        if stream.get("url") in selected_urls:
+        url = s.get("url")
+        if url in selected_urls:
             continue
-        replace = next((i for i in range(len(selected) - 1, -1, -1)
-                        if not _is_direct_nzb(selected[i])), None)
-        if replace is None:
-            break
-        selected_urls.discard(selected[replace].get("url"))
-        selected[replace] = stream
-        selected_urls.add(stream.get("url"))
-        have += 1
+        ident = _release_ident(s)
+        if ident and ident in skip_idents:
+            continue                   # verified elsewhere — a probe proves nothing
+        selected_urls.add(url)
 
     # Keep the original pure-quality order inside the chosen wave.
     return [s for s in ok if s.get("url") in selected_urls][:limit]
@@ -2318,14 +2574,16 @@ def _slow_probe_slice(ok: list[dict], max_probes: int,
 
 async def _probe_bounded(ok: list[dict], runtime: float, ttfb_max: float,
                          max_probes: int, hard_deadline: float,
+                         success_grace: float | None = None,
                          ) -> list[tuple[dict, probe.ProbeResult]]:
-    """Verify the top `max_probes` candidates *by quality*, all at once, and wait
-    for that slice to settle (or `hard_deadline`, a monotonic time). Probing the
-    highest-quality candidates — rather than stopping at the first few links that
-    happen to answer fastest — is what lets the caller put the genuine best
-    quality that plays at #1. Dead links fail out of the slice on their own via
-    the probe timeout; probe_race keeps every probe in flight until it settles or
-    the deadline, then cancels whatever's left. Returns the ones that verified."""
+    """Verify the top `max_probes` candidates by quality, concurrently.
+
+    Background callers leave `success_grace` unset and patiently collect the
+    entire slice. The foreground slow picker sets it: once a result has passed
+    both transport and semantic-identity checks, the remaining prospects get a
+    short settling window and then stragglers are cancelled. That returns the best
+    evidence available now without making a dead NZB dictate response latency;
+    the background finisher retries unfinished leaders with its longer budget."""
     budget = hard_deadline - time.monotonic()
     if not ok or budget <= 1:
         return []
@@ -2333,33 +2591,53 @@ async def _probe_bounded(ok: list[dict], runtime: float, ttfb_max: float,
     # probe_race owns this deadline and returns every success accumulated before
     # it.  Wrapping it in another timer at the exact same instant can cancel it
     # during cleanup and throw those already-verified successes away.
+    eligible: set[int] = set()
+
+    def settle_when(s: dict, r: probe.ProbeResult) -> bool:
+        accepted = _apply_probe_evidence(s, r, runtime)
+        if accepted:
+            eligible.add(id(s))
+        return accepted
+
     results = await probe.probe_race(
         cands, _need_bps_fn(runtime), ttfb_max,
         want=len(cands),               # collect all that pass, no early bail
         concurrency=SLOW_CONCURRENCY, deadline=hard_deadline,
         expect_secs=runtime,
-        deep_check_of=lambda s: (_size_bytes(s) if _is_direct_nzb(s) else None))
+        deep_check_of=lambda s: (_size_bytes(s) if _is_direct_nzb(s) else None),
+        settle_after=success_grace,
+        settle_when=settle_when if success_grace is not None else None)
     # Transport success is necessary but not sufficient. Only candidates whose
     # identity was already strong, or became strong through a measured-runtime
     # corroboration, enter the verified tier.
+    if success_grace is not None:
+        return [(s, r) for s, r in results if id(s) in eligible]
     return [(s, r) for s, r in results
             if _apply_probe_evidence(s, r, runtime)]
 
 
 async def _finish_slow(cache_key: str, media: str, media_id: str,
                        profile: dict, runtime: float) -> None:
-    """Let every source run fully to completion (usenet is the long one), then
-    do the deep merge/probe and cache the best-quality result for the retry."""
+    """Finish the top quality prospects off-request and cache any upgrade."""
     try:
+        finish_deadline = time.monotonic() + SLOW_FINISH_DEADLINE
+
+        def left() -> float:
+            return max(finish_deadline - time.monotonic(), 0.0)
+
         fast, stremthru, mediafusion, nzb, extras = await asyncio.gather(
-            sources.get(sources.FAST, media, media_id, wait=15),
-            sources.get(sources.STREMTHRU, media, media_id, wait=45),
-            sources.get(sources.MEDIAFUSION, media, media_id, wait=60),
-            sources.get(sources.NZB, media, media_id, wait=60),
-            _gather_extras(media, media_id, wait=60),
+            sources.get(sources.FAST, media, media_id, wait=min(15, left())),
+            sources.get(sources.STREMTHRU, media, media_id, wait=min(45, left())),
+            sources.get(sources.MEDIAFUSION, media, media_id, wait=min(60, left())),
+            sources.get(sources.NZB, media, media_id, wait=min(60, left())),
+            _gather_extras(media, media_id, wait=min(60, left())),
         )
+        # Progressive Usenet may still be mounting. Wait only inside the fixed
+        # finisher window and reserve SLOW_FINISH_TTFB_MAX for actual verification.
         complete_nzb = await nzb_lane.wait_complete(
-            media, media_id, USENET_FINISH_WAIT)
+            media, media_id,
+            min(USENET_FINISH_WAIT,
+                max(left() - SLOW_FINISH_TTFB_MAX, 0.0)))
         if complete_nzb is not None:
             nzb = sources.normalize_nzb(complete_nzb)
         ok, fallback = _merge_rank(fast, stremthru, mediafusion, nzb,
@@ -2371,7 +2649,7 @@ async def _finish_slow(cache_key: str, media: str, media_id: str,
         if lib:
             lib = _eligible_library(lib, profile, runtime)
         unprobed = [s for s in ok + lib if s.get("url") not in fast_urls]
-        unprobed.sort(key=_quality_key, reverse=True)
+        unprobed.sort(key=_probe_key, reverse=True)
         # Off Nuvio's clock, so dig deeper by quality than the foreground slice
         # AND wait patiently (SLOW_FINISH_TTFB_MAX) for slow-to-start high-quality
         # sources, so they survive verification and can take #1 on the retry.
@@ -2380,8 +2658,8 @@ async def _finish_slow(cache_key: str, media: str, media_id: str,
             SLOW_FINISH_MAX_PROBES, skip_idents=fast_idents)
         verified = await _probe_bounded(
             finish_slice, runtime, SLOW_FINISH_TTFB_MAX, len(finish_slice),
-            time.monotonic() + SLOW_FINISH_DEADLINE)
-        await _refine_video_bitrate(verified, runtime, 45)
+            finish_deadline)
+        await _refine_video_bitrate(verified, runtime, min(45, left()))
         all_verified = _combine_verified(fast_verified, verified)
         _tb_autocache(media, media_id, all_verified, runtime)
         if all_verified:
@@ -2402,6 +2680,10 @@ async def _finish_slow(cache_key: str, media: str, media_id: str,
                 media, media_id, [fast, stremthru, mediafusion, nzb]):
             _notice_until[cache_key] = (time.monotonic() + NOTICE_TTL, "theatrical")
             logger.info(f"{cache_key}: full search — no proper release out yet")
+            return
+        if nzb_lane.in_progress(media, media_id):
+            logger.info(f"{cache_key}: background budget ended while direct "
+                        "usenet was still mounting; leaving acquisition for retry")
             return
         if acquire.enabled_for(media):
             if await acquire.request(media, media_id):
@@ -2461,6 +2743,7 @@ async def _no_source(cache_key: str, media: str, media_id: str,
 
 async def pick_slow(media: str, media_id: str,
                     profile_name: str = "full") -> list[dict]:
+    t0 = time.monotonic()
     profile = PROFILES[profile_name]
     cache_key = f"slow:{profile_name}:{media}:{media_id}"
     hit = await _cached_pick(cache_key, media, media_id, profile, slow=True)
@@ -2500,7 +2783,6 @@ async def pick_slow(media: str, media_id: str,
         logger.info(f"{cache_key}: still pending ({nu[1]}), showing notice")
         return [_notice_stream(nu[1])]
 
-    t0 = time.monotonic()
     # Hard ceiling on the whole response, kept safely inside Nuvio's 60s addon
     # timeout. Everything below stays within this; anything unfinished is left
     # to the background finisher and served from cache on the retry.
@@ -2557,15 +2839,14 @@ async def pick_slow(media: str, media_id: str,
     if lib:
         lib = _eligible_library(lib, profile, runtime)
     unprobed = [s for s in ok + lib if s.get("url") not in fast_urls]
-    unprobed.sort(key=_quality_key, reverse=True)
-    inherited_nzb = sum(_is_direct_nzb(s) for s, _ in fast_verified)
+    unprobed.sort(key=_probe_key, reverse=True)
     probe_slice = _slow_probe_slice(
-        unprobed, SLOW_MAX_PROBES,
-        max(SLOW_NZB_PROBES - inherited_nzb, 0), skip_idents=fast_idents)
+        unprobed, SLOW_MAX_PROBES, skip_idents=fast_idents)
     verified = await _probe_bounded(
         probe_slice,
         runtime, min(SLOW_TTFB_MAX, max(left(), 5)),
-        len(probe_slice), resp_deadline - 3)
+        len(probe_slice), resp_deadline - 3,
+        success_grace=SLOW_VERIFIED_GRACE)
     distinct = len({_release_ident(s) or s.get("url") for s in ok})
     logger.info(f"{cache_key}: merged fast {len(fast)} / stremthru {len(stremthru)} /"
                 f" mf {len(mediafusion)} / nzb {len(nzb)} / extras {len(extras)}"
@@ -2592,9 +2873,9 @@ async def pick_slow(media: str, media_id: str,
 
     # The slow picker's whole job is the *best* source, so whenever candidates
     # remain unprobed, keep digging in the background even if we can already
-    # answer with a verified stream (a fast-picker inherit, or the first few
-    # probes). The finisher waits out every source and caches the best-quality
-    # result for the retry / the cache.
+    # answer with a verified stream. The foreground settling window deliberately
+    # stops waiting on stragglers; the finisher retries those leaders with its
+    # patient budget and caches any upgrade for three hours.
     if cache_key not in _background:
         _background[cache_key] = asyncio.create_task(
             _finish_slow(cache_key, media, media_id, profile, runtime))
@@ -2628,7 +2909,9 @@ async def pick_slow(media: str, media_id: str,
 
 
 # ── next-episode prefetch ────────────────────────────────────────────────────
-_prefetching: set[str] = set()
+# (operation, profile, target episode): mobile/full households do not suppress
+# one another, and a force-refresh cannot collide with E+1 desired state.
+_prefetching: set[tuple[str, str, str]] = set()
 
 
 async def _next_episode(media_id: str) -> str | None:
@@ -2649,9 +2932,9 @@ async def _next_episode(media_id: str) -> str | None:
     return f"{base}:{se[0]}:{se[1]}" if se else None
 
 
-_PREFETCH_SETTLE = 180.0
-_PREFETCH_QUIESCE_POLL = 5.0
 _PREFETCH_QUIESCE_MAX = 600.0
+_PREFETCH_RETRY_DELAY = 120.0
+_PREFETCH_RETRY_MAX = 1
 
 
 def _episode_work_active(media: str, media_id: str) -> bool:
@@ -2665,13 +2948,110 @@ def _episode_work_active(media: str, media_id: str) -> bool:
     if any(key.endswith(suffix) and not task.done()
            for key, task in _background.items()):
         return True
-    return nzb_lane.in_progress(media, media_id)
+    return (sources.in_progress(media, media_id)
+            or nzb_lane.in_progress(media, media_id))
+
+
+async def _wait_episode_idle(media: str, media_id: str) -> tuple[bool, bool]:
+    """Wait on real completion objects, not a fixed delay/polling loop.
+
+    Returns ``(waited, timed_out)``. New work registered while the first task
+    snapshot settles is caught by the loop. The safety cap prevents one broken
+    provider task from suppressing E+1 forever; normal picker/usenet work is
+    already bounded well below it.
+    """
+    deadline = time.monotonic() + _PREFETCH_QUIESCE_MAX
+    waited = False
+    suffix = f":{media}:{media_id}"
+    while _episode_work_active(media, media_id):
+        waited = True
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return waited, True
+        tasks = [task for key, task in _background.items()
+                 if key.endswith(suffix) and not task.done()]
+        if tasks:
+            _, pending = await asyncio.wait(
+                tasks, timeout=left, return_when=asyncio.ALL_COMPLETED)
+            if pending:
+                return waited, True
+        left = deadline - time.monotonic()
+        if sources.in_progress(media, media_id) and left > 0:
+            await sources.wait_complete(media, media_id, left)
+        left = deadline - time.monotonic()
+        if nzb_lane.in_progress(media, media_id) and left > 0:
+            await nzb_lane.wait_complete(media, media_id, left)
+    return waited, False
+
+
+def _cache_ready(key: str) -> bool:
+    hit = _cache.get(key)
+    return bool(hit and time.monotonic() - hit[0] < CACHE_REVERIFY_AFTER
+                and any(_is_ranked(s) for s in hit[1]))
+
+
+async def _wait_target_ready(keys: tuple[str, ...], media: str,
+                             media_id: str, wait: float) -> bool:
+    """Keep a prewarm intent alive while its detached finisher works."""
+    deadline = time.monotonic() + max(wait, 0.0)
+    suffix = f":{media}:{media_id}"
+    while not any(_cache_ready(key) for key in keys):
+        tasks = [task for key, task in _background.items()
+                 if key.endswith(suffix) and not task.done()]
+        if not tasks:
+            return False
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return False
+        done, _ = await asyncio.wait(
+            tasks, timeout=left, return_when=asyncio.FIRST_COMPLETED)
+        if not done:
+            return False
+    return True
+
+
+def note_playback(media: str, media_id: str, picker_label: str,
+                  release_sig: str = "") -> None:
+    """Let real proxy startup refresh the exact cache entry that supplied it.
+
+    This replaces the old foreground-current-episode re-search. Only the exact
+    selected, still-ranked release can refresh the timestamp; an unknown identity
+    cannot make an unrelated stale leader current.
+    """
+    if not release_sig:
+        return
+    profile = "mobile" if "mob" in (picker_label or "") else "full"
+    slow = "slow" in (picker_label or "")
+    key = (f"slow:{profile}:{media}:{media_id}" if slow
+           else f"{profile}:{media}:{media_id}")
+    hit = _cached_candidate(key)
+    if not hit:
+        return
+    _, streams = hit
+    selected = next((s for s in streams
+                     if _is_ranked(s) and telemetry.signature(s) == release_sig),
+                    None)
+    if selected is None:
+        return
+    ordered = [selected] + [s for s in streams if s is not selected]
+    rank = 0
+    normalized = []
+    for stream in ordered:
+        if _is_ranked(stream):
+            rank += 1
+            stream = _renumber(stream, rank)
+        normalized.append(stream)
+    _cache[key] = (time.monotonic(), normalized)
+    telemetry.record_cache_event(
+        "playback_cache_touch", target_id=media_id, count=1)
 
 
 async def _prepare_and_cache(media: str, playing_id: str, target_id: str,
                              picker_label: str,
                              *, invalidate_first: bool, both: bool,
-                             prefetch_cap: bool = False) -> None:
+                             prefetch_cap: bool = False,
+                             started_at: float | None = None,
+                             ) -> tuple[list[str], float | None]:
     """Shared core for prefetch (next episode) and refresh (this episode).
 
     Waits for the *playing* episode's own search work (``playing_id``) to drain
@@ -2686,18 +3066,17 @@ async def _prepare_and_cache(media: str, playing_id: str, target_id: str,
     (or a repeat) pick reuses the first one's work."""
     profile = "mobile" if "mob" in (picker_label or "") else "full"
     slow = "slow" in (picker_label or "")
-    # Let playback settle first.  The trigger fires at the stream's very first
-    # byte — the moment the start gate is measuring throughput — and a probe
-    # wave there can strangle that measurement into 'too slow' failures (live
-    # incident 2026-07-15: 41s of 502s while a slow merge probed 65 candidates).
-    # The next episode is needed in twenty minutes, not twenty seconds.
-    await asyncio.sleep(_PREFETCH_SETTLE)
-    deadline = time.monotonic() + _PREFETCH_QUIESCE_MAX
-    while (_episode_work_active(media, playing_id)
-           and time.monotonic() < deadline):
-        await asyncio.sleep(_PREFETCH_QUIESCE_POLL)
+    _waited, timed_out = await _wait_episode_idle(media, playing_id)
+    if timed_out:
+        telemetry.record_cache_event(
+            "prewarm_wait_timeout", target_id=target_id,
+            seconds=_PREFETCH_QUIESCE_MAX)
     if invalidate_first:
         invalidate(target_id)
+        suffix = f":{target_id}"
+        for key in [key for key in _stale_cache if key.endswith(suffix)]:
+            _stale_cache.pop(key, None)
+        sources.invalidate(media, target_id)
     # Attribute these probes to the episode being prepped, not the one playing.
     telemetry.request_ctx.set({"media": media, "media_id": target_id,
                                "picker": (picker_label or "") + "/prefetch"})
@@ -2714,6 +3093,7 @@ async def _prepare_and_cache(media: str, playing_id: str, target_id: str,
     lane_scope = (nzb_lane.prefetch_scope() if prefetch_cap
                   else contextlib.nullcontext())
     cached = []
+    first_ready: float | None = None
     with lane_scope:
         for kind, one_pick in pickers:
             streams = await one_pick(media, target_id, profile)
@@ -2727,51 +3107,109 @@ async def _prepare_and_cache(media: str, playing_id: str, target_id: str,
                 logger.info(f"prefetch: {target_id} still {state} ({kind}); "
                             f"not caching")
                 continue
+            if not any(_is_ranked(s) for s in streams):
+                logger.info(f"prefetch: no verified stream for {target_id} "
+                            f"({kind}); not caching")
+                continue
             _store(f"slow:{profile}:{media}:{target_id}" if kind == "slow"
                    else f"{profile}:{media}:{target_id}", streams)
+            if first_ready is None and started_at is not None:
+                first_ready = time.monotonic() - started_at
             top = " ".join((streams[0].get("name") or "").split())[:40]
             cached.append(f"{kind} #1 {top!r}")
     if cached:
         logger.info(f"prefetch: cached {target_id} — " + "; ".join(cached))
+    return cached, first_ready
 
 
 async def prefetch_next(media: str, media_id: str, picker_label: str) -> None:
     """Search-and-cache episode E+1 the moment E starts playing, so opening the
     next episode is an instant cache hit with a verified #1 on either addon.
     Runs both pickers, viewer's first. Best-effort, deduped per next-episode id."""
+    started = time.monotonic()
     nxt = await _next_episode(media_id)
-    if not nxt or nxt in _prefetching:
+    if not nxt:
         return
-    _prefetching.add(nxt)
+    profile = "mobile" if "mob" in (picker_label or "") else "full"
+    job = ("next", profile, nxt)
+    active = _episode_work_active(media, media_id)
+    telemetry.record_cache_event(
+        "prewarm_intent", target_id=nxt, active=active)
+    if job in _prefetching:
+        telemetry.record_cache_event(
+            "prewarm_join", target_id=nxt, active=active)
+        return
+    fast_key = f"{profile}:{media}:{nxt}"
+    slow_key = f"slow:{profile}:{media}:{nxt}"
+    if _cache_ready(fast_key) and _cache_ready(slow_key):
+        telemetry.record_cache_event(
+            "prewarm_cache_hit", target_id=nxt, seconds=0)
+        return
+    _prefetching.add(job)
     try:
-        await _prepare_and_cache(media, media_id, nxt, picker_label,
-                                 invalidate_first=False, both=True,
-                                 prefetch_cap=True)
+        ready_keys = ((slow_key, fast_key) if "slow" in (picker_label or "")
+                      else (fast_key, slow_key))
+        for attempt in range(_PREFETCH_RETRY_MAX + 1):
+            cached, ready = await _prepare_and_cache(
+                media, media_id, nxt, picker_label,
+                invalidate_first=False, both=True, prefetch_cap=True,
+                started_at=started)
+            if cached:
+                telemetry.record_cache_event(
+                    "prewarm_ready", target_id=nxt,
+                    seconds=(ready if ready is not None
+                             else time.monotonic() - started),
+                    count=len(cached), detail=f"attempt {attempt + 1}")
+                return
+            if await _wait_target_ready(
+                    ready_keys, media, nxt, SLOW_FINISH_DEADLINE):
+                telemetry.record_cache_event(
+                    "prewarm_ready", target_id=nxt,
+                    seconds=time.monotonic() - started, count=1,
+                    detail=f"background attempt {attempt + 1}")
+                return
+            if attempt < _PREFETCH_RETRY_MAX:
+                telemetry.record_cache_event(
+                    "prewarm_retry", target_id=nxt,
+                    seconds=time.monotonic() - started,
+                    detail=f"attempt {attempt + 2}")
+                await asyncio.sleep(_PREFETCH_RETRY_DELAY)
+                if any(_cache_ready(key) for key in ready_keys):
+                    telemetry.record_cache_event(
+                        "prewarm_ready", target_id=nxt,
+                        seconds=time.monotonic() - started, count=1,
+                        detail="became ready during backoff")
+                    return
+                # Refresh URL-bearing catalogs for the retry; durable release and
+                # exact-link health evidence remains intact.
+                sources.invalidate(media, nxt)
+        telemetry.record_cache_event(
+            "prewarm_exhausted", target_id=nxt,
+            seconds=time.monotonic() - started)
     except Exception:
         logger.exception(f"prefetch: failed for {media_id}")
     finally:
-        _prefetching.discard(nxt)
+        _prefetching.discard(job)
 
 
 async def refresh(media: str, media_id: str, picker_label: str) -> None:
-    """Re-run and re-cache *this* episode's own search when it starts playing.
+    """Explicit force-refresh retained for callers/admin tools.
 
-    Because a result list now lives for RESULT_CACHE_TTL (a couple of hours), a
-    prefetched — or simply re-watched — episode can be opened off a list whose
-    signed links are hours old. This drops that stale list and re-searches, so a
-    return to the list (or the sibling addon) gets freshly-verified links, and
-    it re-chains the next-episode prefetch. Only the viewer's own picker is
-    re-run, to stay clear of the playing stream's probe budget. Deduped per id."""
-    if not media_id or media_id in _prefetching:
+    Normal playback now proves the selected current link and prioritizes E+1;
+    it no longer burns bandwidth re-searching an episode that is already playing.
+    """
+    profile = "mobile" if "mob" in (picker_label or "") else "full"
+    job = ("refresh", profile, media_id)
+    if not media_id or job in _prefetching:
         return
-    _prefetching.add(media_id)
+    _prefetching.add(job)
     try:
         await _prepare_and_cache(media, media_id, media_id, picker_label,
                                  invalidate_first=True, both=False)
     except Exception:
         logger.exception(f"refresh: failed for {media_id}")
     finally:
-        _prefetching.discard(media_id)
+        _prefetching.discard(job)
 
 
 async def shutdown() -> None:
@@ -2783,4 +3221,5 @@ async def shutdown() -> None:
         await asyncio.gather(*tasks, return_exceptions=True)
     _background.clear()
     _acquire_tasks.clear()
+    candidate_health.flush()
     await _client.aclose()

@@ -94,11 +94,11 @@ SETTINGS = [
          label="Fast picker probe budget",
          desc="Most streams verify in the first wave; a bigger budget helps "
               "obscure titles at the cost of a slower worst case."),
-    dict(key="SLOW_MAX_PROBES", group="picking", type="number", default="16",
+    dict(key="SLOW_MAX_PROBES", group="picking", type="number", default="10",
          min=4, max=48, step=2, unit="",
          label="Quality picker probe budget",
-         desc="The slow picker probes only the top of its quality ranking. "
-              "Raise to dig deeper when top releases keep failing."),
+         desc="Top distinct prospects checked by the slow picker. One place is "
+              "reserved per available transport; the rest stay quality-first."),
     dict(key="OMDB_DAILY_BUDGET", group="picking", type="number",
          default="750", min=0, max=900, step=50, unit="calls/day",
          label="OMDb daily budget",
@@ -108,8 +108,8 @@ SETTINGS = [
     dict(key="FAST_RACE_DEADLINE", group="picking", type="number",
          default="55", min=10, max=90, step=5, unit="s",
          label="Fast picker deadline",
-         desc="Hard cap on how long the fast picker may hold a request "
-              "before answering with what it has."),
+         desc="Player-safe outer cap. The normal stop condition is one "
+              "verified playable stream, not the 2-10 second speed target."),
     dict(key="MAX_BITRATE_MBPS", group="picking", type="number",
          default="0", min=0, max=120, step=5, unit=" Mbps",
          zero_label="Unlimited", label="Max bitrate",
@@ -273,7 +273,7 @@ _INT_KEYS = {
     "BUFFER_CACHE_GB", "BUFFER_AHEAD_GB", "VERIFIED_WANT", "MAX_PROBES",
     "SLOW_MAX_PROBES", "FAST_ENOUGH_4K", "FAST_ENOUGH_1080",
     "FAST_PROBE_BATCH", "PROBE_HOST_BENCH", "SLOW_CONCURRENCY",
-    "SLOW_NZB_PROBES", "SLOW_FINISH_MAX_PROBES", "SLOW_VIDEO_PROBE_N",
+    "SLOW_FINISH_MAX_PROBES", "SLOW_VIDEO_PROBE_N",
     "UNPROVEN_MAX_RES", "PROXY_WRAP_MAX", "PROXY_MAX_FAILOVER",
     "PLAYER_REJECT_STARTS", "DECODE_BAD_REJECTS", "PROXY_SESSION_MAX_BYTES",
     "PROXY_SESSION_MAX", "HLS_BUFFER_CONCURRENCY", "TWIN_SPLICE_MAX",

@@ -433,6 +433,54 @@ class MountSpeedupTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(usenet.MOUNT_MAX, captured["limit"])
 
+    async def test_verified_pack_resolves_sibling_before_fresh_search_finishes(
+            self) -> None:
+        search_done = False
+        mount_observations: list[bool] = []
+        key = "nzb:" + "c" * 64
+        seed = {
+            "scope": "series:tt1234567:1", "release_key": key,
+            "legacy_release_key": "nzb:" + "d" * 64,
+            "title": "Example.Show.S01.COMPLETE.1080p.WEB-DL",
+            "size": 40_000_000_000, "titles": ["Example Show"],
+            "year": 2024,
+        }
+
+        async def delayed_search(*_args):
+            nonlocal search_done
+            await asyncio.sleep(0.04)
+            search_done = True
+            return []
+
+        async def reused_mount(release, _cat, _delay, episode):
+            mount_observations.append(search_done)
+            self.assertEqual((1, 3), episode)
+            self.assertEqual([], release["offers"])
+            return {
+                "name": "NZB", "url": "https://nzbdav.invalid/e3",
+                "behaviorHints": {
+                    "filename": "Example.Show.S01E03.1080p.WEB-DL.mkv"},
+                "_nzb_release_key": key, "_nzb_pack": True,
+            }
+
+        out: list[dict] = []
+        event = asyncio.Event()
+        with mock.patch.object(
+                usenet.candidate_health, "pack_seeds", return_value=[seed]), \
+                mock.patch.object(usenet.usenet_health, "should_skip",
+                                  return_value=False), \
+                mock.patch.object(usenet.usenet_health, "status",
+                                  return_value={"successes": 1}), \
+                mock.patch.object(usenet, "search", new=delayed_search), \
+                mock.patch.object(usenet, "_mount_limited", new=reused_mount):
+            await usenet._run_lane(
+                "series", "tt1234567:1:3", out, event)
+
+        self.assertEqual([False], mount_observations)
+        self.assertEqual(["https://nzbdav.invalid/e3"],
+                         [stream["url"] for stream in out])
+        self.assertTrue(event.is_set())
+
     async def test_prefetch_disabled_starts_no_new_lane(self) -> None:
         with mock.patch.object(usenet, "PREFETCH_MOUNT", False), \
                 mock.patch.object(usenet, "enabled", return_value=True), \

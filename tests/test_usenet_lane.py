@@ -32,7 +32,7 @@ class EpisodeSafetyTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(entries[1], usenet._pick_video(entries, (1, 2)))
 
-    async def test_search_drops_wrong_episode_pack_and_wrong_title(self):
+    async def test_search_keeps_gated_pack_but_drops_wrong_episode_and_title(self):
         rows = [
             {"title": "Example.Show.S01E02.1080p.WEB-DL-GOOD",
              "size": 4_000_000_000, "link": "https://indexer/good",
@@ -55,8 +55,11 @@ class EpisodeSafetyTests(unittest.IsolatedAsyncioTestCase):
               patch("app.usenet_health.status", return_value={}),
               patch("app.usenet_health.indexer_score", return_value=0.5)):
             found = await usenet.search("series", "tt1234567:1:2")
-        self.assertEqual(["Example.Show.S01E02.1080p.WEB-DL-GOOD"],
-                         [r["title"] for r in found])
+        self.assertEqual({"Example.Show.S01E02.1080p.WEB-DL-GOOD",
+                          "Example.Show.S01.COMPLETE.2160p-WRONG"},
+                         {r["title"] for r in found})
+        pack = next(r for r in found if r.get("_nzb_pack"))
+        self.assertEqual("series:tt1234567:1", pack["_nzb_pack_scope"])
 
     async def test_search_rejects_contradictory_newznab_identity_attrs(self):
         rows = [

@@ -325,12 +325,19 @@ def render(recs: list[dict], blocklist: list[dict],
     switched = sum(1 for r in plays if r.get("switched"))
     switch_pct = round(100 * switched / len(plays), 1) if plays else 0.0
     n_blocked = sum(1 for b in blocklist if b["blocked"])
+    cache = telemetry.aggregate_cache(recs)
     tiles = [
         ("probes logged", len(probes)),
         ("probe fail rate", f"{fail_pct}%"),
         ("streams played", len(plays)),
         ("auto-switched", f"{switch_pct}%"),
         ("blocked sources", n_blocked),
+        ("E+1 ready", cache["prewarm_ready"]),
+        ("E+1 ready median", f"{cache['prewarm_seconds_med']}s"),
+        ("stale links revived", f"{cache['stale_success_pct']}%"),
+        ("dead probes avoided", cache["probes_avoided"]),
+        ("pack members reused", cache["pack_members_reused"]),
+        ("playable identity rejects", cache["identity_rejected"]),
     ]
     tile_html = "".join(
         f"<div class='tile'><div class='v'>{_esc(v)}</div>"
@@ -352,6 +359,10 @@ def render(recs: list[dict], blocklist: list[dict],
 <p class="sub">{_esc(span)} · playback numbers are ground truth (bytes reaching the
 device via the proxy); probe numbers are our server's estimate. Worst first.</p>
 <div class="tiles">{tile_html}</div>
+<div class="note">Next-episode readiness: {cache['prewarm_cache_hits']} requests were
+already warm; completed prewarms took p90 {cache['prewarm_seconds_p90']}s.
+Stale-link revival is a live re-probe, never trust carried across the three-hour
+URL window ({cache['stale_revalidated']}/{cache['stale_attempts']} passed).</div>
 {_blocklist_table(blocklist)}
 {_decode_table()}
 {_nzb_indexer_table()}

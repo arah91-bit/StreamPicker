@@ -352,16 +352,11 @@ def _note_segment(token: str, entry: dict, st: dict, size: int) -> None:
     if st["segs"] == 3 and not st["credited"]:
         st["credited"] = True
         # A series episode is really playing over HLS: prep the next episode
-        # exactly like the byte-range path does at its first serve.  Lazy
+        # exactly like the byte-range path does after its start gate. Lazy
         # import — proxy imports this module at load time.
         from app import proxy as _pxy
-        if (_pxy.PREFETCH_NEXT and ":" in (entry.get("id") or "")
-                and not entry.get("nextfetched")):
-            entry["nextfetched"] = True
-            task = asyncio.create_task(_pxy._fire_prefetch(
-                entry["id"], entry.get("picker", "")))
-            _pxy._bg_tasks.add(task)
-            task.add_done_callback(_pxy._bg_tasks.discard)
+        _pxy._schedule_prefetch(
+            entry, (st.get("cand") or {}).get("sig", ""))
         ac, vc = entry.get("_hlscodecs") or ([], "")
         if ac or vc:
             decode_health.record_play(ac, vc)

@@ -136,24 +136,69 @@ class SeriesIdentityTests(unittest.TestCase):
         self.assertEqual(identity.CONTRADICTION, identity.classify(
             self.office_uk, "The.Office.2005.S01E01.1080p.WEB-DL.mkv"))
 
-    def test_exact_episode_plus_trusted_imdb_can_resolve_yearless_title(self):
+    def test_exact_title_and_episode_are_strong_without_repeating_show_year(self):
         text = "The.Office.S01E01.1080p.WEB-DL.mkv"
-        self.assertEqual(identity.COMPATIBLE,
+        self.assertEqual(identity.STRONG,
                          identity.classify(self.office_uk, text))
         self.assertEqual(identity.STRONG, identity.classify(
             self.office_uk, text, trusted_imdb=True))
 
-    def test_wrong_episode_season_and_multi_episode_are_contradictions(self):
+    def test_wrong_episode_and_season_are_contradictions(self):
         wrong = (
             "The.Office.UK.S01E02.1080p.WEB-DL.mkv",
             "The.Office.UK.S02E01.1080p.WEB-DL.mkv",
-            "The.Office.UK.S01E01-E03.1080p.WEB-DL.mkv",
-            "The.Office.UK.S01E01E02.1080p.WEB-DL.mkv",
         )
         for text in wrong:
             with self.subTest(text=text):
                 self.assertEqual(identity.CONTRADICTION,
                                  identity.classify(self.office_uk, text))
+
+    def test_pack_and_multi_episode_relationships_are_safe(self):
+        cases = {
+            "The.Office.UK.S01.COMPLETE.1080p.WEB-DL": identity.COMPATIBLE,
+            "The.Office.UK.Season.1.1080p.WEB-DL": identity.COMPATIBLE,
+            # A combined file beginning at the request is directly playable.
+            "The.Office.UK.S01E01-E03.1080p.WEB-DL.mkv": identity.STRONG,
+            "The.Office.UK.S01E01E02.1080p.WEB-DL.mkv": identity.STRONG,
+            # Explicit containers that do not include the request are wrong.
+            "The.Office.UK.S01E02-E06.1080p.WEB-DL": identity.CONTRADICTION,
+            "The.Office.UK.Season.2.1080p.WEB-DL": identity.CONTRADICTION,
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(expected,
+                                 identity.classify(self.office_uk, text))
+
+    def test_resolved_pack_member_can_lead_but_raw_pack_cannot(self):
+        self.assertEqual(identity.STRONG, identity.classify_evidence(
+            self.office_uk,
+            filename="The.Office.UK.S01E01.1080p.WEB-DL.mkv",
+            release_label="The.Office.UK.S01.COMPLETE.1080p.WEB-DL"))
+        self.assertEqual(identity.STRONG, identity.classify_evidence(
+            self.office_uk,
+            filename="The.Office.UK.S01E01.1080p.WEB-DL.mkv",
+            release_label="The.Office.UK.Complete.Series.1080p.WEB-DL"))
+        self.assertEqual(identity.STRONG, identity.classify_evidence(
+            self.office_uk,
+            filename="The.Office.UK.S01E01.1080p.WEB-DL.mkv",
+            release_label="The.Office.UK.S01-S04.1080p.WEB-DL"))
+        self.assertEqual(identity.CONTRADICTION, identity.classify_evidence(
+            self.office_uk,
+            filename="The.Office.UK.S01E01.1080p.WEB-DL.mkv",
+            release_label="The.Office.UK.S02.COMPLETE.1080p.WEB-DL"))
+
+    def test_show_pack_season_range_must_contain_selected_member(self):
+        season_three = identity.IdentityProfile(
+            media="series", imdb_id="tt0386676", aliases=("The Office",),
+            years=frozenset({2005}), season=3, episode=1,
+            region_tags=frozenset({"US"}))
+        filename = "The.Office.US.S03E01.1080p.WEB-DL.mkv"
+        self.assertEqual(identity.STRONG, identity.classify_evidence(
+            season_three, filename=filename,
+            release_label="The.Office.US.S01-S05.1080p.WEB-DL"))
+        self.assertEqual(identity.CONTRADICTION, identity.classify_evidence(
+            season_three, filename=filename,
+            release_label="The.Office.US.S04-S05.1080p.WEB-DL"))
 
     def test_trusted_episode_is_explicit_context(self):
         text = "The.Office.UK.1080p.WEB-DL.mkv"
@@ -260,7 +305,7 @@ class RuntimeCorroborationTests(unittest.TestCase):
         exact_result = identity.assess(
             self.episode, exact, measured_runtime_seconds=2_700)
         self.assertEqual(identity.STRONG, exact_result.state)
-        self.assertEqual(identity.EVIDENCE_RUNTIME, exact_result.evidence)
+        self.assertEqual(identity.EVIDENCE_CANONICAL, exact_result.evidence)
         self.assertEqual(identity.COMPATIBLE, identity.corroborate_runtime(
             self.episode, no_episode, 2_700))
         self.assertEqual(identity.STRONG, identity.corroborate_runtime(
@@ -283,11 +328,10 @@ class RuntimeCorroborationTests(unittest.TestCase):
         self.assertEqual(identity.COMPATIBLE, identity.corroborate_runtime(
             self.long_movie, text, 8_281))
 
+        # Exact title + S/E is independently strong; runtime is no longer
+        # required to bless an ordinary yearless episode release.
         ep = "The.Crossing.S01E02.1080p.WEB-DL.mkv"
-        # Episode tolerance is max(5m, 20%): 540 seconds here.
         self.assertEqual(identity.STRONG, identity.corroborate_runtime(
-            self.episode, ep, 3_240))
-        self.assertEqual(identity.COMPATIBLE, identity.corroborate_runtime(
             self.episode, ep, 3_241))
 
     def test_evidence_rank_order_is_stable(self):

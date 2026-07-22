@@ -12,7 +12,7 @@ import time
 import unittest
 from unittest import mock
 
-from app import picker, probe, telemetry, usenet
+from app import content_identity, picker, probe, telemetry, usenet
 
 
 def _stream(filename: str, url: str = "https://stream.invalid/video") -> dict:
@@ -21,6 +21,15 @@ def _stream(filename: str, url: str = "https://stream.invalid/video") -> dict:
         "url": url,
         "behaviorHints": {"filename": filename},
     }
+
+
+def _verified_stream(filename: str,
+                     url: str = "https://stream.invalid/video") -> dict:
+    stream = _stream(filename, url)
+    picker._annotate_quality([stream], 7_200)
+    return picker._mark(
+        stream, 1,
+        probe.ProbeResult(True, ttfb=0.1, speed_bps=20_000_000))
 
 
 class AudioLanguageRegressionTests(unittest.TestCase):
@@ -153,14 +162,38 @@ class PickerTrustMarkerRegressionTests(unittest.TestCase):
 
 
 class PrefetchCacheRegressionTests(unittest.IsolatedAsyncioTestCase):
-    async def test_transient_notices_never_enter_six_hour_result_caches(self) -> None:
+    def test_real_play_refreshes_only_the_selected_picker_cache(self) -> None:
+        media_id = "tt9999999:1:1"
+        stream = _verified_stream("Show.S01E01.1080p.WEB-DL-GOOD.mkv")
+        token = telemetry.request_ctx.set({
+            "media": "series", "media_id": media_id, "picker": "fast",
+        })
+        try:
+            sig = telemetry.signature(stream)
+            old = time.monotonic() - 100
+            key = f"full:series:{media_id}"
+            sibling = f"slow:full:series:{media_id}"
+            cache = {key: (old, [stream]), sibling: (old, [dict(stream)])}
+            with mock.patch.object(picker, "_cache", cache), \
+                    mock.patch.object(picker, "_stale_cache", {}), \
+                    mock.patch.object(picker.reputation, "blocked", return_value=False), \
+                    mock.patch.object(picker.reputation, "cooled", return_value=False):
+                picker.note_playback("series", media_id, "fast", sig)
+
+                self.assertGreater(picker._cache[key][0], old)
+                self.assertEqual(old, picker._cache[sibling][0])
+        finally:
+            telemetry.request_ctx.reset(token)
+
+    async def test_transient_notices_never_enter_long_lived_result_caches(self) -> None:
         for i, kind in enumerate(("checking", "theatrical", "added"), 2):
             nxt = f"tt9999999:1:{i}"
             with self.subTest(kind=kind), \
                     mock.patch.object(picker, "_cache", {}), \
+                    mock.patch.object(picker, "_stale_cache", {}), \
                     mock.patch.object(picker, "_background", {}), \
                     mock.patch.object(picker, "_prefetching", set()), \
-                    mock.patch.object(picker, "_PREFETCH_SETTLE", 0), \
+                    mock.patch.object(picker, "_PREFETCH_RETRY_MAX", 0), \
                     mock.patch.object(
                         picker, "_next_episode",
                         new=mock.AsyncMock(return_value=nxt)), \
@@ -179,7 +212,7 @@ class PrefetchCacheRegressionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_prefetch_primes_both_picker_caches_viewers_first(self) -> None:
         nxt = "tt9999999:1:2"
-        stream = _stream("Show.S01E02.1080p.WEB-DL-GOOD.mkv")
+        stream = _verified_stream("Show.S01E02.1080p.WEB-DL-GOOD.mkv")
         order: list[str] = []
 
         async def fast_pick(media, media_id, profile):
@@ -191,9 +224,9 @@ class PrefetchCacheRegressionTests(unittest.IsolatedAsyncioTestCase):
             return [dict(stream)]
 
         with mock.patch.object(picker, "_cache", {}), \
+                mock.patch.object(picker, "_stale_cache", {}), \
                 mock.patch.object(picker, "_background", {}), \
                 mock.patch.object(picker, "_prefetching", set()), \
-                mock.patch.object(picker, "_PREFETCH_SETTLE", 0), \
                 mock.patch.object(
                     picker, "_next_episode",
                     new=mock.AsyncMock(return_value=nxt)), \
@@ -205,6 +238,45 @@ class PrefetchCacheRegressionTests(unittest.IsolatedAsyncioTestCase):
                               f"slow:full:series:{nxt}"}, set(picker._cache))
             self.assertEqual(["slow", "fast"], order)
 
+    async def test_transient_empty_prewarm_retries_with_backoff(self) -> None:
+        nxt = "tt9999999:1:2"
+        verified = _verified_stream("Show.S01E02.1080p.WEB-DL-GOOD.mkv")
+        fast_calls = 0
+        events: list[str] = []
+        cache: dict = {}
+
+        async def fast_pick(media, media_id, profile):
+            nonlocal fast_calls
+            fast_calls += 1
+            if fast_calls == 1:
+                return [picker._notice_stream("checking")]
+            return [dict(verified)]
+
+        async def slow_pick(media, media_id, profile):
+            return [picker._notice_stream("checking")]
+
+        with mock.patch.object(picker, "_cache", cache), \
+                mock.patch.object(picker, "_stale_cache", {}), \
+                mock.patch.object(picker, "_background", {}), \
+                mock.patch.object(picker, "_prefetching", set()), \
+                mock.patch.object(picker, "_PREFETCH_RETRY_DELAY", 0), \
+                mock.patch.object(
+                    picker, "_next_episode",
+                    new=mock.AsyncMock(return_value=nxt)), \
+                mock.patch.object(picker, "pick", new=fast_pick), \
+                mock.patch.object(picker, "pick_slow", new=slow_pick), \
+                mock.patch.object(picker.sources, "invalidate") as invalidated, \
+                mock.patch.object(
+                    picker.telemetry, "record_cache_event",
+                    side_effect=lambda event, **kwargs: events.append(event)):
+            await picker.prefetch_next("series", "tt9999999:1:1", "fast")
+
+        self.assertEqual(2, fast_calls)
+        self.assertIn(f"full:series:{nxt}", cache)
+        self.assertIn("prewarm_retry", events)
+        self.assertIn("prewarm_ready", events)
+        invalidated.assert_called_once_with("series", nxt)
+
     async def test_prefetch_waits_for_current_episode_work(self) -> None:
         nxt = "tt9999999:1:2"
         current_finisher = asyncio.create_task(asyncio.sleep(0.05))
@@ -212,15 +284,15 @@ class PrefetchCacheRegressionTests(unittest.IsolatedAsyncioTestCase):
 
         async def a_pick(media, media_id, profile):
             finisher_done_at_pick.append(current_finisher.done())
-            return [dict(_stream("Show.S01E02.1080p.WEB-DL-GOOD.mkv"))]
+            return [dict(_verified_stream(
+                "Show.S01E02.1080p.WEB-DL-GOOD.mkv"))]
 
         with mock.patch.object(picker, "_cache", {}), \
+                mock.patch.object(picker, "_stale_cache", {}), \
                 mock.patch.object(
                     picker, "_background",
                     {"full:series:tt9999999:1:1": current_finisher}), \
                 mock.patch.object(picker, "_prefetching", set()), \
-                mock.patch.object(picker, "_PREFETCH_SETTLE", 0), \
-                mock.patch.object(picker, "_PREFETCH_QUIESCE_POLL", 0.01), \
                 mock.patch.object(
                     picker, "_next_episode",
                     new=mock.AsyncMock(return_value=nxt)), \
@@ -230,19 +302,51 @@ class PrefetchCacheRegressionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([True, True], finisher_done_at_pick)
 
+    async def test_prefetch_waits_for_shared_source_search_completion(self) -> None:
+        nxt = "tt9999999:1:2"
+        source_task = asyncio.create_task(asyncio.sleep(0.04))
+        search_done_at_pick: list[bool] = []
+
+        async def wait_sources(media, media_id, wait):
+            await source_task
+            return True
+
+        async def a_pick(media, media_id, profile):
+            search_done_at_pick.append(source_task.done())
+            return [dict(_verified_stream(
+                "Show.S01E02.1080p.WEB-DL-GOOD.mkv"))]
+
+        with mock.patch.object(picker, "_cache", {}), \
+                mock.patch.object(picker, "_stale_cache", {}), \
+                mock.patch.object(picker, "_background", {}), \
+                mock.patch.object(picker, "_prefetching", set()), \
+                mock.patch.object(
+                    picker, "_next_episode",
+                    new=mock.AsyncMock(return_value=nxt)), \
+                mock.patch.object(
+                    picker.sources, "in_progress",
+                    side_effect=lambda media, media_id: not source_task.done()), \
+                mock.patch.object(
+                    picker.sources, "wait_complete", new=wait_sources), \
+                mock.patch.object(picker, "pick", new=a_pick), \
+                mock.patch.object(picker, "pick_slow", new=a_pick):
+            await picker.prefetch_next("series", "tt9999999:1:1", "fast")
+
+        self.assertEqual([True, True], search_done_at_pick)
+
     async def test_prefetch_quiesce_wait_is_capped(self) -> None:
         nxt = "tt9999999:1:2"
         never_done: asyncio.Future = asyncio.get_event_loop().create_future()
         picked = mock.AsyncMock(
-            return_value=[dict(_stream("Show.S01E02.1080p.WEB-DL-GOOD.mkv"))])
+            return_value=[dict(_verified_stream(
+                "Show.S01E02.1080p.WEB-DL-GOOD.mkv"))])
         try:
             with mock.patch.object(picker, "_cache", {}), \
+                    mock.patch.object(picker, "_stale_cache", {}), \
                     mock.patch.object(
                         picker, "_background",
                         {"full:series:tt9999999:1:1": never_done}), \
                     mock.patch.object(picker, "_prefetching", set()), \
-                    mock.patch.object(picker, "_PREFETCH_SETTLE", 0), \
-                    mock.patch.object(picker, "_PREFETCH_QUIESCE_POLL", 0.01), \
                     mock.patch.object(picker, "_PREFETCH_QUIESCE_MAX", 0.03), \
                     mock.patch.object(
                         picker, "_next_episode",
@@ -260,7 +364,7 @@ class PrefetchCacheRegressionTests(unittest.IsolatedAsyncioTestCase):
         # list whose signed links are hours old. Playing it must re-search: drop
         # every stale entry for the id and re-store a freshly-picked list.
         cur = "tt9999999:1:5"
-        fresh = _stream("Show.S01E05.1080p.WEB-DL-FRESH.mkv")
+        fresh = _verified_stream("Show.S01E05.1080p.WEB-DL-FRESH.mkv")
         slow_ran: list[str] = []
 
         async def fast_pick(media, media_id, profile):
@@ -273,9 +377,9 @@ class PrefetchCacheRegressionTests(unittest.IsolatedAsyncioTestCase):
         stale_cache = {f"full:series:{cur}": (0.0, [{"stale": True}]),
                        f"slow:full:series:{cur}": (0.0, [{"stale": True}])}
         with mock.patch.object(picker, "_cache", stale_cache), \
+                mock.patch.object(picker, "_stale_cache", {}), \
                 mock.patch.object(picker, "_background", {}), \
                 mock.patch.object(picker, "_prefetching", set()), \
-                mock.patch.object(picker, "_PREFETCH_SETTLE", 0), \
                 mock.patch.object(picker, "pick", new=fast_pick), \
                 mock.patch.object(picker, "pick_slow", new=slow_pick):
             await picker.refresh("series", cur, "fast")
@@ -300,7 +404,36 @@ class PrefetchCacheRegressionTests(unittest.IsolatedAsyncioTestCase):
                 hlsproxy._note_segment("tok", entry, st, 1024)
             await asyncio.sleep(0)
             self.assertTrue(entry.get("nextfetched"))
-            fired.assert_awaited_once_with("tt9999999:1:1", "slow")
+            fired.assert_awaited_once_with("tt9999999:1:1", "slow", "")
+
+    async def test_playback_trigger_is_single_flight_and_carries_release(self) -> None:
+        from app import proxy
+        entry = {"id": "tt9999999:1:1", "picker": "fast"}
+        with mock.patch.object(proxy, "PREFETCH_NEXT", True), \
+                mock.patch.object(
+                    proxy, "_fire_prefetch", new=mock.AsyncMock()) as fired:
+            proxy._schedule_prefetch(entry, "file:known-release")
+            proxy._schedule_prefetch(entry, "file:known-release")
+            await asyncio.sleep(0)
+
+        self.assertTrue(entry["nextfetched"])
+        fired.assert_awaited_once_with(
+            "tt9999999:1:1", "fast", "file:known-release")
+
+    async def test_playback_prioritizes_next_episode_not_current_research(self) -> None:
+        from app import proxy
+        with mock.patch.object(picker, "note_playback") as noted, \
+                mock.patch.object(
+                    picker, "prefetch_next", new=mock.AsyncMock()) as next_ep, \
+                mock.patch.object(
+                    picker, "refresh", new=mock.AsyncMock()) as refreshed:
+            await proxy._fire_prefetch(
+                "tt9999999:1:1", "fast", "file:known-release")
+
+        noted.assert_called_once_with(
+            "series", "tt9999999:1:1", "fast", "file:known-release")
+        next_ep.assert_awaited_once_with("series", "tt9999999:1:1", "fast")
+        refreshed.assert_not_awaited()
 
 
 class FailureDetailTelemetryTests(unittest.TestCase):
@@ -369,6 +502,92 @@ class PickerDeadlineRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([good], [stream for stream, _ in result])
         self.assertTrue(result[0][1].ok)
 
+    async def test_probe_bounded_returns_after_verified_settling_window(self) -> None:
+        good = _stream("Movie.2024.1080p.WEB-DL-GOOD.mkv",
+                       "https://stream.invalid/good")
+        hung = _stream("Movie.2024.2160p.BluRay.REMUX-HUNG.mkv",
+                       "https://nzbdav.invalid/hung")
+        hung["_nzb_release_key"] = "nzb:hung"
+        cancelled = asyncio.Event()
+
+        async def fake_probe(url, *_args, **_kwargs):
+            if url.endswith("/good"):
+                await asyncio.sleep(0.01)
+                return probe.ProbeResult(
+                    True, ttfb=0.01, speed_bps=20_000_000)
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        started = time.monotonic()
+        with mock.patch.object(probe, "probe", new=fake_probe), \
+                mock.patch.object(probe, "_record"):
+            result = await picker._probe_bounded(
+                [good, hung], runtime=7_200, ttfb_max=60,
+                max_probes=2, hard_deadline=started + 2,
+                success_grace=0.03)
+
+        self.assertEqual([good], [stream for stream, _ in result])
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertTrue(cancelled.is_set())
+
+    async def test_later_resolved_pack_member_survives_and_wins(self) -> None:
+        """The first floor starts the window; a later exact pack member wins."""
+        low = _stream("Example.Show.2024.S01E03.720p.WEB-DL-LOW.mkv",
+                      "https://stream.invalid/low")
+        high = _stream("Example.Show.2024.S01E03.1080p.WEB-DL-HIGH.mkv",
+                       "https://stream.invalid/high")
+        high["description"] = "Example.Show.S01.COMPLETE.1080p.WEB-DL-PACK"
+        raw_pack = {
+            "name": "Example.Show.S01.COMPLETE.2160p.WEB-DL-RAW",
+            "url": "https://stream.invalid/raw-pack",
+            "behaviorHints": {"videoSize": 40_000_000_000},
+        }
+        wrong = _stream("Example.Show.2024.S01E04.2160p.WEB-DL-WRONG.mkv",
+                        "https://stream.invalid/wrong")
+        low["behaviorHints"]["videoSize"] = 1_000_000_000
+        high["behaviorHints"]["videoSize"] = 4_000_000_000
+        wrong["behaviorHints"]["videoSize"] = 8_000_000_000
+        profile = content_identity.IdentityProfile(
+            "series", "tt1234567", ("Example Show",), frozenset({2024}),
+            season=1, episode=3)
+        profile_token = picker._identity_profile_ctx.set(profile)
+        log_token = picker._identity_logged_ctx.set(set())
+
+        async def fake_probe(url, *_args, **_kwargs):
+            await asyncio.sleep(0.01 if url.endswith("/low") else 0.03)
+            return probe.ProbeResult(
+                True, ttfb=0.01, speed_bps=20_000_000)
+
+        try:
+            candidates = [low, high, raw_pack, wrong]
+            picker._annotate_identity(candidates)
+            picker._annotate_quality(candidates, 2_400)
+            rejected_events: list[str] = []
+            with mock.patch.object(probe, "probe", new=fake_probe), \
+                    mock.patch.object(probe, "_record"), \
+                    mock.patch.object(
+                        picker.telemetry, "record_cache_event",
+                        side_effect=lambda event, **_kwargs:
+                        rejected_events.append(event)):
+                verified = await picker._probe_bounded(
+                    candidates, runtime=2_400, ttfb_max=2,
+                    max_probes=4, hard_deadline=time.monotonic() + 2,
+                    success_grace=0.1)
+        finally:
+            picker._identity_logged_ctx.reset(log_token)
+            picker._identity_profile_ctx.reset(profile_token)
+
+        self.assertEqual({low["url"], high["url"]},
+                         {stream["url"] for stream, _ in verified})
+        self.assertEqual(2, rejected_events.count(
+            "transport_ok_identity_rejected"))
+        assembled = picker._assemble(
+            verified, [], None, key=picker._verified_quality_key)
+        self.assertEqual(high["url"], assembled[0]["url"])
+
 
 class FastTierRegressionTests(unittest.TestCase):
     def test_count_tiers_uses_effective_not_advertised_resolution(self) -> None:
@@ -389,7 +608,7 @@ class FastTierRegressionTests(unittest.TestCase):
 
 
 class SlowDirectUsenetRegressionTests(unittest.TestCase):
-    def test_probe_slice_reserves_two_slots_for_direct_usenet(self) -> None:
+    def test_probe_slice_gives_usenet_one_exploratory_place(self) -> None:
         online = [
             _stream(f"Movie.2024.2160p.WEB-DL-ONLINE{i}.mkv",
                     f"https://stream.invalid/online/{i}")
@@ -403,13 +622,14 @@ class SlowDirectUsenetRegressionTests(unittest.TestCase):
         for i, stream in enumerate(direct):
             stream["_nzb_release_key"] = f"nzb:release-{i}"
 
-        selected = picker._slow_probe_slice(
-            online + direct, max_probes=16, nzb_want=2)
+        selected = picker._slow_probe_slice(online + direct, max_probes=16)
 
+        # Diversity gets one place, not half the wave: every other probe remains
+        # available to the better-ranked online prospects.
         self.assertEqual(16, len(selected))
-        self.assertEqual(2, sum(picker._is_direct_nzb(s) for s in selected))
-        self.assertEqual(online[:14], selected[:14])
-        self.assertEqual(direct[:2], selected[14:])
+        self.assertEqual(1, sum(picker._is_direct_nzb(s) for s in selected))
+        self.assertEqual(online[:15], selected[:15])
+        self.assertEqual(direct[:1], selected[15:])
 
     def test_verified_direct_result_survives_tail_without_becoming_number_one(self) -> None:
         premium = [
