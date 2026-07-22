@@ -369,17 +369,35 @@ def _source_rank(s: dict) -> int:
     return 25  # unknown source: between webrip and web-dl
 
 
-_SIZE_RE = re.compile(r"([\d.]+)\s*(GB|MB)", re.IGNORECASE)
+# Match one decimal number, not an arbitrary run of digits and dots.  Some
+# addons have emitted labels such as ``.2.91 GB``; the old ``[\d.]+`` pattern
+# accepted that token and ``float()`` then crashed the entire picker merge.
+# The lookbehind also prevents the engine from salvaging the trailing
+# ``.91 GB`` from an otherwise-malformed token.  A normal leading-decimal size
+# such as ``.75 GB`` remains valid.
+_SIZE_RE = re.compile(
+    r"(?<![\d.])((?:\d+(?:\.\d+)?|\.\d+))\s*(GB|MB)\b",
+    re.IGNORECASE,
+)
 
 
 def _size_bytes(s: dict) -> int | None:
     v = (s.get("behaviorHints") or {}).get("videoSize")
-    if v:
-        return int(v)
+    if v is not None and not isinstance(v, bool):
+        try:
+            size = int(v)
+        except (TypeError, ValueError, OverflowError):
+            size = 0
+        if size > 0:
+            return size
     m = _SIZE_RE.search(_stream_text(s))
     if m:
         mult = 1e9 if m.group(2).upper() == "GB" else 1e6
-        return int(float(m.group(1)) * mult)
+        try:
+            size = int(float(m.group(1)) * mult)
+        except (ValueError, OverflowError):
+            return None
+        return size if size > 0 else None
     return None
 
 
@@ -403,7 +421,7 @@ def _release_ident(s: dict) -> str:
     sig = telemetry.signature(s)
     if sig:
         return sig
-    size = (s.get("behaviorHints") or {}).get("videoSize")
+    size = _size_bytes(s)
     text = " ".join(filter(None, (s.get("name"), s.get("title"),
                                   s.get("description"))))
     norm = re.sub(r"[^a-z0-9]+", "", text.lower())

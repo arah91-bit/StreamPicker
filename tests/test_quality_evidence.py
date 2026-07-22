@@ -40,6 +40,32 @@ class UnprovenClaimTests(unittest.TestCase):
         self.assertEqual((0, 1), picker._count_tiers([(s, None)]))
 
 
+class SizeEvidenceTests(unittest.TestCase):
+    def test_malformed_debridio_size_is_unknown_not_an_exception(self):
+        s = _claim("[TB] Debridio HDRip · Size: .2.91 GB")
+
+        self.assertIsNone(picker._size_bytes(s))
+        picker._annotate_quality([s], RUNTIME)
+        self.assertEqual(0, s["_qbps"])
+
+    def test_valid_decimal_and_leading_decimal_sizes_still_parse(self):
+        self.assertEqual(
+            2_910_000_000,
+            picker._size_bytes(_claim("Debridio · Size: 2.91 GB")),
+        )
+        self.assertEqual(
+            750_000_000,
+            picker._size_bytes(_claim("Debridio · Size: .75 GB")),
+        )
+
+    def test_malformed_structured_size_falls_back_to_valid_label(self):
+        s = _claim("Debridio · Size: 850 MB")
+        s["behaviorHints"]["videoSize"] = ".2.91"
+
+        self.assertEqual(850_000_000, picker._size_bytes(s))
+        self.assertTrue(picker._release_ident(s))
+
+
 class ProbeEvidenceTests(unittest.TestCase):
     def _apply(self, s, **media):
         r = probe.ProbeResult(True, ttfb=0.2, speed_bps=20_000_000, **media)
