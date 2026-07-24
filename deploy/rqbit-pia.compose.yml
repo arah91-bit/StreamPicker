@@ -1,0 +1,74 @@
+# Run this companion stack on the storage/NAS host, not on a Docker host that
+# reaches the download directory over NFS. rqbit and the long-term qBittorrent
+# instance must mount PRIVATE_DOWNLOAD_HOST_PATH as the same physical folder.
+#
+# Reuse the existing qBittorrent PIA credential file without printing or
+# duplicating its VPN_USER/VPN_PASS values:
+#
+#   docker compose \
+#     --env-file /secure/path/qbittorrentvpn.env \
+#     --env-file ./rqbit-pia.env \
+#     -f rqbit-pia.compose.yml up -d
+
+name: stream-picker-rqbit
+
+services:
+  rqbit-vpn:
+    image: qmcgaw/gluetun:v3.41.1
+    container_name: rqbit-vpn
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      # Bind only to the NAS LAN address. Do not forward these on the router.
+      - "${RQBIT_BIND_IP:?Set RQBIT_BIND_IP to the NAS LAN IP}:3030:3030/tcp"
+      - "${RQBIT_BIND_IP:?Set RQBIT_BIND_IP to the NAS LAN IP}:8000:8000/tcp"
+    environment:
+      VPN_SERVICE_PROVIDER: private internet access
+      VPN_TYPE: openvpn
+      # TCP is more tolerant of restrictive or unreliable UDP paths. Gluetun
+      # selects the correct PIA TCP endpoint/port from its server catalog.
+      OPENVPN_PROTOCOL: tcp
+      SERVER_REGIONS: "${PIA_SERVER_REGIONS:-US New York}"
+      # The existing binhex qBittorrent PIA env file already uses these names.
+      OPENVPN_USER: "${VPN_USER:?Load the qBittorrent PIA credential env file}"
+      OPENVPN_PASSWORD: "${VPN_PASS:?Load the qBittorrent PIA credential env file}"
+      # Permit only the rqbit API and authenticated Gluetun control API from
+      # the NAS's normal interface. Torrent traffic still uses the tunnel.
+      FIREWALL_INPUT_PORTS: "3030,8000"
+      HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE: >-
+        {"auth":"apikey","apikey":"${RQBIT_VPN_CONTROL_API_KEY:?Set a Gluetun control API key}"}
+      TZ: "${TZ:-America/New_York}"
+    volumes:
+      - ./gluetun:/gluetun
+
+  rqbit:
+    image: ikatson/rqbit:8.1.1
+    container_name: rqbit
+    restart: unless-stopped
+    # This is the kill switch: rqbit owns no separate network namespace and
+    # therefore has no route around Gluetun if PIA disconnects.
+    network_mode: "service:rqbit-vpn"
+    depends_on:
+      rqbit-vpn:
+        condition: service_healthy
+    user: "${PUID:-1000}:${PGID:-1000}"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    environment:
+      RQBIT_HTTP_API_LISTEN_ADDR: "0.0.0.0:3030"
+      RQBIT_HTTP_BASIC_AUTH_USERPASS: "${RQBIT_HTTP_USER:?Set an rqbit API username}:${RQBIT_HTTP_PASSWORD:?Set an rqbit API password}"
+      # UPnP would target the LAN router, which is inappropriate behind a VPN.
+      RQBIT_UPNP_PORT_FORWARD_DISABLE: "true"
+      TZ: "${TZ:-America/New_York}"
+    command: ["server", "start", "/data/nuviodownloads"]
+    volumes:
+      - ./rqbit/db:/home/rqbit/db
+      - ./rqbit/cache:/home/rqbit/cache
+      - "${PRIVATE_DOWNLOAD_HOST_PATH:?Set the NAS download directory}:/data/nuviodownloads"

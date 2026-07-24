@@ -570,6 +570,46 @@ def record_tbcache(media_id: str, stream: dict, *, res: int,
     })
 
 
+def record_private_tracker(event: str, *, media_id: str = "", count: int = 0,
+                           bytes_total: int = 0, detail: str = "") -> None:
+    """Private-P2P control-plane telemetry, deliberately credential-free.
+
+    Tracker names, torrent download URLs, passkeys and hashes are omitted. The
+    separate admin tab needs only lifecycle counts and aggregate byte volume.
+    """
+    _append({
+        "ts": round(time.time(), 1),
+        "kind": "private_tracker",
+        "event": re.sub(r"[^a-z0-9_-]", "", (event or "").lower())[:48],
+        "id": str(media_id or "")[:80],
+        "count": max(0, int(count or 0)),
+        "bytes": max(0, int(bytes_total or 0)),
+        "detail": re.sub(r"[^A-Za-z0-9 ._+:-]", "", detail or "")[:80],
+    })
+
+
+def aggregate_private_trackers(recs: list[dict]) -> dict:
+    """Headline private-tracker lifecycle metrics for its isolated UI."""
+    rows = [r for r in recs if r.get("kind") == "private_tracker"]
+    events: dict[str, int] = {}
+    bytes_added = 0
+    recent = []
+    for row in rows:
+        event = str(row.get("event") or "unknown")
+        increment = int(row.get("count") or 0)
+        events[event] = events.get(event, 0) + (increment if increment else 1)
+        if event == "added":
+            bytes_added += int(row.get("bytes") or 0)
+        recent.append({
+            "ts": row.get("ts", 0), "event": event,
+            "id": str(row.get("id") or "")[:80],
+            "count": max(0, int(row.get("count") or 0)),
+            "detail": str(row.get("detail") or "")[:80],
+        })
+    return {"events": events, "bytes_added": bytes_added,
+            "recent": recent[-30:]}
+
+
 def record_cache_event(event: str, *, target_id: str = "",
                        seconds: float | None = None,
                        age_seconds: float | None = None,

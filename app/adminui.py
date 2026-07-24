@@ -1,6 +1,7 @@
 """Shared security boundary and chrome for the admin dashboard.
 
-The dashboard is one site with three tabs — Overview, Settings, Source health —
+The dashboard is one site with four tabs — Overview, Settings, Source health,
+Private Trackers —
 served at clean paths (/, /settings, /stats) on the container's own port, with
 no secret in the URL. The addon's public endpoints (manifest/stream/proxy) keep
 their path/capability gates; the admin UI additionally requires HTTP Basic
@@ -33,6 +34,7 @@ TABS = [
     ("overview", "/", "Overview"),
     ("settings", "/settings", "Settings"),
     ("stats", "/stats", "Source health"),
+    ("private", "/private-trackers", "Private Trackers"),
 ]
 
 NAV_CSS = """

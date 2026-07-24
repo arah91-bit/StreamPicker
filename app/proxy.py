@@ -317,8 +317,13 @@ def _prune_sessions() -> None:
 def _proxyable(s: dict) -> bool:
     if not s.get("url"):
         return False
+    # Private-tracker URLs are already opaque local capabilities. Wrapping one
+    # as an ordinary upstream would hide the activation boundary inside the
+    # failover proxy and could make a probe/prefetch look like a user click.
+    if s.get("_private_tracker"):
+        return False
     name = s.get("name") or ""
-    return not any(e in name for e in ("📚", "⏳", "🎬"))   # skip library / notices
+    return not any(e in name for e in ("📚", "⏳", "🎬", "🔒"))
 
 
 def _internal_url(url: str) -> bool:

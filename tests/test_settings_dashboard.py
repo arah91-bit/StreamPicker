@@ -258,6 +258,15 @@ class SecretHygieneTests(unittest.TestCase):
             self.assertGreaterEqual(page.count("kept"), 5)
             self.assertIn("TMDB_API_KEY", page)   # the key name is shown
             self.assertIn("data-service='tmdb'", page)
+            self.assertIn("Public tracker searches", page)
+            self.assertIn('id="public_trackers_master"', page)
+            self.assertIn('data-key="PUBLIC_TRACKERS_ENABLED"', page)
+            self.assertIn('id="https_master"', page)
+            self.assertIn('data-key="HTTPS_STREAMS_ENABLED"', page)
+            self.assertIn('id="jellyfin_master"', page)
+            self.assertIn('data-key="JELLYFIN_ENABLED"', page)
+            self.assertIn('id="usenet_master"', page)
+            self.assertIn('data-key="USENET_ENABLED"', page)
         finally:
             os.environ.pop("TMDB_API_KEY", None)
             os.environ.pop("NZBDAV_PASS", None)

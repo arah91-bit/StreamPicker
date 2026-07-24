@@ -108,6 +108,16 @@ class CandidateFilterTests(unittest.TestCase):
                 ["The Matrix"], None)
             self.assertEqual([], got)
 
+    def test_same_name_series_with_explicit_wrong_year_is_rejected(self):
+        results = [
+            _rel("Shared Show 2026 S01E01 1080p", "a" * 40),
+            _rel("Shared Show 2005 S01E01 1080p", "b" * 40),
+            _rel("Shared Show S01E01 1080p", "c" * 40),
+        ]
+        got = prowlarr._candidates(
+            results, ["Shared Show"], (1, 1), year=2005)
+        self.assertEqual({"b" * 40, "c" * 40}, {row["hash"] for row in got})
+
 
 class PickFileTests(unittest.TestCase):
     def test_largest_video_for_movie(self):
@@ -127,6 +137,32 @@ class PickFileTests(unittest.TestCase):
 
 
 class StreamsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_searches_native_alias_when_english_title_has_no_result(self):
+        seen = []
+        native = _rel("外来媳妇本地郎.S01E01.1080p.WEB-DL", "c" * 40)
+
+        async def fake_search(query):
+            seen.append(query)
+            return [native] if query.startswith("外来媳妇本地郎") else []
+
+        async def fake_resolve(cand, store, token, se):
+            return {"name": "Prowlarr", "url": "http://cdn/native",
+                    "behaviorHints": {}}
+
+        with patch.object(prowlarr, "enabled", lambda: True), \
+             patch.object(prowlarr, "_stores", lambda: [("torbox", "T")]), \
+             patch.object(prowlarr.usenet, "_expected_info",
+                          side_effect=_returns(
+                              (["Kang's Family", "外来媳妇本地郎"], 2000))), \
+             patch.object(prowlarr, "_search", side_effect=fake_search), \
+             patch.object(prowlarr, "_cached_hashes",
+                          side_effect=_returns({"c" * 40})), \
+             patch.object(prowlarr, "_resolve", side_effect=fake_resolve):
+            out = await prowlarr.streams("series", "tt7803586:1:1")
+        self.assertEqual(["Kang's Family S01E01", "外来媳妇本地郎 S01E01"],
+                         seen)
+        self.assertEqual(["http://cdn/native"], [stream["url"] for stream in out])
+
     async def test_resolves_only_cached_and_emits_streams(self):
         results = [_rel("The Matrix 1999 1080p", "a" * 40),
                    _rel("The Matrix 1999 2160p", "b" * 40)]

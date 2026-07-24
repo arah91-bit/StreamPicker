@@ -124,20 +124,34 @@ def _record(media: str, media_id: str, state: str, detail: str = "") -> None:
 
 # ── Prowlarr search ──────────────────────────────────────────────────────────
 
-def _query(media: str, media_id: str, titles: list[str],
-           year: int | None) -> str:
-    """A single search string: the primary title, narrowed by the release year
-    (movies) or the episode token (series), so Prowlarr's live scrape returns a
-    focused set before we title/episode-filter it. A bare title is too broad —
-    it makes indexers slow and noisy."""
-    title = titles[0] if titles else ""
+def _queries(media: str, media_id: str, titles: list[str],
+             year: int | None) -> list[str]:
+    """Focused searches for every trusted canonical/native title alias.
+
+    Foreign works routinely index under native script or a regional title, so
+    primary-English-only search loses valid cached releases. Keep the episode
+    or year narrowing on every alias and bound fan-out to four metadata titles.
+    """
     parts = media_id.split(":")
+    episode = ""
     if media != "movie" and len(parts) >= 3:
         try:
-            return f"{title} S{int(parts[1]):02d}E{int(parts[2]):02d}"
+            episode = f"S{int(parts[1]):02d}E{int(parts[2]):02d}"
         except ValueError:
-            pass
-    return f"{title} {year}" if year else title
+            episode = ""
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in titles:
+        title = str(raw or "").strip()
+        folded = title.casefold()
+        if not title or folded in seen:
+            continue
+        seen.add(folded)
+        out.append(f"{title} {episode}" if episode else
+                   f"{title} {year}" if year else title)
+        if len(out) >= 4:
+            break
+    return out
 
 
 async def _search(query: str) -> list[dict]:
@@ -151,7 +165,8 @@ async def _search(query: str) -> list[dict]:
 
 
 def _candidates(results: list[dict], titles: list[str],
-                season_episode: tuple[int, int] | None) -> list[dict]:
+                season_episode: tuple[int, int] | None,
+                year: int | None = None) -> list[dict]:
     """Torrent releases with a hash whose title matches the requested one (and
     episode, for a series), best-first by seeders then size. The title gate is
     the same one the usenet lane relies on to never play wrong content."""
@@ -166,6 +181,8 @@ def _candidates(results: list[dict], titles: list[str],
         if (it.get("seeders") or 0) < MIN_SEEDERS:
             continue
         if not any(usenet._release_title_match(title, t) for t in titles if t):
+            continue
+        if not usenet._release_year_match(title, titles, year):
             continue
         if season_episode and not usenet._episode_match(title, *season_episode):
             continue
@@ -295,13 +312,20 @@ async def streams(media: str, media_id: str) -> list[dict]:
         if not titles:
             _record(media, media_id, "failed", "no title metadata")
             return []
-        results = await _search(_query(media, media_id, titles, year))
+        queries = _queries(media, media_id, titles, year)
+        searched = await asyncio.gather(
+            *(_search(query) for query in queries), return_exceptions=True)
+        if all(isinstance(batch, BaseException) for batch in searched):
+            raise next(batch for batch in searched
+                       if isinstance(batch, BaseException))
+        results = [row for batch in searched if isinstance(batch, list)
+                   for row in batch]
     except Exception as e:
         logger.warning(f"prowlarr search failed: {type(e).__name__}")
         _record(media, media_id, "failed", type(e).__name__)
         return []
 
-    cands = _candidates(results, titles, season_episode)
+    cands = _candidates(results, titles, season_episode, year)
     if not cands:
         _record(media, media_id, "empty", "no matching torrents")
         return []

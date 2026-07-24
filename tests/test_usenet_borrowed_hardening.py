@@ -33,6 +33,20 @@ class TitleFoldingTests(unittest.TestCase):
         self.assertFalse(usenet._release_title_match(
             "Another.Movie.2001.1080p", "Amélie"))
 
+    def test_native_cjk_title_matches_without_accepting_longer_title(self):
+        self.assertTrue(usenet._release_title_match(
+            "外来媳妇本地郎.S01E01.1080p.WEB-DL", "外来媳妇本地郎"))
+        self.assertFalse(usenet._release_title_match(
+            "外来媳妇本地郎续集.S01E01.1080p.WEB-DL", "外来媳妇本地郎"))
+
+    def test_explicit_different_series_year_is_rejected(self):
+        self.assertTrue(usenet._release_year_match(
+            "Shared Show 2005 S01E01 1080p", ["Shared Show"], 2005))
+        self.assertTrue(usenet._release_year_match(
+            "Shared Show S01E01 1080p", ["Shared Show"], 2005))
+        self.assertFalse(usenet._release_year_match(
+            "Shared Show 2026 S01E01 1080p", ["Shared Show"], 2005))
+
     def test_bare_season_token_is_valid_title_tail(self):
         # "Show.S01.COMPLETE" packs and "Show.S01.E02" spaced styles must
         # survive the title check; a longer different title still must not.

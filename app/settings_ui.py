@@ -43,6 +43,17 @@ background:var(--card);white-space:nowrap}
 h2{font-size:16px;margin:30px 0 4px}
 .blurb{color:var(--mut);font-size:13px;margin:0 0 10px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:10px}
+.lane-masters{margin:8px 0 18px;
+border-color:color-mix(in srgb,var(--accent) 35%,var(--line))}
+.lane-master{display:flex;align-items:center;gap:14px;padding:12px 16px;
+border-bottom:1px solid var(--line)}.lane-master:last-child{border-bottom:0}
+.lane-master .mastercopy{flex:1;min-width:0}
+.lane-master .mastertitle{font-weight:650}
+.lane-master .masterdesc{color:var(--mut);font-size:12.5px}
+.lane-master .masterdesc a{color:var(--accent);text-decoration:none}
+.lane-master .masterstate{font:11.5px var(--mono);color:var(--mut);min-width:70px;
+text-align:right}.lane-master .masterstate.ok{color:var(--good)}
+.lane-master .masterstate.bad{color:var(--bad)}
 
 .row{display:flex;justify-content:space-between;align-items:center;gap:24px;
 padding:14px 16px;border-bottom:1px solid var(--line)}
@@ -302,6 +313,21 @@ async function post(url,body){
  if(!r.ok)throw new Error((await r.json().catch(()=>({}))).detail||('HTTP '+r.status));
  return r.json();
 }
+
+/* Stream-lane master switches save independently so toggling a lane cannot
+   submit or clear unrelated credential fields. */
+$$('.lane-master-toggle').forEach(master=>master.addEventListener('change',async()=>{
+ const state=$('#'+master.dataset.state),before=master.dataset.init;
+ master.disabled=true;state.className='masterstate';state.textContent='saving…';
+ try{const values={};values[master.dataset.key]=master.checked?'1':'0';
+  const res=await post('/api/settings/save',{values});
+  master.dataset.init=master.checked?'1':'0';
+  state.className='masterstate ok';state.textContent='saved · restart';
+  $$('.savebar').forEach(b=>b.dataset.restart=res.restart_needed?'1':'0');
+ }catch(e){master.checked=before==='1';state.className='masterstate bad';
+  state.textContent=e.message;}
+ master.disabled=false;refreshBar();
+}));
 
 async function doSave(){
  const values={};dirtyControls().forEach(el=>values[el.dataset.key]=ctlValue(el));
@@ -901,6 +927,14 @@ def _scrapers() -> str:
 
 def render() -> str:
     restart = "1" if config.restart_pending() else "0"
+    def lane_on(key: str) -> bool:
+        return config.pending(key).lower() not in (
+            "", "0", "false", "no", "off")
+
+    public_on = lane_on("PUBLIC_TRACKERS_ENABLED")
+    https_on = lane_on("HTTPS_STREAMS_ENABLED")
+    jellyfin_on = lane_on("JELLYFIN_ENABLED")
+    usenet_on = lane_on("USENET_ENABLED")
     sections = _stream_mode()
     for gid, title, blurb in config.GROUPS:
         if gid == "stream":
@@ -915,6 +949,41 @@ def render() -> str:
 <body><div class="wrap">
 {adminui.nav('settings', ADDON_NAME)}
 <h1>Settings</h1>
+<section class="card lane-masters">
+ <div class="lane-master"><div class="mastercopy"><div class="mastertitle">Public tracker searches</div>
+ <div class="masterdesc">One switch for Comet, StremThru, MediaFusion,
+ native Prowlarr, and every custom online addon. Jellyfin, direct Usenet, and
+ <a href="/private-trackers">private trackers</a> remain independent.</div></div>
+ <span class="masterstate" id="public_trackers_state"></span>
+ <input class="swi lane-master-toggle" id="public_trackers_master" type="checkbox"
+ data-key="PUBLIC_TRACKERS_ENABLED" data-state="public_trackers_state"
+ data-init="{'1' if public_on else '0'}" {'checked' if public_on else ''}
+ aria-label="Enable all public tracker searches"></div>
+ <div class="lane-master"><div class="mastercopy"><div class="mastertitle">Direct HTTPS streams</div>
+ <div class="masterdesc">Enable or disable direct HTTP(S) playback sources
+ from custom addons independently of torrent/debrid results.</div></div>
+ <span class="masterstate" id="https_master_state"></span>
+ <input class="swi lane-master-toggle" id="https_master" type="checkbox"
+ data-key="HTTPS_STREAMS_ENABLED" data-state="https_master_state"
+ data-init="{'1' if https_on else '0'}" {'checked' if https_on else ''}
+ aria-label="Enable direct HTTPS stream sources"></div>
+ <div class="lane-master"><div class="mastercopy"><div class="mastertitle">Jellyfin library</div>
+ <div class="masterdesc">Enable or disable Jellyfin as a local stream source
+ without removing its saved connection.</div></div>
+ <span class="masterstate" id="jellyfin_master_state"></span>
+ <input class="swi lane-master-toggle" id="jellyfin_master" type="checkbox"
+ data-key="JELLYFIN_ENABLED" data-state="jellyfin_master_state"
+ data-init="{'1' if jellyfin_on else '0'}" {'checked' if jellyfin_on else ''}
+ aria-label="Enable Jellyfin library source"></div>
+ <div class="lane-master"><div class="mastercopy"><div class="mastertitle">Direct Usenet</div>
+ <div class="masterdesc">Enable or disable Newznab search and nzbdav mounting
+ without deleting indexer or nzbdav credentials.</div></div>
+ <span class="masterstate" id="usenet_master_state"></span>
+ <input class="swi lane-master-toggle" id="usenet_master" type="checkbox"
+ data-key="USENET_ENABLED" data-state="usenet_master_state"
+ data-init="{'1' if usenet_on else '0'}" {'checked' if usenet_on else ''}
+ aria-label="Enable direct Usenet source"></div>
+</section>
 <p class="sub">Connect your services and choose how streams are handled.
 Saved to <code>/data/config.json</code> on the addon's data volume; changes
 apply on restart. Anyone deploying their own instance starts here.</p>

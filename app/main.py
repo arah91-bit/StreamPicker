@@ -28,9 +28,10 @@ except ValueError as exc:
     raise RuntimeError(f"invalid stream-picker configuration: {exc}") from exc
 
 from app import (acquire, admin_auth, adminui, anime, connections, dashboard,  # noqa: E402
-                 envref, library, meta, overview, picker, probe, prowlarr, proxy,
-                 reputation, scrapers, settings_ui, sources, tbcache, telemetry,
-                 usenet, usenet_health, vprobe, wizard)
+                 envref, library, meta, overview, picker, private_trackers,
+                 private_ui, probe, prowlarr, proxy, reputation, scrapers,
+                 settings_ui, sources, tbcache, telemetry, usenet,
+                 usenet_health, vprobe, wizard)
 
 NOTICE_FILE = pathlib.Path(__file__).parent / "static" / "notice.mp4"
 NOTICE_THEATRICAL_FILE = (pathlib.Path(__file__).parent / "static"
@@ -59,6 +60,7 @@ async def _lifespan(_app: FastAPI):
     if await adminui.migrate_legacy():
         logger.info("admin: migrated explicit dashboard credentials to scrypt")
     proxy.load()
+    await private_trackers.startup()
     _READY = True
     logger.info("startup complete; persistent data writable at %s", data_dir)
     try:
@@ -73,6 +75,7 @@ async def _lifespan(_app: FastAPI):
             ("metadata", meta), ("library", library), ("acquire", acquire),
             ("video probe", vprobe), ("sources", sources), ("usenet", usenet),
             ("prowlarr", prowlarr), ("tbcache", tbcache), ("anime", anime),
+            ("private trackers", private_trackers),
         ):
             shutdown = getattr(module, "shutdown", None)
             if shutdown is not None:
@@ -102,7 +105,7 @@ async def _log_request(request: Request, call_next):
     resp.headers.setdefault("X-Content-Type-Options", "nosniff")
     resp.headers.setdefault("Referrer-Policy", "no-referrer")
     resp.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
-    if (request.url.path in ("/", "/settings", "/stats")
+    if (request.url.path in ("/", "/settings", "/stats", "/private-trackers")
             or request.url.path.startswith("/api/")):
         resp.headers["Cache-Control"] = "no-store"
         resp.headers.setdefault("X-Frame-Options", "DENY")
@@ -121,6 +124,7 @@ async def _log_request(request: Request, call_next):
     path = request.url.path.replace(SECRET, "<secret>")
     path = re.sub(r"^/proxy/[^/]+", "/proxy/<token>", path)
     path = re.sub(r"^/library/[^/]+", "/library/<token>", path)
+    path = re.sub(r"^/private/[^/]+", "/private/<token>", path)
     logger.info(f'req {client} "{request.method} {path}" '
                 f'{resp.status_code} ua="{ua}"')
     return resp
@@ -273,7 +277,7 @@ async def _streams(media: str, media_id: str, profile: str, slow: bool = False):
     except Exception:
         logger.exception(f"pick failed for {media}/{media_id}")
         streams = []
-    if streams:
+    if streams and not streams[0].get("_private_action"):
         telemetry.record_served(streams[0])   # log real host/source before rewrite
     picker_label = ("slow" if slow else "fast") + ("/mob" if profile == "mobile" else "")
     streams = proxy.wrap(streams, media, media_id, picker_label)  # → /proxy URLs
@@ -308,6 +312,12 @@ async def stream_slow_mobile(secret: str, media: str, media_id: str):
 async def library_playback(token: str, request: Request):
     """Opaque native-Jellyfin playback URL; credentials stay server-side."""
     return await library.serve(token, request)
+
+
+@app.api_route("/private/{token}", methods=["GET", "HEAD"])
+async def private_playback(token: str, request: Request):
+    """Opaque click-to-activate private torrent capability."""
+    return await private_trackers.serve(token, request)
 
 
 # ── local admin dashboard (clean paths, no secret; see _admin guard) ─────────
@@ -399,6 +409,66 @@ async def stats(request: Request, min_n: int = 3):
     await _admin(request)
     blocks = reputation.listing() + usenet_health.blocked_listing()
     return HTMLResponse(dashboard.render(telemetry.load(), blocks, min_n=min_n))
+
+
+@app.get("/private-trackers")
+async def private_trackers_page(request: Request):
+    await _admin(request)
+    metrics = telemetry.aggregate_private_trackers(telemetry.load())
+    return HTMLResponse(private_ui.render(metrics))
+
+
+@app.get("/private-trackers/setup")
+async def private_trackers_setup_page(request: Request):
+    await _admin(request)
+    return HTMLResponse(private_ui.render_setup())
+
+
+@app.get("/api/private-trackers/status.json")
+async def private_trackers_status(request: Request):
+    await _admin(request)
+    current = await private_trackers.status()
+    current["metrics"] = telemetry.aggregate_private_trackers(telemetry.load())
+    return current
+
+
+@app.get("/api/private-trackers/indexers.json")
+async def private_trackers_indexers(request: Request):
+    await _admin(request)
+    try:
+        return {"ok": True, "indexers": await private_trackers.indexer_preferences()}
+    except Exception as exc:
+        return {"ok": False, "indexers": [], "detail": str(exc)[:200]}
+
+
+@app.post("/api/private-trackers/save")
+async def private_trackers_save(request: Request):
+    await _admin(request, mutation=True)
+    body = await _json_body(request)
+    submitted = dict(body.get("values") or {})
+    unknown = set(submitted) - set(private_ui.KEYS)
+    if unknown:
+        raise HTTPException(status_code=400, detail="unknown private setting")
+    try:
+        return config.save(submitted)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/private-trackers/test")
+async def private_trackers_test(request: Request):
+    await _admin(request, mutation=True)
+    body = await _json_body(request)
+    submitted = dict(body.get("values") or {})
+    unknown = set(submitted) - set(private_ui.KEYS)
+    if unknown:
+        raise HTTPException(status_code=400, detail="unknown private setting")
+    # Blank secret fields mean "use the stored secret", exactly like Save.
+    for key in ("PRIVATE_PROWLARR_API_KEY", "PRIVATE_QBITTORRENT_PASSWORD",
+                "PRIVATE_RQBIT_PASSWORD", "PRIVATE_RQBIT_VPN_API_KEY"):
+        if not submitted.get(key):
+            submitted[key] = config.pending(key)
+    return await private_trackers.test_connections(submitted)
 
 
 @app.get("/api/stats.json")

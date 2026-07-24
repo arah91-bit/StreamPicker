@@ -42,6 +42,8 @@ logger = logging.getLogger("stream-picker")
 JELLYFIN_URL = (os.environ.get("JELLYFIN_URL") or "").rstrip("/")
 JELLYFIN_USERNAME = os.environ.get("JELLYFIN_USERNAME") or ""
 JELLYFIN_PASSWORD = os.environ.get("JELLYFIN_PASSWORD") or ""
+JELLYFIN_ENABLED = (os.environ.get("JELLYFIN_ENABLED") or "1").strip().lower() \
+    not in ("", "0", "false", "no", "off")
 PUBLIC_URL = os.environ.get("ADDON_PUBLIC_URL", "http://localhost:8011").rstrip("/")
 TIMEOUT = float(os.environ.get("JELLYFIN_TIMEOUT", "8"))
 INDEX_TTL = float(os.environ.get("JELLYFIN_INDEX_TTL", "300"))
@@ -101,7 +103,8 @@ _SAFE_CONTAINER = re.compile(r"^[A-Za-z0-9]{1,12}$")
 
 
 def enabled() -> bool:
-    return bool(JELLYFIN_URL and JELLYFIN_USERNAME and JELLYFIN_PASSWORD)
+    return bool(JELLYFIN_ENABLED and JELLYFIN_URL and JELLYFIN_USERNAME
+                and JELLYFIN_PASSWORD)
 
 
 def _provider_imdb(item: dict | None) -> str:

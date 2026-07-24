@@ -112,6 +112,9 @@ for part in _INDEXER_SPEC.split(";"):
     if len(bits) == 3 and all(bits):
         INDEXERS.append((bits[0], bits[1].rstrip("/"), bits[2]))
 
+USENET_ENABLED = (os.environ.get("USENET_ENABLED") or "1").strip().lower() \
+    not in ("", "0", "false", "no", "off")
+
 _client = httpx.AsyncClient(follow_redirects=True,
                             headers={"User-Agent": "stream-picker/1.0"})
 _put_slots = asyncio.Semaphore(PUT_CONCURRENCY)
@@ -140,7 +143,8 @@ def prefetch_scope():
 
 
 def enabled() -> bool:
-    return bool(INDEXERS and NZBDAV_URL and NZBDAV_USER and NZBDAV_PASS)
+    return bool(USENET_ENABLED and INDEXERS and NZBDAV_URL and NZBDAV_USER
+                and NZBDAV_PASS)
 
 
 def _dav_auth() -> tuple[str, str]:
@@ -341,7 +345,10 @@ def _fold(t: str) -> str:
 
 
 def _norm(t: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", _fold(t))
+    # ``[a-z0-9]`` silently erased an entire CJK/Arabic/Cyrillic title. Keep
+    # Unicode letters and digits so an authoritative native-script alias can
+    # validate the corresponding release just as an English alias does.
+    return "".join(ch for ch in _fold(t) if ch.isalnum())
 
 
 _IMDB_VALUE_RE = re.compile(r"^(?:tt)?(\d+)$", re.I)
@@ -468,7 +475,10 @@ def _release_title_match(release: str, expected: str) -> bool:
                 return False
     if consumed != target:
         return False
-    tail_match = re.search(r"[A-Za-z0-9]+", (release or "")[end + 1:])
+    # First Unicode alphanumeric token after the expected title. Using an
+    # ASCII-only expression here made a longer CJK title look like an exact
+    # match because its non-Latin suffix was invisible.
+    tail_match = re.search(r"[^\W_]+", (release or "")[end + 1:])
     if not tail_match:
         return True
     token = tail_match.group().lower()
@@ -482,6 +492,46 @@ def _release_title_match(release: str, expected: str) -> bool:
         or re.fullmatch(r"\d{1,3}x\d{1,4}", token)
         or token in _TITLE_TAIL_MARKERS
     )
+
+
+def _release_year_match(release: str, titles: list[str],
+                        expected_year: int | None) -> bool:
+    """Reject an explicit, contradictory year immediately after a title.
+
+    Same-name series/remakes are common (and alias fan-out makes finding them
+    more likely). A release with no title-adjacent year remains eligible, but
+    ``Shared Show 2026 S01`` cannot satisfy metadata for the 2005 show. Matching
+    only the title-adjacent token avoids treating numeric titles such as
+    ``1917`` as the production year.
+    """
+    if not expected_year:
+        return True
+    folded = _fold(release or "")
+    for expected in titles:
+        target = _norm(expected)
+        if not target:
+            continue
+        consumed = ""
+        end = -1
+        for end, char in enumerate(folded):
+            if char.isalnum():
+                consumed += char.lower()
+                if len(consumed) == len(target):
+                    break
+                if not target.startswith(consumed):
+                    break
+        if consumed != target:
+            continue
+        match = re.match(r"[^A-Za-z0-9]*((?:19|20)\d{2})(?!\d)",
+                         folded[end + 1:])
+        if not match:
+            return True
+        actual = int(match.group(1))
+        # A one-year discrepancy is common around festival/air/release dates;
+        # larger differences identify a different same-name work.
+        if abs(actual - int(expected_year)) <= 1:
+            return True
+    return False
 
 
 def _episode_match(text: str, season: int, episode: int) -> bool:

@@ -90,6 +90,13 @@ the job to an AI)? Every setting is equally reachable by editing `.env` or
 [AGENTS.md](AGENTS.md) for the guide and [`.env.reference`](.env.reference) for
 the full annotated key list.
 
+The optional **Private Trackers** tab is an isolated home for local downloads:
+private releases never go to debrid, and draggable release preferences let you
+favor episodes, season packs, or full-series packs. rqbit can begin playback
+progressively before handing the same files to qBittorrent for permanent
+seeding. Its in-app setup guide covers the fail-closed PIA/Gluetun companion;
+see [PRIVATE_TRACKERS.md](PRIVATE_TRACKERS.md) for the file-based version.
+
 The dashboard is **authenticated and local-only by default** — it answers to
 loopback/LAN/Docker clients but not to requests coming through a public reverse
 proxy, so keep the port on your LAN (like Radarr/Sonarr). First-run enrollment

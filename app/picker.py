@@ -50,8 +50,8 @@ from urllib.parse import urlsplit
 import httpx
 
 from app import (acquire, anime, candidate_health, content_identity,
-                 decode_health, library, meta, probe, reputation, sources,
-                 tbcache, telemetry,
+                 decode_health, library, meta, private_trackers, probe,
+                 reputation, sources, tbcache, telemetry,
                  usenet as nzb_lane, vprobe)
 
 logger = logging.getLogger("stream-picker")
@@ -816,7 +816,7 @@ def _ingested_stream(s: dict) -> dict:
 
 def _strip_internal(s: dict) -> dict:
     private_prefixes = ("_nzb_", "_identity_", "_picker_", "_library_",
-                        "_source_")
+                        "_private_", "_source_")
     if any(k in s for k in _INTERNAL_KEYS) or any(
             str(k).startswith(private_prefixes) for k in s):
         return {k: v for k, v in s.items()
@@ -1565,10 +1565,13 @@ def _mark(s: dict, rank: int, r: probe.ProbeResult | None) -> dict:
     # upstream attempt to spell the same private key.
     if _identity_leader(s):
         content_identity.mark_auto_eligible(out)
-    if r is None:        # local library file — reliable, but no probe speed
+    if r is None:        # trusted local file — reliable, but no probe speed
         out["_ttfb"], out["_speed"] = 0.0, LIBRARY_SPEED
-        label = (s.get("name") or "Library").replace("📚", "").strip()
-        out["name"] = f"📚 {rank} · {label}"
+        private = bool(s.get("_private_tracker"))
+        icon = "🔒" if private else "📚"
+        label = (s.get("name") or ("Private Tracker" if private else "Library"))
+        label = label.replace("🔒", "").replace("📚", "").strip()
+        out["name"] = f"{icon} {rank} · {label}"
         return out
     out["_ttfb"], out["_speed"] = r.ttfb, r.speed_bps
     icon = "📚" if "📚" in (s.get("name") or "") else "✅"
@@ -1662,6 +1665,24 @@ def invalidate(media_id: str) -> None:
         hit = _cache.pop(k, None)
         if hit:
             _archive_stale(k, hit)
+
+
+def private_source_changed(media_id: str) -> None:
+    """A private torrent was activated or completed; re-evaluate local reuse.
+
+    Unlike an expired verified URL, a click-to-download action is not useful
+    stale probe evidence. Drop it outright, along with any checking notice, so
+    the next open can surface the newly downloading/completed local member.
+    """
+    if not media_id:
+        return
+    suffix = f":{media_id}"
+    for key in [k for k in _cache if k.endswith(suffix)]:
+        _cache.pop(key, None)
+    for key in [k for k in _stale_cache if k.endswith(suffix)]:
+        _stale_cache.pop(key, None)
+    for key in [k for k in _notice_until if k.endswith(suffix)]:
+        _notice_until.pop(key, None)
 
 
 def _as_verified(lib: list[dict]) -> list[tuple[dict, None]]:
@@ -1924,7 +1945,9 @@ def _notice_stream(kind: str = "added") -> dict:
       'theatrical' — only a cam/TS exists (or no digital release is out yet);
       'added'      — sent to the library via Sonarr/Radarr, downloading now;
       'checking'   — sources exist and are still being verified in the background;
-                     the best working one will appear on a retry in a moment."""
+                     the best working one will appear on a retry in a moment;
+      'private_empty' — private indexers were searched but no exact eligible
+                        release exists under the current policy."""
     if kind == "theatrical":
         return {
             "name": "🎬 Not Out Yet",
@@ -1943,6 +1966,25 @@ def _notice_stream(kind: str = "added") -> dict:
             "url": NOTICE_URL,
             _NOTICE_STATE_KEY: kind,
         }
+    if kind == "private_empty":
+        return {
+            "name": "🔒 No Private Tracker Match",
+            "title": ("Searched your enabled private torrent indexers using "
+                      "the known title aliases, but no exact episode or pack "
+                      f"met the {private_trackers.MIN_SEEDERS}-seeder floor.\n"
+                      "No torrent was added."),
+            "url": NOTICE_URL,
+            _NOTICE_STATE_KEY: kind,
+        }
+    if kind == "private_failed":
+        return {
+            "name": "⚠️ Private Tracker Search Unavailable",
+            "title": ("The private fallback could not complete its search.\n"
+                      "No torrent was added; retry or check the Private "
+                      "Trackers status page."),
+            "url": NOTICE_URL,
+            _NOTICE_STATE_KEY: kind,
+        }
     return {
         "name": "⏳ Being Added",
         "title": ("Not streamable right now — sent to your library "
@@ -1954,7 +1996,8 @@ def _notice_stream(kind: str = "added") -> dict:
 
 
 def _contains_notice(streams: list[dict]) -> bool:
-    return any(s.get(_NOTICE_STATE_KEY) in ("checking", "theatrical", "added")
+    return any(s.get(_NOTICE_STATE_KEY) in (
+        "checking", "theatrical", "added", "private_empty", "private_failed")
                for s in streams)
 
 
@@ -2666,6 +2709,11 @@ async def _finish_slow(cache_key: str, media: str, media_id: str,
         lib = await library.streams(media, media_id) if library.enabled() else []
         if lib:
             lib = _eligible_library(lib, profile, runtime)
+        private_complete, private_pending = await private_trackers.local_streams(
+            media, media_id)
+        if private_complete:
+            private_complete = _eligible_library(
+                private_complete, profile, runtime)
         unprobed = [s for s in ok + lib if s.get("url") not in fast_urls]
         unprobed.sort(key=_probe_key, reverse=True)
         # Off Nuvio's clock, so dig deeper by quality than the foreground slice
@@ -2678,17 +2726,32 @@ async def _finish_slow(cache_key: str, media: str, media_id: str,
             finish_slice, runtime, SLOW_FINISH_TTFB_MAX, len(finish_slice),
             finish_deadline)
         await _refine_video_bitrate(verified, runtime, min(45, left()))
-        all_verified = _combine_verified(fast_verified, verified)
+        all_verified = _combine_verified(
+            _as_verified(private_complete), fast_verified, verified)
         _tb_autocache(media, media_id, all_verified, runtime)
         if all_verified:
             vurls = {v.get("url") for v, _ in all_verified}
             streams = _assemble(all_verified,
-                                [s for s in ok + lib if s.get("url") not in vurls],
+                                [s for s in ok + lib + private_pending
+                                 if s.get("url") not in vurls],
                                 fallback, key=_verified_quality_key)
+            # If the only verified inventory is private-local, keep the manual
+            # private alternatives visible after it. A download should not
+            # collapse the user's 20 choices into one row.
+            if private_complete and not (fast_verified or verified):
+                streams += await private_trackers.choice_streams(
+                    media, media_id, wait=max(left(), 0.0))
             _store(cache_key, streams)
             logger.info(f"{cache_key}: background best-quality cached"
                         f" ({len(verified)} verified, +{len(fast_verified)} fast,"
                         f" {len(lib)} library of {len(ok)})")
+            return
+        if private_pending:
+            private_pending += await private_trackers.choice_streams(
+                media, media_id, wait=max(left(), 0.0))
+            _notice_until.pop(cache_key, None)
+            _store(cache_key, private_pending)
+            logger.info("%s: cached downloading private pack member", cache_key)
             return
         # Exhausted the full search and nothing plays. Raw library URLs do not
         # count here: they went through the same probe gate and may be stale.
@@ -2698,6 +2761,19 @@ async def _finish_slow(cache_key: str, media: str, media_id: str,
                 media, media_id, [fast, stremthru, mediafusion, nzb]):
             _notice_until[cache_key] = (time.monotonic() + NOTICE_TTL, "theatrical")
             logger.info(f"{cache_key}: full search — no proper release out yet")
+            return
+        found = await private_trackers.candidates(
+            media, media_id, wait=max(left(), 0.0))
+        if found:
+            private_rows = private_trackers.fallback_streams(
+                media, media_id, found)
+            _notice_until.pop(cache_key, None)
+            _store(cache_key, private_rows)
+            logger.info("%s: background cached %d private last-resort row(s)",
+                        cache_key, len(private_rows))
+            return
+        if private_trackers.search_in_progress(media, media_id):
+            logger.info("%s: private search outlived background budget", cache_key)
             return
         if nzb_lane.in_progress(media, media_id):
             logger.info(f"{cache_key}: background budget ended while direct "
@@ -2730,7 +2806,8 @@ async def _release_expected(media: str, media_id: str,
 
 
 async def _no_source(cache_key: str, media: str, media_id: str,
-                     raw_lists: list[list[dict]]) -> list[dict]:
+                     raw_lists: list[list[dict]],
+                     private_wait: float = 0.0) -> list[dict]:
     """Slow picker's foreground no-source outcome. Acquire via Sonarr/Radarr and
     show the "being added" notice only when a proper release should exist but we
     couldn't find it; if nothing is out yet (still theatrical / not aired), show
@@ -2739,6 +2816,33 @@ async def _no_source(cache_key: str, media: str, media_id: str,
         _notice_until[cache_key] = (time.monotonic() + NOTICE_TTL, "theatrical")
         logger.info(f"{cache_key}: no proper release out yet — 'not out' notice")
         return [_notice_stream("theatrical")]
+    # Private trackers are a manual last resort, evaluated only after the
+    # ordinary source/probe path found nothing playable and release metadata
+    # says the title should exist. Searching is inert; the returned rows do not
+    # add anything until their media URL receives a real GET.
+    found = await private_trackers.candidates(
+        media, media_id, wait=max(0.0, private_wait))
+    if found:
+        streams = private_trackers.fallback_streams(media, media_id, found)
+        _notice_until.pop(cache_key, None)
+        _store(cache_key, streams)
+        logger.info("%s: private last resort offers %d manual candidate(s)",
+                    cache_key, len(streams))
+        return streams
+    if private_trackers.search_in_progress(media, media_id):
+        logger.info("%s: private last-resort search continues in background",
+                    cache_key)
+        return [_notice_stream("checking")]
+    private_outcome = private_trackers.search_outcome(media, media_id)
+    if private_trackers.enabled() and private_outcome.get("state") == "empty":
+        streams = [_notice_stream("private_empty")]
+        _store(cache_key, streams)
+        logger.info("%s: private trackers searched with no eligible match",
+                    cache_key)
+        return streams
+    if private_trackers.enabled() and private_outcome.get("state") == "failed":
+        logger.warning("%s: private tracker search failed", cache_key)
+        return [_notice_stream("private_failed")]
     if acquire.enabled_for(media):
         task = asyncio.create_task(acquire.request(media, media_id))
         try:
@@ -2772,6 +2876,12 @@ async def pick_slow(media: str, media_id: str,
     # Local Jellyfin library — a fast, reliable source; fire it now, use later.
     lib_task = (asyncio.create_task(library.streams(media, media_id))
                 if library.enabled() else None)
+    # Already-added private torrents are a second local inventory. This query
+    # is read-only: it can reuse a completed season member, but never searches
+    # a tracker or starts a download on its own.
+    private_local_task = (asyncio.create_task(
+        private_trackers.local_streams(media, media_id))
+        if private_trackers.enabled() else None)
 
     # Recently classified as pending (downloading, or not out yet)? Serve the
     # matching notice fast — but re-check the library first so a finished
@@ -2856,6 +2966,16 @@ async def pick_slow(media: str, media_id: str,
             lib = []
     if lib:
         lib = _eligible_library(lib, profile, runtime)
+    private_complete: list[dict] = []
+    private_pending: list[dict] = []
+    if private_local_task:
+        try:
+            private_complete, private_pending = await private_local_task
+        except Exception:
+            private_complete, private_pending = [], []
+    if private_complete:
+        private_complete = _eligible_library(
+            private_complete, profile, runtime)
     unprobed = [s for s in ok + lib if s.get("url") not in fast_urls]
     unprobed.sort(key=_probe_key, reverse=True)
     probe_slice = _slow_probe_slice(
@@ -2883,10 +3003,12 @@ async def pick_slow(media: str, media_id: str,
 
     # Library copies passed through the same probe wave, so every member of the
     # leading tier has current playback evidence.
-    all_verified = _combine_verified(fast_verified, verified)
+    all_verified = _combine_verified(
+        _as_verified(private_complete), fast_verified, verified)
     vurls = {v.get("url") for v, _ in all_verified}
     streams = _assemble(all_verified,
-                        [s for s in ok + lib if s.get("url") not in vurls],
+                        [s for s in ok + lib + private_pending
+                         if s.get("url") not in vurls],
                         fallback, key=_verified_quality_key)
 
     # The slow picker's whole job is the *best* source, so whenever candidates
@@ -2899,8 +3021,20 @@ async def pick_slow(media: str, media_id: str,
             _finish_slow(cache_key, media, media_id, profile, runtime))
 
     if all_verified:
+        if private_complete and not (fast_verified or verified):
+            streams += await private_trackers.choice_streams(
+                media, media_id, wait=max(left() - 1, 0.0))
         _store(cache_key, streams)
         return streams
+
+    # A member of a previously selected season pack is already downloading.
+    # It is an explicit manual row (not falsely stamped verified), and opening
+    # it only reprioritizes that episode; the complete pack keeps downloading.
+    if private_pending:
+        private_pending += await private_trackers.choice_streams(
+            media, media_id, wait=max(left() - 1, 0.0))
+        _store(cache_key, private_pending)
+        return private_pending
 
     # No playable source anywhere. A raw library URL is not proof of playback:
     # it may be stale and has already failed the byte gate above. Let Usenet
@@ -2911,7 +3045,8 @@ async def pick_slow(media: str, media_id: str,
         return [_notice_stream("checking")]
     if not ok:
         return await _no_source(cache_key, media, media_id,
-                                [fast, stremthru, mediafusion, nzb])
+                                [fast, stremthru, mediafusion, nzb],
+                                private_wait=max(left() - 1, 0))
 
     # Candidates exist but none verified in the foreground window. We never hand
     # the user an unverified #1 — it might not play — so show the "finding best

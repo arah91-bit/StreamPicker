@@ -177,6 +177,95 @@ SETTINGS = [
          hidden=True, default="", label="Prowlarr API key"),
     dict(key="PROWLARR_SOURCE", group="identity", type="bool", hidden=True,
          default="0", label="Prowlarr as a source"),
+    # One master gate for every ordinary online tracker/addon source. Direct
+    # Usenet, Jellyfin/library, and the separately controlled private fallback
+    # remain independent.
+    dict(key="PUBLIC_TRACKERS_ENABLED", group="identity", type="bool",
+         hidden=True, default="1", label="Public tracker searches"),
+    dict(key="HTTPS_STREAMS_ENABLED", group="identity", type="bool",
+         hidden=True, default="1", label="Direct HTTPS stream sources"),
+    dict(key="JELLYFIN_ENABLED", group="identity", type="bool", hidden=True,
+         default="1", label="Jellyfin library source"),
+    dict(key="USENET_ENABLED", group="identity", type="bool", hidden=True,
+         default="1", label="Direct Usenet source"),
+    # Private trackers are intentionally absent from the ordinary Settings and
+    # Sources surfaces. Their dedicated /private-trackers tab renders these
+    # real schema entries and saves through the same encrypted config store.
+    dict(key="PRIVATE_TRACKERS_ENABLED", group="identity", type="bool",
+         hidden=True, default="0", label="Private tracker local downloads"),
+    dict(key="PRIVATE_PROWLARR_URL", group="identity", type="text", kind="url",
+         hidden=True, default="http://prowlarr:9696",
+         label="Private Prowlarr URL"),
+    dict(key="PRIVATE_PROWLARR_API_KEY", group="identity", type="text",
+         kind="secret", hidden=True, default="",
+         label="Private Prowlarr API key"),
+    dict(key="PRIVATE_QBITTORRENT_URL", group="identity", type="text", kind="url",
+         hidden=True, default="http://qbittorrentvpn:8081",
+         label="Private qBittorrent URL"),
+    dict(key="PRIVATE_QBITTORRENT_USERNAME", group="identity", type="text",
+         hidden=True, default="admin", label="qBittorrent username"),
+    dict(key="PRIVATE_QBITTORRENT_PASSWORD", group="identity", type="text",
+         kind="secret", hidden=True, default="",
+         label="qBittorrent password"),
+    dict(key="PRIVATE_STREAM_ENGINE", group="identity", type="choice",
+         hidden=True, default="qbittorrent",
+         choices=[("qbittorrent", "qBittorrent (compatibility)"),
+                  ("rqbit", "rqbit (progressive streaming)")],
+         label="Private torrent streaming engine"),
+    dict(key="PRIVATE_RQBIT_URL", group="identity", type="text", kind="url",
+         hidden=True, default="http://rqbit:3030", label="rqbit URL"),
+    dict(key="PRIVATE_RQBIT_USERNAME", group="identity", type="text",
+         hidden=True, default="", label="rqbit username"),
+    dict(key="PRIVATE_RQBIT_PASSWORD", group="identity", type="text",
+         kind="secret", hidden=True, default="", label="rqbit password"),
+    dict(key="PRIVATE_RQBIT_OUTPUT_PATH", group="identity", type="text",
+         hidden=True, default="/data/nuviodownloads",
+         label="rqbit output path"),
+    dict(key="PRIVATE_RQBIT_VPN_URL", group="identity", type="text", kind="url",
+         hidden=True, default="http://rqbit-vpn:8000",
+         label="rqbit VPN health URL"),
+    dict(key="PRIVATE_RQBIT_VPN_API_KEY", group="identity", type="text",
+         kind="secret", hidden=True, default="",
+         label="rqbit VPN control API key"),
+    dict(key="PRIVATE_QBITTORRENT_SAVE_PATH", group="identity", type="text",
+         hidden=True, default="/data/nuviodownloads",
+         label="qBittorrent save path"),
+    dict(key="PRIVATE_TRACKER_DOWNLOAD_ROOT", group="identity", type="text",
+         hidden=True, default="/private-downloads",
+         label="Stream Picker read-only download root"),
+    dict(key="PRIVATE_QBITTORRENT_CATEGORY", group="identity", type="text",
+         hidden=True, default="stream-picker-private",
+         label="qBittorrent category"),
+    dict(key="PRIVATE_TRACKER_CANDIDATES", group="identity", type="number",
+         hidden=True, default="20", min=1, max=1000,
+         label="Private candidates shown"),
+    dict(key="PRIVATE_TRACKER_RELEASE_ORDER", group="identity", type="text",
+         hidden=True, default="episode,season,series",
+         label="Private release preference"),
+    dict(key="PRIVATE_TRACKER_INDEXER_SCORES", group="identity", type="text",
+         hidden=True, default="",
+         label="Private tracker preference scores"),
+    dict(key="PRIVATE_TRACKER_MIN_SEEDERS", group="identity", type="number",
+         hidden=True, default="5", min=0, max=10000,
+         label="Minimum private seeders"),
+    dict(key="PRIVATE_TRACKER_MAX_TORRENT_GB", group="identity", type="number",
+         hidden=True, default="0", min=0, max=100000,
+         label="Maximum private torrent size (GB)"),
+    dict(key="PRIVATE_TRACKER_MAX_ACTIVE_DOWNLOADS", group="identity",
+         type="number", hidden=True, default="3", min=0, max=1000,
+         label="Maximum active private downloads"),
+    dict(key="PRIVATE_TRACKER_WHOLE_TORRENT", group="identity", type="bool",
+         hidden=True, default="1",
+         label="Download whole private torrent (100%)"),
+    dict(key="PRIVATE_TRACKER_SEARCH_TIMEOUT", group="identity", type="number",
+         hidden=True, default="45", min=2, max=180,
+         label="Private search timeout"),
+    dict(key="PRIVATE_TRACKER_START_TIMEOUT", group="identity", type="number",
+         hidden=True, default="90", min=5, max=600,
+         label="Private playback start timeout"),
+    dict(key="PRIVATE_TRACKER_SEARCH_TTL", group="identity", type="number",
+         hidden=True, default="10800", min=60, max=86400,
+         label="Private search cache TTL"),
     # Managed by the "Sources" scraper catalog, not generic rows (hence hidden).
     # EXTRA_ADDONS carries the minted/custom addon URLs the picker races;
     # SCRAPERS records which catalog engines are enabled so the panel round-trips.
@@ -286,6 +375,8 @@ _INT_KEYS = {
     "REPUTATION_MAX_ENTRIES", "MIN_BLOCK_SESSIONS", "TELEMETRY_MAX_BYTES",
     "TELEMETRY_SEGMENTS", "MAX_BITRATE_MBPS",
     "PROWLARR_RESOLVE_MAX", "PROWLARR_RESOLVE_CONCURRENCY", "PROWLARR_MIN_SEEDERS",
+    "PRIVATE_TRACKER_CANDIDATES", "PRIVATE_TRACKER_MIN_SEEDERS",
+    "PRIVATE_TRACKER_MAX_ACTIVE_DOWNLOADS",
 }
 
 _FRACTION_KEYS = {
@@ -655,6 +746,50 @@ def _normalize(spec: dict, raw: str):
     if spec["key"] == "ADMIN_USERNAME":
         if not raw or len(raw) > 128 or ":" in raw or any(ord(c) < 33 for c in raw):
             raise ValueError("ADMIN_USERNAME: use 1-128 visible characters without ':'")
+    if spec["key"] == "PRIVATE_TRACKER_RELEASE_ORDER":
+        allowed = {"episode", "season", "series"}
+        values = [value.strip().lower() for value in raw.split(",")
+                  if value.strip()]
+        if (not values or len(values) != len(set(values))
+                or any(value not in allowed for value in values)):
+            raise ValueError(
+                "PRIVATE_TRACKER_RELEASE_ORDER must contain one or more unique "
+                "values from: episode, season, series")
+        return ",".join(values)
+    if spec["key"] == "PRIVATE_TRACKER_INDEXER_SCORES":
+        if not raw.strip():
+            return ""
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            raise ValueError(
+                "PRIVATE_TRACKER_INDEXER_SCORES: not valid JSON") from None
+        if not isinstance(data, dict):
+            raise ValueError(
+                "PRIVATE_TRACKER_INDEXER_SCORES: expected a JSON object")
+        if len(data) > 300:
+            raise ValueError(
+                "PRIVATE_TRACKER_INDEXER_SCORES: at most 300 trackers")
+        out: dict[str, int] = {}
+        seen: set[str] = set()
+        for name, value in data.items():
+            key = re.sub(r"[\r\n\t]+", " ", str(name or "")).strip()[:80]
+            if not key or key.casefold() in seen:
+                continue
+            try:
+                score = int(value)
+            except (TypeError, ValueError):
+                raise ValueError("PRIVATE_TRACKER_INDEXER_SCORES: scores "
+                                 "must be whole numbers from 1 to 100") from None
+            if not 1 <= score <= 100:
+                raise ValueError("PRIVATE_TRACKER_INDEXER_SCORES: scores "
+                                 "must be between 1 and 100")
+            seen.add(key.casefold())
+            # 50 is the neutral default; do not persist it, so the stored map
+            # stays limited to trackers the user actually reweighted.
+            if score != 50:
+                out[key] = score
+        return json.dumps(out, separators=(",", ":")) if out else ""
     if len(raw.encode("utf-8")) > 8192 or "\x00" in raw:
         raise ValueError(f"{spec['key']}: value is too long or invalid")
     return raw
@@ -679,6 +814,16 @@ def _validate_effective(store: dict[str, str]) -> dict[str, str]:
         raise ValueError("SLOW_PROBE_RESERVE must be below SLOW_TOTAL_DEADLINE")
     if num("FAST_RACE_DEADLINE") > num("TOTAL_DEADLINE"):
         raise ValueError("FAST_RACE_DEADLINE must not exceed TOTAL_DEADLINE")
+    for key in ("PRIVATE_QBITTORRENT_SAVE_PATH",
+                "PRIVATE_RQBIT_OUTPUT_PATH",
+                "PRIVATE_TRACKER_DOWNLOAD_ROOT"):
+        value = effective[key]
+        if not value.startswith("/") or ".." in value.split("/"):
+            raise ValueError(f"{key} must be an absolute container path")
+    category = effective["PRIVATE_QBITTORRENT_CATEGORY"]
+    if not category or "/" in category or "\\" in category:
+        raise ValueError(
+            "PRIVATE_QBITTORRENT_CATEGORY must be a non-empty category name")
     return effective
 
 
@@ -749,6 +894,11 @@ def save(values: dict[str, str]) -> dict:
         if norm is None:
             continue
         before = pending_from(original, key)
+        # A blank SECRET submit means "keep the stored value" — the form always
+        # renders secret fields blank, so a plain Save must never wipe them.
+        # (Only non-secret blanks revert to env/default.)
+        if norm == "" and is_secret(key):
+            continue
         if norm == "" and spec.get("type") != "connection":
             store.pop(key, None)            # revert knob to env/default
         elif spec.get("advanced") and norm == default(key):

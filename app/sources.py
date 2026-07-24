@@ -26,9 +26,14 @@ import time
 
 import httpx
 
-from app import prowlarr, usenet
+from app import prowlarr, telemetry, usenet
 
 logger = logging.getLogger("stream-picker")
+
+PUBLIC_TRACKERS_ENABLED = (os.environ.get("PUBLIC_TRACKERS_ENABLED") or "1") \
+    .strip().lower() not in ("", "0", "false", "no", "off")
+HTTPS_STREAMS_ENABLED = (os.environ.get("HTTPS_STREAMS_ENABLED") or "1") \
+    .strip().lower() not in ("", "0", "false", "no", "off")
 
 FAST, STREMTHRU, MEDIAFUSION = "fast", "stremthru", "mediafusion"
 # Direct usenet lane (app.usenet): our own Newznab searches + nzbdav mounts,
@@ -150,7 +155,26 @@ _outcomes: dict[tuple, dict] = {}
 
 
 def has(source: str) -> bool:
-    return _BASES.get(source) is not None
+    if _BASES.get(source) is None:
+        return False
+    if source == NZB:
+        return True
+    if source in EXTRAS:
+        # A custom addon may return both debrid/torrent and direct HTTPS rows;
+        # search it while either output lane is enabled, then filter per row.
+        return PUBLIC_TRACKERS_ENABLED or HTTPS_STREAMS_ENABLED
+    return PUBLIC_TRACKERS_ENABLED
+
+
+def _extra_is_tracker(stream: dict) -> bool:
+    text = " ".join(str(stream.get(k) or "")
+                    for k in ("name", "title", "description"))
+    return bool(stream.get("infoHash") or telemetry.debrid_tag(text))
+
+
+def _extra_allowed(stream: dict) -> bool:
+    return (PUBLIC_TRACKERS_ENABLED if _extra_is_tracker(stream)
+            else HTTPS_STREAMS_ENABLED)
 
 
 def _fresh(hit: tuple[float, list[dict]]) -> bool:
@@ -210,6 +234,9 @@ async def _run(key: tuple, base: str, media: str, media_id: str,
         # registry if this event loop is kept alive by a test/reloader.
         _inflight.pop(key, None)
     assert streams is not None
+    if source in EXTRAS:
+        streams = [stream for stream in streams
+                   if isinstance(stream, dict) and _extra_allowed(stream)]
     # Stremio stream objects have no public underscore-prefixed fields.  Strip
     # every such field from HTTP addons before adding our own provenance so an
     # upstream cannot forge picker verification, library identity, or direct-NZB
@@ -272,7 +299,7 @@ def _task(source: str, media: str, media_id: str) -> asyncio.Task | None:
     when neither a fresh cache entry nor an in-flight task exists — this is
     where double-searching is prevented."""
     base = _BASES.get(source)
-    if not base:
+    if not base or not has(source):
         return None
     key = (source, media, media_id)
     hit = _raw.get(key)
@@ -296,6 +323,8 @@ def start(source: str, media: str, media_id: str) -> None:
 def peek(source: str, media: str, media_id: str) -> list[dict] | None:
     """Non-blocking: the raw streams if the search has finished, else None.
     Never starts or waits on a search."""
+    if not has(source):
+        return None
     hit = _raw.get((source, media, media_id))
     return hit[1] if hit and _fresh(hit) else None
 
@@ -367,7 +396,7 @@ async def get(source: str, media: str, media_id: str,
     cancels the underlying search — it keeps running and caches its result for
     the next joiner."""
     base = _BASES.get(source)
-    if not base:
+    if not base or not has(source):
         return []
     key = (source, media, media_id)
     hit = _raw.get(key)
