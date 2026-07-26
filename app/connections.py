@@ -65,6 +65,40 @@ async def _manifest(key: str, overrides: dict) -> dict:
         return _fail(t0, e)
 
 
+async def _publicurl(overrides: dict) -> dict:
+    """Call our own advertised public address and see whether it comes back to
+    us. /health/live is ungated and carries an opaque per-process nonce, so
+    this proves identity without ever sending the addon secret to a host that
+    might be a typo.
+
+    A failure here is genuinely inconclusive: plenty of routers refuse to route
+    a LAN client to their own public address (no NAT hairpinning), so the URL
+    can be correct and still unreachable from in here. Say so rather than
+    calling a working address broken."""
+    from app import adminui
+    base = _val("ADDON_PUBLIC_URL", overrides).strip().rstrip("/")
+    t0 = time.monotonic()
+    if not base:
+        return _fail(t0, "no public address set")
+    if not base.startswith(("http://", "https://")):
+        return _fail(t0, "address must start with http:// or https://")
+    try:
+        r = await _client.get(f"{base}/health/live")
+        r.raise_for_status()
+        seen = (r.json() or {}).get("instance")
+    except Exception as e:
+        return {"ok": False, "ms": int((time.monotonic() - t0) * 1000),
+                "detail": _scrub(f"{type(e).__name__}: {e}")[:110]
+                + " — many routers can't route a local client to their own "
+                  "public address, so this can fail even when the address "
+                  "works from outside."}
+    if seen and seen == adminui.INSTANCE_ID:
+        return _ok(t0, "reaches this server — the address is correct")
+    if seen:
+        return _fail(t0, "a different Stream Picker answers at that address")
+    return _fail(t0, "something answered there, but it isn't this addon")
+
+
 async def _addon(overrides: dict) -> dict:
     """Verify an arbitrary player addon by its manifest, and confirm it can
     actually serve streams. The URL comes straight from the form (overrides),
@@ -340,16 +374,17 @@ async def _nzbdav(overrides: dict) -> dict:
 
 
 async def _indexers(overrides: dict) -> dict:
+    """Ask every configured indexer for its capabilities with the saved key —
+    a caps call is cheap and is exactly what a failed search would trip over,
+    so this proves reachability *and* that the key is accepted.
+
+    Rows the editor sent as @keep are resolved first, so Test works on unsaved
+    edits without the operator having to retype any key."""
     spec = _val("NZB_INDEXERS", overrides)
     t0 = time.monotonic()
-    triples = []
-    for part in spec.replace("\n", ";").split(";"):
-        bits = part.strip().split("|")
-        if len(bits) == 3 and all(b.strip() for b in bits):
-            triples.append((bits[0].strip(), bits[1].strip().rstrip("/"),
-                            bits[2].strip()))
+    triples = config.resolve_indexers(spec)
     if not triples:
-        return _fail(t0, "no indexers configured (name|api-url|apikey)")
+        return _fail(t0, "no indexers configured — add a name, API URL and key")
 
     async def one(name, base, key):
         try:
@@ -390,6 +425,7 @@ _TESTS = {
     "sonarr": lambda o: _arr("SONARR", o),
     "nzbdav": _nzbdav,
     "indexers": _indexers,
+    "publicurl": _publicurl,
 }
 
 

@@ -1,11 +1,11 @@
 """Shared security boundary and chrome for the admin dashboard.
 
-The dashboard is one site with four tabs — Overview, Settings, Source health,
-Private Trackers —
-served at clean paths (/, /settings, /stats) on the container's own port, with
-no secret in the URL. The addon's public endpoints (manifest/stream/proxy) keep
-their path/capability gates; the admin UI additionally requires HTTP Basic
-authentication and is limited to local clients by default.
+The dashboard is one site served at clean paths on the container's own port,
+with no secret in the URL; its tabs and chrome live in app/uitheme (see
+uitheme.NAV), and this module owns only the guard in front of them. The
+addon's public endpoints (manifest/stream/proxy) keep their path/capability
+gates; the admin UI additionally requires HTTP Basic authentication and is
+limited to local clients by default.
 
 Forwarding headers are security-sensitive. They are considered only when the
 immediate peer belongs to TRUSTED_PROXIES; an untrusted peer sending one is
@@ -16,7 +16,6 @@ import base64
 import binascii
 import asyncio
 import hashlib
-import html
 import ipaddress
 import os
 import re
@@ -28,37 +27,15 @@ from urllib.parse import urlsplit
 from fastapi import HTTPException
 
 from app import admin_auth
-
-# (id, href, label) — the tab order across every admin page.
-TABS = [
-    ("overview", "/", "Overview"),
-    ("settings", "/settings", "Settings"),
-    ("stats", "/stats", "Source health"),
-    ("private", "/private-trackers", "Private Trackers"),
-    ("picks", "/picks", "Catalog builder"),
-]
-
-NAV_CSS = """
-.adminnav{position:sticky;top:12px;z-index:30;display:flex;justify-content:space-between;
-align-items:center;gap:12px;margin:0 0 26px;padding:9px 10px 9px 16px;
-background:var(--card);border:1px solid var(--line);border-radius:14px;
-box-shadow:0 2px 10px rgba(0,0,0,.05)}
-.adminnav .brand{font-weight:700;font-size:14.5px;letter-spacing:-.01em;
-display:flex;gap:9px;align-items:center;white-space:nowrap}
-.adminnav .brand .dot{width:9px;height:9px;border-radius:50%;
-background:var(--accent);flex-shrink:0}
-.adminnav .tabs{display:flex;gap:3px;flex-wrap:wrap;justify-content:flex-end}
-.adminnav .tab{font-size:13.5px;color:var(--mut);text-decoration:none;
-padding:7px 13px;border-radius:9px;white-space:nowrap;transition:background .12s,color .12s}
-.adminnav .tab:hover{color:var(--fg);background:var(--line)}
-.adminnav .tab.on{color:#fff;background:var(--accent)}
-.adminnav .tab.on:hover{background:var(--accent)}
-@media (max-width:520px){.adminnav{flex-direction:column;align-items:stretch}
-.adminnav .tabs{justify-content:center}}
-"""
-
+from app import uitheme
 
 _CSRF_TOKEN = secrets.token_urlsafe(32)
+
+# An opaque per-process nonce published on the public /health/live endpoint.
+# It is deliberately NOT a secret — it exists so this server can recognise
+# itself when the public-URL check calls its own advertised address, without
+# ever sending the addon secret to whatever host was typed in.
+INSTANCE_ID = secrets.token_urlsafe(8)
 _FORWARDED_HEADERS = ("x-forwarded-for", "forwarded")
 _HASH_SLOTS = threading.BoundedSemaphore(2)
 _AUTH_CACHE: dict[tuple, float] = {}
@@ -70,59 +47,54 @@ def csrf_token() -> str:
     return _CSRF_TOKEN
 
 
-def nav(active: str, name: str) -> str:
-    tabs = "".join(
-        f'<a class="tab{" on" if tid == active else ""}" href="{href}">'
-        f'{html.escape(label)}</a>'
-        for tid, href, label in TABS)
-    # Source-health renders unblock/clear/retry actions as links. Intercept
-    # those links here so the shared chrome upgrades them to CSRF-protected
-    # POSTs without putting secrets in query paths or changing public routes.
-    csrf = html.escape(_CSRF_TOKEN, quote=True)
-    return (f'<header class="adminnav" data-csrf="{csrf}"><span class="brand">'
-            f'<span class="dot"></span>{html.escape(name)}</span>'
-            f'<nav class="tabs">{tabs}</nav></header>'
-            "<script>document.addEventListener('click',async e=>{"
-            "const a=e.target.closest('a[href]');if(!a)return;"
-            "const u=new URL(a.href,location.href);"
-            "if(!['/api/unblock','/api/decode/clear','/api/nzb-indexer/clear']"
-            ".includes(u.pathname))return;"
-            "e.preventDefault();const c=document.querySelector('.adminnav').dataset.csrf;"
-            "const r=await fetch(u,{method:'POST',headers:{'X-CSRF-Token':c}});"
-            "if(r.ok)location.href='/stats';else alert('Action failed: HTTP '+r.status);"
-            "});</script>")
+# Page-specific CSS for the first-run enrollment card (everything else comes
+# from uitheme.BASE_CSS).
+_SETUP_CSS = """
+.enroll{min-height:74vh;display:grid;place-items:center}
+.enroll-card{width:min(460px,100%);padding:30px}
+.enroll-card .mark{width:12px;height:24px;border-radius:4px;margin-bottom:20px}
+.enroll-card h1{margin:0 0 8px}
+.enroll-card .sub{margin:0 0 20px}
+.enroll-card label{display:block;font-weight:600;font-size:13.5px;margin:14px 0 6px}
+.enroll-card .hint{font-size:12.5px;color:var(--mut);margin-top:6px}
+.enroll-card .btn{width:100%;margin-top:22px}
+.enroll-card .err{min-height:22px;color:var(--bad);font-size:13px;margin-top:12px}
+"""
+
+_SETUP_JS = """<script>
+const form=document.getElementById('setup'),err=document.getElementById('error');
+form.addEventListener('submit',async e=>{e.preventDefault();err.textContent='';
+ const password=document.getElementById('password').value;
+ if(password!==document.getElementById('confirm').value){err.textContent='Passwords do not match.';return}
+ const button=document.getElementById('create');button.disabled=true;
+ try{const response=await fetch('/api/admin/setup',{method:'POST',headers:{
+  'Content-Type':'application/json','X-CSRF-Token':document.querySelector('.enroll-card').dataset.csrf},
+  body:JSON.stringify({username:document.getElementById('username').value,password,
+   confirmation:document.getElementById('confirm').value})});
+  const body=await response.json().catch(()=>({}));
+  if(!response.ok)throw new Error(body.detail||('HTTP '+response.status));
+  form.reset();form.innerHTML='<div class="callout ok"><strong>Account created.</strong><br>'+
+   'Continue to the dashboard and sign in once with your new username and password.</div>'+
+   '<button type="button" class="btn" id="continue">Continue to dashboard</button>';
+  document.getElementById('continue').onclick=()=>location.href='/';
+ }catch(ex){err.textContent=ex.message}finally{if(button.isConnected)button.disabled=false}
+});
+</script>"""
 
 
 def setup_page(name: str) -> str:
     """One-time local enrollment page; it never embeds an existing secret."""
-    csrf = html.escape(_CSRF_TOKEN, quote=True)
-    title = html.escape(name)
-    return f"""<!doctype html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="robots" content="noindex,nofollow">
-<title>{title} — create administrator</title>
-<style>
-:root{{--bg:#f5f7fb;--card:#fff;--fg:#172033;--mut:#657086;--line:#dfe4ed;
---accent:#5965e8;--bad:#b42318}}*{{box-sizing:border-box}}body{{margin:0;
-font:15px/1.5 system-ui,sans-serif;background:var(--bg);color:var(--fg)}}
-.wrap{{min-height:100vh;display:grid;place-items:center;padding:24px}}.card{{width:min(440px,100%);
-background:var(--card);border:1px solid var(--line);border-radius:18px;padding:30px;
-box-shadow:0 14px 40px rgba(24,35,58,.10)}}.mark{{width:42px;height:42px;
-border-radius:12px;background:var(--accent);display:grid;place-items:center;color:#fff;
-font-weight:800;margin-bottom:18px}}h1{{font-size:24px;line-height:1.2;margin:0 0 8px}}
-.sub{{color:var(--mut);margin:0 0 24px}}label{{display:block;font-weight:650;
-margin:14px 0 6px}}input{{width:100%;padding:11px 12px;border:1px solid var(--line);
-border-radius:10px;font:inherit;background:#fff}}input:focus{{outline:2px solid #cbd0ff;
-border-color:var(--accent)}}button{{width:100%;margin-top:22px;padding:12px;border:0;
-border-radius:10px;background:var(--accent);color:#fff;font:inherit;font-weight:700;
-cursor:pointer}}button:disabled{{opacity:.6;cursor:wait}}.hint{{font-size:12.5px;
-color:var(--mut);margin-top:5px}}.err{{min-height:22px;color:var(--bad);margin-top:12px}}
-.ok{{padding:14px;border-radius:10px;background:#ecfdf3;color:#067647}}
-</style></head><body><main class="wrap"><section class="card" data-csrf="{csrf}">
-<div class="mark">SP</div><h1>Create your administrator account</h1>
+    csrf = uitheme.esc(_CSRF_TOKEN)
+    key = uitheme.icon("key")
+    body = f"""
+<div class="enroll"><section class="card hot enroll-card" data-csrf="{csrf}">
+<div class="mark" aria-hidden="true"></div>
+<p class="eyebrow">First run · local only</p>
+<h1>Create your administrator account</h1>
 <p class="sub">This is the first dashboard visit. Choose the username and
 password you will use from now on.</p>
-<form id="setup"><label for="username">Username</label>
+<form id="setup">
+<label for="username">Username</label>
 <input id="username" name="username" required maxlength="128"
 autocomplete="username" spellcheck="false" autofocus>
 <label for="password">Password</label>
@@ -132,27 +104,13 @@ maxlength="1024" autocomplete="new-password">
 <label for="confirm">Confirm password</label>
 <input id="confirm" name="confirm" type="password" required minlength="12"
 maxlength="1024" autocomplete="new-password">
-<button id="create" type="submit">Create account</button>
-<div class="err" id="error" role="alert"></div></form></section></main>
-<script>
-const form=document.getElementById('setup'),err=document.getElementById('error');
-form.addEventListener('submit',async e=>{{e.preventDefault();err.textContent='';
- const password=document.getElementById('password').value;
- if(password!==document.getElementById('confirm').value){{err.textContent='Passwords do not match.';return}}
- const button=document.getElementById('create');button.disabled=true;
- try{{const response=await fetch('/api/admin/setup',{{method:'POST',headers:{{
-  'Content-Type':'application/json','X-CSRF-Token':document.querySelector('.card').dataset.csrf}},
-  body:JSON.stringify({{username:document.getElementById('username').value,password,
-   confirmation:document.getElementById('confirm').value}})}});
-  const body=await response.json().catch(()=>({{}}));
-  if(!response.ok)throw new Error(body.detail||('HTTP '+response.status));
-  form.reset();form.innerHTML='<div class="ok"><strong>Account created.</strong><br>'+
-   'Continue to the dashboard and sign in once with your new username and password.</div>'+
-   '<button type="button" id="continue">Continue to dashboard</button>';
-  document.getElementById('continue').onclick=()=>location.href='/';
- }}catch(ex){{err.textContent=ex.message}}finally{{if(button.isConnected)button.disabled=false}}
-}});
-</script></body></html>"""
+<button id="create" class="btn" type="submit">{key}Create account</button>
+<div class="err" id="error" role="alert"></div>
+</form></section></div>"""
+    return uitheme.page(
+        title="create administrator", name=name,
+        robots="noindex,nofollow", body=body,
+        head=f"<style>{_SETUP_CSS}</style>", scripts=_SETUP_JS)
 
 
 def _networks() -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:

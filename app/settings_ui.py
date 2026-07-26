@@ -1,107 +1,54 @@
-"""Renders /{secret}/settings — the operator dashboard.
+"""Shared settings machinery for the /connect, /tune, and / pages.
 
-One page, two jobs: plug in every upstream service this instance depends on
-(with a live Test per service, so a pasted key is verified before it's
-trusted), and set the handful of behavior knobs worth adjusting — led by the
-stream-path choice: cache on disk, pass through, or hand players direct
-links. Values are written to config.json via app.config and take effect on
-restart; the save bar walks the operator through save → restart.
+This module holds the control renderers and all of the client-side save /
+test / restart logic the three pages share:
 
-Visual language matches the /stats page (same palette, same card grammar).
-One rule carried throughout: machine truth — env keys, URLs, latencies,
-values — is set in monospace; human copy is in the system sans.
+- ``_row`` / ``_settings_section`` / ``_stream_mode`` — the behavior-knob
+  controls used by tune_ui (/tune)
+- ``_advanced_section`` — the full remaining-knob catalog, also /tune
+- ``_lane_masters`` — the four stream-lane master switches (home + connect)
+- ``_scrapers`` — the unified Sources panel (debrid keys, Prowlarr, scraper
+  engines, custom addons), on /connect
+- ``_conn_fields`` / ``_conn_configured`` — connection field generation and
+  state, on /connect
+- ``_savebar`` — the save → restart bar all three pages share
+- ``search_index`` — the Ctrl/⌘K palette index fed to uitheme.shell
+- ``_CSS`` / ``_JS`` — the shared page styles and client logic (dirty
+  tracking via [data-key], /api/settings/save, per-service Test, restart)
+
+Everything writes to config.json via app.config and takes effect on restart;
+every control is equally settable by editing the file (or asking an AI to).
 """
 
-import html
 import json
-import os
 
-from app import adminui, config, debrid, knobs, scrapers
-
-ADDON_NAME = os.environ.get("ADDON_NAME", "Auto Stream")
+from app import config, debrid, knobs, scrapers, uitheme
 
 _CSS = """
-:root{color-scheme:light dark;--bg:#fbfbfa;--card:#fff;--fg:#1a1a18;--mut:#6b6b66;
---line:#e6e6e2;--bad:#c0392b;--warn:#b8860b;--good:#2e7d5b;--accent:#3b6ea5;
---accent-soft:#eef3f9;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;}
-@media (prefers-color-scheme:dark){:root{--bg:#16171a;--card:#1e2024;--fg:#e9e9e6;
---mut:#9a9a94;--line:#2c2f34;--bad:#ff6b5e;--warn:#e0b74a;--good:#5cc99a;
---accent:#6ea3d8;--accent-soft:#232c37;}}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--fg);
-font:15px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
-padding:24px 16px 120px}
-.wrap{max-width:1000px;margin:0 auto}
-.top{display:flex;justify-content:space-between;align-items:flex-start;gap:16px}
-h1{font-size:22px;margin:0 0 4px}
-.sub{color:var(--mut);margin:0 0 20px;font-size:13px}
-.sub code{font:12px var(--mono)}
-.navlink{font-size:13px;color:var(--accent);text-decoration:none;
-border:1px solid var(--line);border-radius:20px;padding:5px 12px;
-background:var(--card);white-space:nowrap}
-.navlink:hover{border-color:var(--accent)}
-h2{font-size:16px;margin:30px 0 4px}
-.blurb{color:var(--mut);font-size:13px;margin:0 0 10px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:10px}
-.lane-masters{margin:8px 0 18px;
-border-color:color-mix(in srgb,var(--accent) 35%,var(--line))}
-.lane-master{display:flex;align-items:center;gap:14px;padding:12px 16px;
-border-bottom:1px solid var(--line)}.lane-master:last-child{border-bottom:0}
+/* page-specific layout — tokens & common components live in uitheme.BASE_CSS */
+
+/* lane master switches */
+.lane-masters{margin:0 0 18px}
+.lane-master{display:flex;align-items:center;gap:14px;padding:13px 16px;
+border-bottom:1px solid var(--line)}
+.lane-master:last-child{border-bottom:0}
 .lane-master .mastercopy{flex:1;min-width:0}
 .lane-master .mastertitle{font-weight:650}
 .lane-master .masterdesc{color:var(--mut);font-size:12.5px}
-.lane-master .masterdesc a{color:var(--accent);text-decoration:none}
-.lane-master .masterstate{font:11.5px var(--mono);color:var(--mut);min-width:70px;
-text-align:right}.lane-master .masterstate.ok{color:var(--good)}
+.lane-master .masterstate{font:11.5px var(--mono);color:var(--mut);
+min-width:70px;text-align:right}
+.lane-master .masterstate.ok{color:var(--ok)}
 .lane-master .masterstate.bad{color:var(--bad)}
 
-.row{display:flex;justify-content:space-between;align-items:center;gap:24px;
-padding:14px 16px;border-bottom:1px solid var(--line)}
-.row:last-child{border-bottom:0}
-.row.off{opacity:.45;pointer-events:none}
-.lbl{font-weight:600}
-.desc{color:var(--mut);font-size:12.5px;max-width:520px}
-.envk{font:10.5px var(--mono);color:var(--mut);opacity:.65;margin-left:8px}
-.ctl{display:flex;align-items:center;gap:10px;flex-shrink:0}
-output{font:13px var(--mono);min-width:64px;text-align:right}
-.brctl{display:flex;align-items:center;gap:10px}
-.brctl .br-range{width:150px}
-.br-num{width:62px;font:13px var(--mono);text-align:right;padding:5px 6px;
-background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:7px}
-.br-num::-webkit-outer-spin-button,.br-num::-webkit-inner-spin-button{margin:0}
-.brctl output{min-width:72px}
+.blurb{color:var(--mut);font-size:13px;margin:-6px 0 12px;max-width:72ch}
+.blurb .envk{margin-left:4px}
 
-.swi{appearance:none;-webkit-appearance:none;width:42px;height:24px;margin:0;
-border-radius:99px;background:var(--line);position:relative;cursor:pointer;
-transition:background .15s;flex-shrink:0}
-.swi::before{content:'';position:absolute;top:3px;left:3px;width:18px;height:18px;
-border-radius:50%;background:var(--card);box-shadow:0 1px 2px rgba(0,0,0,.25);
-transition:transform .15s}
-.swi:checked{background:var(--accent)}
-.swi:checked::before{transform:translateX(18px)}
-input[type=range]{accent-color:var(--accent);width:190px}
-select,input[type=text],input[type=password],input[type=url],textarea{
-background:var(--bg);color:var(--fg);border:1px solid var(--line);
-border-radius:8px;padding:8px 10px;font:13px var(--mono);width:100%}
-select{width:auto;font:14px inherit}
-textarea{resize:vertical;min-height:74px;white-space:pre;overflow-x:auto}
-input::placeholder{color:var(--mut);opacity:.8}
-
-.seg{display:inline-flex;border:1px solid var(--line);border-radius:10px;
-overflow:hidden;background:var(--bg)}
-.seg label{cursor:pointer}
-.seg input{position:absolute;opacity:0;pointer-events:none}
-.seg span{display:block;padding:8px 16px;font-size:13.5px;color:var(--mut);
-border-right:1px solid var(--line);transition:background .15s,color .15s}
-.seg label:last-child span{border-right:0}
-.seg input:checked+span{background:var(--accent);color:#fff}
-.seg input:focus-visible+span{outline:2px solid var(--accent);outline-offset:-2px}
-
-.pathcard{padding:18px 16px 4px}
+/* stream path diagram */
+.pathcard{padding:18px 16px 6px}
 .schema{display:flex;align-items:center;gap:10px;flex-wrap:wrap;
 font:12.5px var(--mono);margin:16px 2px 10px;min-height:44px}
 .node{border:1px solid var(--line);border-radius:8px;padding:7px 13px;
-background:var(--bg);transition:opacity .2s}
+background:var(--inset);transition:opacity .2s,border-color .2s,background .2s}
 .node small{display:block;font-size:10px;color:var(--mut);letter-spacing:.04em;
 text-transform:uppercase}
 .node.hot{border-color:var(--accent);background:var(--accent-soft)}
@@ -110,29 +57,38 @@ text-transform:uppercase}
 .modecap{color:var(--mut);font-size:12.5px;margin:0 2px 14px;max-width:640px}
 .modecap b{color:var(--warn);font-weight:600}
 
-.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(310px,1fr));
-gap:12px}
-details.conng{border-top:1px solid var(--line)}
-details.conng:first-of-type{border-top:0}
-details.conng>summary{cursor:pointer;padding:11px 2px;list-style:none;
-display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
-details.conng>summary::-webkit-details-marker{display:none}
-details.conng>summary::before{content:'▸';color:var(--mut);font-size:11px;
-align-self:center}
-details.conng[open]>summary::before{content:'▾'}
-details.conng>summary:hover .conngtitle{color:var(--accent)}
-.conngtitle{font-weight:600;font-size:14.5px}
-.connghint{color:var(--mut);font-size:12.5px;flex:1;min-width:120px}
-.conngcount{color:var(--mut);font:11px var(--mono);white-space:nowrap}
-details.conng>.cards{margin:2px 0 16px}
+/* slider+number combo (max bitrate) */
+.brctl{display:flex;align-items:center;gap:10px}
+.brctl .br-range{width:150px}
+.br-num{width:64px;text-align:right}
+.br-num::-webkit-outer-spin-button,.br-num::-webkit-inner-spin-button{margin:0}
+.brctl output{min-width:72px;text-align:right}
+
+/* connection cards */
+details.acc>.cards{margin:2px 0 16px}
 .conn{padding:14px 16px;display:flex;flex-direction:column;gap:10px}
-.keylink{font-size:12px;color:var(--accent);text-decoration:none;white-space:nowrap}
-.keylink:hover{text-decoration:underline}
+.chead{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}
+.cname{font-weight:600}
+.crole{color:var(--mut);font-size:12px;margin-top:1px}
+.keylink{font-size:12px;white-space:nowrap}
+.f label{display:block;font-size:11.5px;color:var(--mut);margin:0 0 3px}
+.hint{font-size:11px;color:var(--mut);opacity:.85;margin-top:3px}
+.cfoot{display:flex;align-items:center;gap:10px;margin-top:2px}
+.tres{font:11.5px var(--mono);color:var(--mut);overflow-wrap:anywhere}
+.tres.ok{color:var(--ok)}.tres.bad{color:var(--bad)}
+
+/* sources panel: debrid rows, engine rows, custom addons */
+.srcsub{font:600 10.5px var(--mono);text-transform:uppercase;letter-spacing:.14em;
+color:var(--accent2);margin:0 0 8px}
+.srcsub2{margin-top:20px;padding-top:14px;border-top:1px solid var(--line)}
+.srcsub .advhint{font:400 12px var(--sans);text-transform:none;letter-spacing:0;
+color:var(--mut)}
+.badge2{font:600 10px var(--mono);letter-spacing:.07em;text-transform:uppercase;
+color:var(--accent);background:var(--accent-soft);border-radius:5px;
+padding:4px 8px;flex-shrink:0;white-space:nowrap}
 .debridrow{display:flex;align-items:center;gap:10px;padding:10px 0;
 border-bottom:1px solid var(--line)}
 .debridrow:last-of-type{border-bottom:0}
-.badge2{font:700 10px var(--mono);color:var(--accent);background:var(--accent-soft);
-border-radius:6px;padding:3px 7px;letter-spacing:.03em;flex-shrink:0}
 .debridname{font-weight:600;font-size:14px;min-width:92px}
 .debridkey{flex:1;min-width:120px}
 .debridadd{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:12px;
@@ -140,81 +96,7 @@ padding-top:14px;border-top:1px solid var(--line)}
 .debridadd input{flex:1;min-width:140px}
 .debridfoot{display:flex;align-items:center;gap:10px;margin-top:12px;flex-wrap:wrap}
 .debridres{font:11.5px var(--mono);color:var(--mut);overflow-wrap:anywhere;flex:1}
-.debridres.ok{color:var(--good)}.debridres.bad{color:var(--bad)}
-.chead{display:flex;justify-content:space-between;gap:10px;align-items:baseline}
-.cname{font-weight:600}
-.crole{color:var(--mut);font-size:12px;margin-top:1px}
-.dot{width:9px;height:9px;border-radius:50%;background:var(--line);
-flex-shrink:0;margin-top:6px}
-.dot.run{background:var(--accent);animation:pulse 1s infinite}
-.dot.ok{background:var(--good)}
-.dot.bad{background:var(--bad)}
-@keyframes pulse{50%{opacity:.35}}
-.f label{display:block;font-size:11.5px;color:var(--mut);margin:0 0 3px}
-.hint{font-size:11px;color:var(--mut);opacity:.8;margin-top:3px}
-.cfoot{display:flex;align-items:center;gap:10px;margin-top:2px}
-.tres{font:11.5px var(--mono);color:var(--mut);overflow-wrap:anywhere}
-.tres.ok{color:var(--good)}.tres.bad{color:var(--bad)}
-
-.btn{font:600 13.5px inherit;color:#fff;background:var(--accent);border:0;
-border-radius:8px;padding:8px 16px;cursor:pointer}
-.btn.ghost{background:transparent;color:var(--accent);
-border:1px solid var(--line)}
-.btn:disabled{opacity:.5;cursor:default}
-.btn.warn{background:var(--bad)}
-
-.savebar[hidden]{display:none}
-.savebar{position:fixed;left:50%;transform:translateX(-50%);bottom:18px;
-display:flex;align-items:center;gap:14px;background:var(--card);
-border:1px solid var(--line);border-radius:12px;padding:10px 16px;
-box-shadow:0 6px 24px rgba(0,0,0,.14);z-index:10;max-width:92vw}
-.savebar-top{position:sticky;top:72px;bottom:auto;left:auto;transform:none;
-margin:-4px 0 22px;max-width:none;justify-content:space-between;z-index:20;
-box-shadow:0 2px 10px rgba(0,0,0,.06)}
-@media(max-width:520px){.savebar-top{position:static;top:auto;margin:0 0 20px}}
-.savebar .msg{font-size:13.5px}
-.savebar .msg b{font-weight:600}
-.savebar .err{color:var(--bad);font-size:12.5px;max-width:340px}
-
-.mono{font-family:var(--mono)}
-.lbl.mono{font-size:12.5px}
-details.adv{margin-top:36px;border-top:1px solid var(--line);padding-top:6px}
-details.adv>summary{cursor:pointer;padding:12px 2px;list-style:none;
-display:flex;align-items:baseline;gap:12px}
-details.adv>summary::-webkit-details-marker{display:none}
-details.adv>summary::before{content:'▸';color:var(--mut);font-size:11px}
-details.adv[open]>summary::before{content:'▾'}
-.advtitle{font-size:16px;font-weight:600}
-.advhint{color:var(--mut);font-size:12.5px}
-.advtools{display:flex;gap:10px;align-items:center;margin:4px 2px 16px;
-flex-wrap:wrap}
-#advsearch{flex:1;min-width:220px;max-width:380px;font:13px inherit;
-padding:8px 10px}
-.advgroup{margin-bottom:18px}
-.advgroup[hidden]{display:none}
-.advh{font-size:11px;text-transform:uppercase;letter-spacing:.05em;
-color:var(--mut);margin:0 2px 8px;font-weight:600}
-.advin{width:150px;text-align:right}
-.unit{font:12px var(--mono);color:var(--mut);min-width:26px}
-.adv-row[hidden]{display:none}
-.nomatch{color:var(--mut);font-size:13px;padding:8px 2px}
-.addonrow{display:flex;align-items:center;gap:10px;padding:11px 0;
-border-bottom:1px solid var(--line)}
-.addonrow:last-of-type{border-bottom:0}
-.addoninfo{flex:1;min-width:0}
-.addonname{font-weight:600;font-size:14px}
-.addonurl{display:block;font:11.5px var(--mono);color:var(--mut);overflow-wrap:anywhere}
-.addon-del{background:none;border:0;color:var(--mut);font-size:21px;line-height:1;
-cursor:pointer;padding:0 4px}
-.addon-del:hover{color:var(--bad)}
-.addonadd{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:12px;
-padding-top:14px;border-top:1px solid var(--line)}
-.addonadd input{flex:1;min-width:150px}
-.addonempty{color:var(--mut);font-size:13px;padding:2px 0 4px}
-.srcsub{font:600 11px var(--mono);text-transform:uppercase;letter-spacing:.05em;
-color:var(--mut);margin:0 0 8px}
-.srcsub2{margin-top:20px;padding-top:14px;border-top:1px solid var(--line)}
-.srcsub .advhint{font:400 12px inherit;text-transform:none;letter-spacing:0}
+.debridres.ok{color:var(--ok)}.debridres.bad{color:var(--bad)}
 .engrow{display:flex;align-items:flex-start;gap:12px;flex-wrap:wrap;
 padding:12px 0;border-bottom:1px solid var(--line)}
 .engrow:last-of-type{border-bottom:0}
@@ -225,16 +107,131 @@ padding:12px 0;border-bottom:1px solid var(--line)}
 .engblurb{color:var(--mut);font-size:12.5px;margin-top:2px}
 .engwarn{color:var(--warn);font-size:12px;margin-top:5px}
 .engurl{margin-top:8px}
-.engurl input{font:12px var(--mono)}
-.engrow .tres{flex-basis:100%;text-align:right}
+/* fill the info column — the default intrinsic input width truncates a
+   manifest URL to about two words */
+.engurl input{font-size:12px;width:100%;max-width:520px}
 
-:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-@media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+.engrow .tres{flex-basis:100%;text-align:right}
+.addonrow{display:flex;align-items:center;gap:10px;padding:11px 0;
+border-bottom:1px solid var(--line)}
+.addonrow:last-of-type{border-bottom:0}
+.addoninfo{flex:1;min-width:0}
+.addonname{font-weight:600;font-size:14px}
+.addonurl{display:block;font:11.5px var(--mono);color:var(--mut);
+overflow-wrap:anywhere}
+.addon-del{background:none;border:0;color:var(--mut);font-size:21px;line-height:1;
+cursor:pointer;padding:0 4px}
+.addon-del:hover{color:var(--bad)}
+.addonadd{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:12px;
+padding-top:14px;border-top:1px solid var(--line)}
+.addonadd input{flex:1;min-width:150px}
+.addonempty{color:var(--mut);font-size:13px;padding:2px 0 4px}
+
+/* advanced tuning */
+#adv{margin-top:36px}
+.advtools{display:flex;gap:10px;align-items:center;margin:10px 2px 16px;
+flex-wrap:wrap}
+#advsearch{flex:1;min-width:220px;max-width:380px}
+.advgroup{margin-bottom:18px}
+.advgroup[hidden]{display:none}
+.advh{font:600 10.5px var(--mono);text-transform:uppercase;letter-spacing:.14em;
+color:var(--accent2);margin:0 2px 8px}
+.advin{width:150px;text-align:right}
+.unit{font:12px var(--mono);color:var(--mut);min-width:26px}
+.adv-row[hidden]{display:none}
+.nomatch{color:var(--mut);font-size:13px;padding:8px 2px}
+.lbl.mono{font-size:12.5px}
+
+/* decisions page: left section-nav layout */
+.slayout{display:grid;grid-template-columns:200px minmax(0,1fr);gap:28px;
+align-items:start}
+.sidenav{position:sticky;top:16px;display:flex;flex-direction:column;gap:2px}
+.sidenav .sn-cap{font:600 10.5px var(--mono);letter-spacing:.14em;
+text-transform:uppercase;color:var(--accent2);margin:0 0 8px 12px}
+.sidenav a{display:block;padding:8px 12px;border-radius:8px;color:var(--mut);
+font-size:13.5px;text-decoration:none;border-left:2px solid transparent}
+.sidenav a:hover{color:var(--fg);background:var(--track)}
+.sidenav a.on{color:var(--accent);background:var(--accent-soft);
+border-left-color:var(--accent)}
+.bsec[hidden]{display:none}
+
+@media (max-width:840px){
+ .slayout{grid-template-columns:1fr}
+ .sidenav{position:static;flex-direction:row;flex-wrap:wrap;gap:4px;
+ margin:0 0 16px}
+ .sidenav .sn-cap{display:none}
+}
+
 @media (max-width:640px){
  .row{flex-direction:column;align-items:flex-start;gap:8px}
  .ctl{width:100%;justify-content:space-between}
  input[type=range]{flex:1}
 }
+
+"""
+
+INDEXER_CSS = """
+/* usenet indexer row editor — a name/url/key triple per row */
+.ixrows{display:flex;flex-direction:column;gap:8px;margin-bottom:10px}
+.ixrow{display:grid;grid-template-columns:minmax(110px,1fr) minmax(150px,2fr)
+minmax(110px,1fr) auto;gap:8px;align-items:center}
+.ixrow input{font-size:12.5px}
+.ixdel{display:inline-flex;align-items:center;justify-content:center;
+width:32px;height:32px;flex-shrink:0;border:1px solid var(--line);
+border-radius:var(--r-s);background:var(--card);color:var(--mut);cursor:pointer;
+transition:color .12s,border-color .12s}
+.ixdel:hover{color:var(--bad);border-color:var(--bad)}
+@media (max-width:640px){.ixrow{grid-template-columns:1fr auto;
+grid-template-areas:'name del' 'url url' 'key key';gap:6px}
+.ixrow .ixname{grid-area:name}.ixrow .ixurl{grid-area:url}
+.ixrow .ixkey{grid-area:key}.ixrow .ixdel{grid-area:del}
+.ixrow+.ixrow{border-top:1px solid var(--line);padding-top:10px}}
+"""
+
+_CSS = _CSS + INDEXER_CSS
+
+INDEXER_JS = """
+/* usenet indexer rows → the hidden [data-key] value the save path reads.
+   An untouched saved row keeps its data-orig index and serialises to
+   @keep:<i>, which the server resolves against the stored spec — that is how
+   a key nobody retyped survives without ever being sent to the browser. */
+function ixSync(ed){
+ const parts=[...ed.querySelectorAll('.ixrow')].map(r=>{
+  const name=r.querySelector('.ixname').value.trim();
+  const url=r.querySelector('.ixurl').value.trim();
+  const typed=r.querySelector('.ixkey').value.trim();
+  const orig=r.dataset.orig;
+  const key=typed||(orig!==undefined?'@keep:'+orig:'');
+  return (name||url||key)?[name,url,key].join('|'):'';
+ }).filter(Boolean);
+ ed.querySelector('.ixvalue').value=parts.join(';');
+ if(typeof refreshBar==='function')refreshBar();
+}
+document.querySelectorAll('.ixeditor').forEach(ed=>{
+ ed.addEventListener('input',e=>{
+  if(e.target.closest('.ixrow')){
+   /* typing a replacement key drops the row's claim on the saved one */
+   if(e.target.classList.contains('ixkey')&&e.target.value!=='')
+    delete e.target.closest('.ixrow').dataset.orig;
+   ixSync(ed);}
+ });
+ ed.addEventListener('click',e=>{
+  const del=e.target.closest('.ixdel');
+  if(del){const rows=ed.querySelectorAll('.ixrow');
+   if(rows.length>1)del.closest('.ixrow').remove();
+   else del.closest('.ixrow').querySelectorAll('input')
+    .forEach(i=>{i.value='';});
+   delete del.closest('.ixrow')?.dataset.orig;ixSync(ed);return;}
+  if(e.target.closest('.ixadd')){
+   const first=ed.querySelector('.ixrow');
+   const row=first.cloneNode(true);
+   delete row.dataset.orig;
+   row.querySelectorAll('input').forEach(i=>{i.value='';
+    if(i.classList.contains('ixkey'))i.placeholder='API key';});
+   ed.querySelector('.ixrows').appendChild(row);
+   row.querySelector('.ixname').focus();ixSync(ed);}
+ });
+});
 """
 
 _JS = """
@@ -309,7 +306,7 @@ $$('.brctl').forEach(box=>{
 async function post(url,body){
  const r=await fetch(url,{method:'POST',
   headers:{'Content-Type':'application/json','X-CSRF-Token':
-   document.querySelector('.adminnav').dataset.csrf},body:JSON.stringify(body||{})});
+   document.querySelector('[data-csrf]').dataset.csrf},body:JSON.stringify(body||{})});
  if(!r.ok)throw new Error((await r.json().catch(()=>({}))).detail||('HTTP '+r.status));
  return r.json();
 }
@@ -609,13 +606,37 @@ if(advsearch)advsearch.addEventListener('input',()=>{
  $('#advnomatch').hidden=anyGroup;
 });
 
-setMode(document.querySelector('input[name=streammode]:checked').value,true);
+/* decisions page: one section at a time behind the left nav. All sections
+   stay in the DOM (so dirty-tracking and save see every control); without
+   JS nothing is hidden and the page reads top to bottom.
+   Each link carries data-sec (the section to reveal) and an href anchor to
+   scroll to — that is how the advanced sub-groups get their own nav rows. */
+const snav=$('.sidenav');
+if(snav){
+ const links=[...snav.querySelectorAll('a[data-sec]')];
+ const secs=$$('.bsec');
+ function go(a){
+  const sec=a.dataset.sec,tgt=a.getAttribute('href').slice(1);
+  secs.forEach(s=>{s.hidden=(s.id!==sec)});
+  links.forEach(x=>x.classList.toggle('on',x===a));
+  if(sec==='sec-advanced'){const adv=document.getElementById('adv');
+   if(adv)adv.open=true;}
+  const el=tgt!==sec?document.getElementById(tgt):null;
+  if(el)el.scrollIntoView({block:'start'});else window.scrollTo(0,0);
+ }
+ links.forEach(a=>a.addEventListener('click',e=>{e.preventDefault();
+  history.replaceState(null,'',a.getAttribute('href'));go(a);}));
+ const h=location.hash||'';
+ go(links.find(a=>a.getAttribute('href')===h)||links[0]);
+}
+
+const sm0=document.querySelector('input[name=streammode]:checked');
+if(sm0)setMode(sm0.value,true);
 refreshBar();
-"""
+""" + INDEXER_JS
 
 
-def _esc(x) -> str:
-    return html.escape(str(x), quote=True)
+_esc = uitheme.esc
 
 
 def _row(spec: dict) -> str:
@@ -670,13 +691,18 @@ def _row(spec: dict) -> str:
             f"<div class='ctl'>{ctl}</div></div>")
 
 
+# Short thematic eyebrows for the tally-bar section headers, keyed by
+# config.GROUPS id (the "stream" group is rendered by _stream_mode instead).
+_EYEBROW = {"picking": "RANKING", "acquire": "FALLBACK", "identity": "IDENTITY"}
+
+
 def _settings_section(group: str, title: str, blurb: str) -> str:
     rows = "".join(_row(s) for s in config.SETTINGS
                    if s["group"] == group and not s.get("hidden"))
     if not rows:
         return ""
-    return (f"<h2>{_esc(title)}</h2><p class='blurb'>{_esc(blurb)}</p>"
-            f"<div class='card'>{rows}</div>")
+    return (uitheme.section(_EYEBROW.get(group, group.upper()), title, blurb)
+            + f"<div class='card'>{rows}</div>")
 
 
 def _stream_mode() -> str:
@@ -696,8 +722,9 @@ def _stream_mode() -> str:
     rows = "".join(_row(s) for s in config.SETTINGS
                    if s["group"] == "stream" and not s.get("hidden"))
     return f"""
-<h2>Stream path</h2><p class='blurb'>How bytes get from a source to the player.
-<span class='envk'>PROXY_PLAYBACK · PROXY_BUFFER</span></p>
+{uitheme.section("STREAM PATH", "Stream path",
+                 "How bytes get from a source to the player. "
+                 "PROXY_PLAYBACK · PROXY_BUFFER")}
 <div class='card'><div class='pathcard'>
 <div class='seg' role='radiogroup' aria-label='Stream path'>
 {seg('cache', 'Cache on disk')}{seg('proxy', 'Pass through')}{seg('direct', 'Direct links')}
@@ -750,32 +777,82 @@ def _advanced_section() -> str:
         rows = [_adv_row(s) for s in knobs.by_group(gid)]
         if not rows:
             continue
-        groups.append(f"<div class='advgroup' data-group='{gid}'>"
+        # id is stable API: /tune#adv-<gid> is what the section nav targets
+        groups.append(f"<div class='advgroup' id='adv-{gid}' "
+                      f"data-group='{gid}'>"
                       f"<div class='advh'>{_esc(title)}</div>"
                       f"<div class='card'>{''.join(rows)}</div></div>")
     return (
-        "<details class='adv' id='adv'><summary>"
-        "<span class='advtitle'>Advanced tuning</span>"
-        "<span class='advhint'>every remaining knob — timeouts, budgets, "
+        "<details class='acc' id='adv'><summary>"
+        "<span class='acc-t'>Advanced tuning</span>"
+        "<span class='acc-hint'>every remaining knob — timeouts, budgets, "
         "thresholds. You don't need these to get started.</span></summary>"
         "<div class='advtools'>"
         "<input id='advsearch' type='search' "
         "placeholder='Filter by name or description…' aria-label='Filter knobs'>"
-        "<a class='navlink' href='/api/settings/export.env'>"
+        "<a class='btn ghost sm' href='/api/settings/export.env'>"
         "Download current .env</a></div>"
         f"{''.join(groups)}"
         "<div class='nomatch' id='advnomatch' hidden>No knob matches that.</div>"
         "</details>")
 
 
-def _conn_card(conn: dict) -> str:
+def _indexer_row(orig: int | None, name: str = "", url: str = "",
+                 masked: str = "") -> str:
+    """One indexer: name, API URL, API key. A saved row's key box is empty
+    with the stored key masked as its placeholder — leave it alone and the row
+    serialises to @keep:<orig>, so nothing has to be retyped."""
+    keep = "" if orig is None else f" data-orig='{orig}'"
+    ph = _esc(masked) if masked else "API key"
+    return (f"<div class='ixrow'{keep}>"
+            f"<input class='ixname' type='text' value='{_esc(name)}' "
+            f"placeholder='Name (e.g. NZBgeek)' spellcheck='false' "
+            f"autocomplete='off' aria-label='Indexer name'>"
+            f"<input class='ixurl' type='text' value='{_esc(url)}' "
+            f"placeholder='https://api.example.com/api' spellcheck='false' "
+            f"autocomplete='off' aria-label='Indexer API URL'>"
+            f"<input class='ixkey' type='password' value='' "
+            f"placeholder='{ph}' autocomplete='new-password' "
+            f"aria-label='Indexer API key'>"
+            f"<button type='button' class='ixdel' aria-label='Remove indexer'>"
+            f"{uitheme.icon('trash', size=15)}</button></div>")
+
+
+def _indexer_editor(key: str) -> str:
+    """The NZB_INDEXERS editor: one row per indexer instead of a pipe-delimited
+    blob. A hidden [data-key] input carries the serialised value, so save,
+    dirty-tracking and Test all work exactly as they do for any other field."""
+    rows, init = [], []
+    for i, (name, url, api_key) in enumerate(
+            config.parse_indexers(config.pending(key))):
+        # Tail-only mask (not the whole-field "hidden") — the blob was
+        # sensitive because it mixed a URL with a key; here the key stands
+        # alone, and a four-character tail is what every other secret shows.
+        rows.append(_indexer_row(i, name, url, config.mask(api_key)))
+        init.append(f"{name}|{url}|@keep:{i}")
+    if not rows:
+        rows.append(_indexer_row(None))
+    return (f"<div class='ixeditor'>"
+            f"<div class='ixrows'>{''.join(rows)}</div>"
+            f"<button type='button' class='btn ghost sm ixadd'>"
+            f"{uitheme.icon('plus', size=14)}Add indexer</button>"
+            f"<input type='hidden' class='ixvalue' data-key='{key}' "
+            f"data-init='{_esc(';'.join(init))}' "
+            f"value='{_esc(';'.join(init))}'></div>")
+
+
+def _conn_fields(conn: dict) -> str:
+    """The labeled inputs for one connection (secret-masked, dirty-tracked).
+    Shared by the /connect catalog card and any future connection surface."""
     fields = []
     for f in conn["fields"]:
         key, kind = f["key"], f.get("kind", "text")
         val = config.pending(key)
         hint = (f"<div class='hint'>{_esc(f['hint'])}</div>"
                 if f.get("hint") else "")
-        if config.is_secret(key):
+        if kind == "indexers":
+            inp = _indexer_editor(key)
+        elif config.is_secret(key):
             ph = config.mask(val, key) or "not set"
             tag = "textarea" if kind == "multiline" else "input"
             if tag == "textarea":
@@ -798,51 +875,12 @@ def _conn_card(conn: dict) -> str:
         fields.append(f"<div class='f'><label>{_esc(f['label'])}"
                       f"<span class='envk'>{_esc(key)}</span></label>"
                       f"{inp}{hint}</div>")
-    return (f"<div class='card conn'><div class='chead'>"
-            f"<div><span class='cname'>{_esc(conn['name'])}</span>"
-            f"<div class='crole'>{_esc(conn['role'])}</div></div>"
-            f"<span class='dot'></span></div>"
-            f"{''.join(fields)}"
-            f"<div class='cfoot'><button class='btn ghost test' "
-            f"data-service='{conn['id']}'>Test</button>"
-            f"<span class='tres'></span></div></div>")
+    return "".join(fields)
 
 
 def _conn_configured(conn: dict) -> bool:
     """Whether any of a connection's fields currently holds a value."""
     return any(config.pending(f["key"]).strip() for f in conn["fields"])
-
-
-def _conn_group(title: str, blurb: str, conns: list[dict], *,
-                start_open: bool) -> str:
-    """One collapsible category of connection cards. Opens by default when it is
-    the primary group or already has something configured, so a fresh instance
-    isn't a wall of empty forms but nothing you've set up ever hides itself."""
-    if not conns:
-        return ""
-    n_set = sum(_conn_configured(c) for c in conns)
-    count = (f"{n_set}/{len(conns)} configured" if n_set
-             else f"{len(conns)} available")
-    cards = "".join(_conn_card(c) for c in conns)
-    open_attr = " open" if (start_open or n_set) else ""
-    return (f"<details class='conng'{open_attr}><summary>"
-            f"<span class='conngtitle'>{_esc(title)}</span>"
-            f"<span class='connghint'>{_esc(blurb)}</span>"
-            f"<span class='conngcount'>{_esc(count)}</span></summary>"
-            f"<div class='cards'>{cards}</div></details>")
-
-
-def _conn_groups() -> str:
-    known = {gid for gid, _t, _b in config.CONNECTION_GROUPS}
-    out = []
-    for i, (gid, title, blurb) in enumerate(config.CONNECTION_GROUPS):
-        conns = [c for c in config.CONNECTIONS if c.get("cat") == gid]
-        out.append(_conn_group(title, blurb, conns, start_open=(i == 0)))
-    # Safety net: any connection without a known category still shows up rather
-    # than silently vanishing from the page.
-    leftovers = [c for c in config.CONNECTIONS if c.get("cat") not in known]
-    out.append(_conn_group("Other", "", leftovers, start_open=False))
-    return "".join(out)
 
 
 def _scrapers() -> str:
@@ -877,11 +915,11 @@ def _scrapers() -> str:
                      "has_key": bool(config.pending("PROWLARR_API_KEY"))}},
         separators=(",", ":"))
     return (
-        "<h2>Sources</h2>"
-        "<p class='blurb'>Your debrid key powers every scraper here. Add the key "
-        "once, then switch on the scrapers you want — each is configured for you "
-        "automatically. Under any engine you can paste your own manifest URL to "
-        "go beyond the default. Changes apply on restart.</p>"
+        uitheme.section("CATALOG", "Sources",
+                        "debrid-powered scrapers, indexers, custom addons")
+        + "<p class='blurb'>Your debrid key powers every scraper here — add it "
+        "once, then switch on the ones you want. Each engine can take your own "
+        "manifest URL instead of the default.</p>"
         "<div class='card' id='scrapers' style='padding:14px 16px'>"
         "<div class='srcsub'>Debrid services</div>"
         "<div id='debridlist'></div>"
@@ -925,40 +963,54 @@ def _scrapers() -> str:
         "</div>")
 
 
-def render() -> str:
-    restart = "1" if config.restart_pending() else "0"
+def _savebar(restart: str, *, top: bool = False) -> str:
+    """The save → restart bar. One near the top of the page (sticky) and one
+    at the bottom; _JS keeps all of them in sync."""
+    cls = "savebar top" if top else "savebar"
+    return (f'<div class="{cls}" hidden data-restart="{restart}">'
+            '<span class="msg"></span><span class="err"></span>'
+            '<button class="btn savebtn">Save changes</button>'
+            '<button class="btn danger restartbtn" hidden>Restart addon</button>'
+            '</div>')
+
+
+def _lane_masters() -> str:
+    """Every stream lane's master switch. Each saves itself immediately and
+    independently (see the .lane-master-toggle handler in _JS) so flipping a
+    lane never submits or clears unrelated credential fields.
+
+    Private trackers are a lane like any other, so the switch lives here too —
+    its trackers, ratios and safety rules stay on /private-trackers, but the
+    on/off belongs with its siblings."""
     def lane_on(key: str) -> bool:
         return config.pending(key).lower() not in (
             "", "0", "false", "no", "off")
 
     public_on = lane_on("PUBLIC_TRACKERS_ENABLED")
+    private_on = lane_on("PRIVATE_TRACKERS_ENABLED")
     https_on = lane_on("HTTPS_STREAMS_ENABLED")
     jellyfin_on = lane_on("JELLYFIN_ENABLED")
     usenet_on = lane_on("USENET_ENABLED")
-    sections = _stream_mode()
-    for gid, title, blurb in config.GROUPS:
-        if gid == "stream":
-            continue
-        sections += _settings_section(gid, title, blurb)
-    conn_groups = _conn_groups()
-    return f"""<!doctype html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="robots" content="noindex">
-<title>{_esc(ADDON_NAME)} — settings</title>
-<style>{_CSS}{adminui.NAV_CSS}</style></head>
-<body><div class="wrap">
-{adminui.nav('settings', ADDON_NAME)}
-<h1>Settings</h1>
+    return f"""
 <section class="card lane-masters">
  <div class="lane-master"><div class="mastercopy"><div class="mastertitle">Public tracker searches</div>
  <div class="masterdesc">One switch for Comet, StremThru, MediaFusion,
- native Prowlarr, and every custom online addon. Jellyfin, direct Usenet, and
- <a href="/private-trackers">private trackers</a> remain independent.</div></div>
+ native Prowlarr, and every custom online addon. Every other lane below
+ stays independent of this one.</div></div>
  <span class="masterstate" id="public_trackers_state"></span>
  <input class="swi lane-master-toggle" id="public_trackers_master" type="checkbox"
  data-key="PUBLIC_TRACKERS_ENABLED" data-state="public_trackers_state"
  data-init="{'1' if public_on else '0'}" {'checked' if public_on else ''}
  aria-label="Enable all public tracker searches"></div>
+ <div class="lane-master"><div class="mastercopy"><div class="mastertitle">Private tracker downloads</div>
+ <div class="masterdesc">Your isolated local lane — downloads run on this box
+ and never touch debrid. Trackers, release order and seeding rules live on
+ <a href="/private-trackers">Trackers</a>.</div></div>
+ <span class="masterstate" id="private_trackers_state"></span>
+ <input class="swi lane-master-toggle" id="private_trackers_master" type="checkbox"
+ data-key="PRIVATE_TRACKERS_ENABLED" data-state="private_trackers_state"
+ data-init="{'1' if private_on else '0'}" {'checked' if private_on else ''}
+ aria-label="Enable private tracker downloads"></div>
  <div class="lane-master"><div class="mastercopy"><div class="mastertitle">Direct HTTPS streams</div>
  <div class="masterdesc">Enable or disable direct HTTP(S) playback sources
  from custom addons independently of torrent/debrid results.</div></div>
@@ -983,28 +1035,30 @@ def render() -> str:
  data-key="USENET_ENABLED" data-state="usenet_master_state"
  data-init="{'1' if usenet_on else '0'}" {'checked' if usenet_on else ''}
  aria-label="Enable direct Usenet source"></div>
-</section>
-<p class="sub">Connect your services and choose how streams are handled.
-Saved to <code>/data/config.json</code> on the addon's data volume; changes
-apply on restart. Anyone deploying their own instance starts here.</p>
-<div class="savebar savebar-top" hidden data-restart="{restart}">
-<span class="msg"></span><span class="err"></span>
-<button class="btn savebtn">Save changes</button>
-<button class="btn warn restartbtn" hidden>Restart addon</button>
-</div>
-{sections}
-{_scrapers()}
-<h2>Connections</h2>
-<p class="blurb">Every upstream service this instance uses, grouped by what it
-does — click a heading to open or close that section. Test verifies the values
-in the form — including keys you haven't saved yet. Leave a masked field blank
-to keep the stored key.</p>
-{conn_groups}
-{_advanced_section()}
-</div>
-<div class="savebar" hidden data-restart="{restart}">
-<span class="msg"></span><span class="err"></span>
-<button class="btn savebtn">Save changes</button>
-<button class="btn warn restartbtn" hidden>Restart addon</button>
-</div>
-<script>{_JS}</script></body></html>"""
+</section>"""
+
+
+def search_index() -> list[dict]:
+    """Ctrl/⌘K palette index for the app shell: every knob and every
+    connection, deep-linking to its page anchor. Values are pre-escaped for
+    the palette's innerHTML rendering."""
+    titles = {gid: title for gid, title, _b in config.GROUPS}
+    out: list[dict] = []
+    for s in config.SETTINGS:
+        if s.get("hidden"):
+            continue
+        out.append({
+            "t": _esc(s["label"]), "k": _esc(s["key"]),
+            "s": _esc(f"Tune · {titles.get(s['group'], s['group'])}"),
+            "href": f"/tune#sec-{s['group']}"})
+    for gid, title in knobs.GROUPS:
+        for s in knobs.by_group(gid):
+            out.append({
+                "t": _esc(s["key"]), "k": _esc(s["key"]),
+                "s": _esc(f"Advanced · {title}"),
+                "href": "/tune#sec-advanced"})
+    for c in config.CONNECTIONS:
+        out.append({
+            "t": _esc(c["name"]), "k": _esc(c["id"]),
+            "s": "Connect", "href": f"/connect#conn-{c['id']}"})
+    return out

@@ -12,11 +12,10 @@ duplicates row logic — it only decides what is switchable.
 
 from __future__ import annotations
 
-import html
 import json
 import os
 
-from app import adminui
+from app import uitheme
 
 ADDON_NAME = os.environ.get("ADDON_NAME", "Auto Stream")
 
@@ -64,23 +63,14 @@ FAMILY_SPECS = (
     },
 )
 
+# Page-specific rules only: the palette, page frame, cards and typography all
+# come from uitheme.BASE_CSS via shell(). Nothing here may hardcode a colour —
+# a value that is not a token stops following the theme the moment someone
+# picks one.
 _CSS = """
-:root{color-scheme:light dark;--bg:#fbfbfa;--card:#fff;--fg:#1a1a18;--mut:#6b6b66;
---line:#e6e6e2;--bad:#c0392b;--warn:#9a6700;--good:#2e7d5b;--accent:#3b6ea5;
---soft:#eef3f9;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
-@media(prefers-color-scheme:dark){:root{--bg:#16171a;--card:#1e2024;--fg:#e9e9e6;
---mut:#9a9a94;--line:#2c2f34;--bad:#ff6b5e;--warn:#e0b74a;--good:#5cc99a;
---accent:#6ea3d8;--soft:#232c37}}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);
-font:15px/1.5 system-ui,sans-serif;padding:24px 16px 100px}
-.wrap{max-width:1000px;margin:auto}
-h1{font-size:23px;margin:0 0 5px}h2{font-size:16px;margin:0 0 4px}
-.sub,.mut{color:var(--mut)}
-.card{background:var(--card);border:1px solid var(--line);border-radius:12px;
-padding:16px 18px;margin:14px 0}
 .who{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin-bottom:2px}
 .who .nm{font-weight:650;font-size:16px}
-.pill{font-size:11.5px;padding:1px 7px;border-radius:99px;background:var(--soft);
+.pill{font-size:11.5px;padding:1px 7px;border-radius:99px;background:var(--inset);
 color:var(--accent);border:1px solid var(--line)}
 .meta{color:var(--mut);font-size:12.5px;margin-bottom:12px}
 .row{display:flex;align-items:center;gap:12px;padding:9px 11px;border:1px solid var(--line);
@@ -88,34 +78,59 @@ border-radius:9px;margin-bottom:6px}
 .row .pos{font:12px var(--mono);color:var(--mut);min-width:20px}
 .row .info{flex:1}.row .t{font-size:14px}.row .d{color:var(--mut);font-size:12.5px}
 .row.fixed{opacity:.7}
-button.sw{font-size:12.5px;padding:5px 13px;border-radius:7px;cursor:pointer;
-border:1px solid var(--line);white-space:nowrap}
-button.sw.on{background:var(--good);border-color:var(--good);color:#fff}
+button.sw{font:600 12.5px var(--sans);padding:5px 13px;border-radius:7px;
+cursor:pointer;border:1px solid var(--line2);white-space:nowrap}
+button.sw.on{background:var(--accent);border-color:transparent;color:var(--accent-ink)}
 button.sw.off{background:transparent;color:var(--mut)}
 button.sw:disabled{cursor:default;opacity:.65}
 a.url{display:block;font:12px var(--mono);color:var(--accent);word-break:break-all;
-background:var(--soft);padding:7px 9px;border-radius:7px;margin:2px 0 8px;
+background:var(--inset);padding:7px 9px;border-radius:7px;margin:2px 0 8px;
 text-decoration:none}a.url:hover{text-decoration:underline}
 .lbl{font-size:12.5px;margin:8px 0 2px}
 .lanelbl{font-size:11.5px;color:var(--mut);margin:6px 0 1px}
-.acts{display:flex;gap:7px;flex-wrap:wrap}
-.acts button{font-size:12.5px;padding:5px 11px;border-radius:7px;cursor:pointer;
-border:1px solid var(--line);background:transparent;color:var(--fg)}
-.acts button.danger{color:var(--bad);border-color:var(--bad)}
-.acts button:disabled{opacity:.6;cursor:default}
+.acts{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+/* The viewer cards are built in JS, so the action buttons are matched to
+   uitheme's ghost button by selector rather than by class. */
+.acts button{font:600 12.5px var(--sans);padding:5px 12px;border-radius:7px;
+cursor:pointer;border:1px solid var(--line2);background:transparent;
+color:var(--accent);transition:border-color .12s,background .12s}
+.acts button:hover{border-color:var(--accent);background:var(--accent-soft)}
+.acts button.danger{color:var(--bad)}
+.acts button.danger:hover{border-color:var(--bad);background:var(--bad-soft)}
+.acts button:disabled{opacity:.5;cursor:default;background:transparent}
 .pill.err{background:transparent;color:var(--bad);border-color:var(--bad)}
 .hidden{display:none}
 .field{margin:8px 0}
 .field label{display:block;font-size:12.5px;color:var(--mut);margin-bottom:3px}
-.field input{width:100%;max-width:320px;padding:7px 9px;border-radius:7px;
-border:1px solid var(--line);background:var(--bg);color:var(--fg);font-size:14px}
+.field input{width:100%;max-width:320px}
 .chk{display:flex;align-items:center;gap:7px;font-size:14px;margin:10px 0}
 .code{font:22px/1.3 var(--mono);letter-spacing:.22em;text-align:center;
-background:var(--soft);border:1px dashed var(--line);border-radius:8px;
+background:var(--inset);border:1px dashed var(--line2);border-radius:8px;
 padding:12px;margin:10px 0;max-width:320px}
 """
 
 
+
+
+_HEAD = uitheme.pagehead(
+    "Catalog builder", "Daily Picks",
+    "Which home rows each viewer gets, and in what order. Continue watching "
+    "and watch history are rebuilt every time the home screen opens; "
+    "everything else is built nightly. Every viewer is listed the same way — "
+    "there is no owner account with special treatment.")
+
+
+def render_unconfigured() -> str:
+    """Shown when SETUP_SECRET is unset. Daily Picks proxies every mutation
+    through app/recs' onboarding secret, so without one there is nothing this
+    page could do — but it is in the nav, so it has to say why."""
+    return uitheme.shell(
+        title="Catalog builder", name=ADDON_NAME, active="picks",
+        head=f"<style>{_CSS}</style>", robots="noindex,nofollow",
+        body=_HEAD + uitheme.empty(
+            "Daily Picks is not configured on this install: set SETUP_SECRET "
+            "to the onboarding secret its catalogs are served under, then "
+            "restart. Streaming is unaffected either way."))
 
 
 def render(setup_secret: str) -> str:
@@ -126,17 +141,7 @@ def render(setup_secret: str) -> str:
     public onboarding page already uses, and this page is only ever served
     behind the LAN-only admin guard.
     """
-    return f"""<!doctype html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Catalog builder — {html.escape(ADDON_NAME)}</title>
-<style>{adminui.NAV_CSS}{_CSS}</style></head><body>
-{adminui.nav("picks", ADDON_NAME)}
-<div class="wrap">
-<h1>Catalog builder</h1>
-<div class="sub">Which home rows each viewer gets, and in what order. Continue
-watching and watch history are rebuilt every time the home screen opens;
-everything else is built nightly. Every viewer is listed the same way — there
-is no owner account with special treatment.</div>
+    body = f"""{_HEAD}
 <div id="out"><p class="mut">Loading…</p></div>
 
 <div class="card" id="add">
@@ -157,9 +162,9 @@ is no owner account with special treatment.</div>
     <div class="mut" id="pstat">Waiting for approval on Trakt…</div>
     <div class="acts"><button id="cancel">Cancel</button></div>
   </div>
-</div>
-</div>
-<script>
+</div>"""
+
+    scripts = f"""<script>
 const SETUP = {json.dumps(setup_secret)};
 const SPECS = {json.dumps(list(ROW_SPECS))};
 const FAMILIES = {json.dumps(list(FAMILY_SPECS))};
@@ -350,4 +355,9 @@ async function poll(interval) {{
 }}
 
 load();
-</script></body></html>"""
+</script>"""
+
+    return uitheme.shell(title="Catalog builder", name=ADDON_NAME,
+                         active="picks", body=body, scripts=scripts,
+                         head=f"<style>{_CSS}</style>",
+                         robots="noindex,nofollow")

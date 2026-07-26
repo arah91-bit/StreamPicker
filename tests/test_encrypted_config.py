@@ -67,7 +67,7 @@ class EncryptedConfigStoreTests(unittest.TestCase):
             spec = config._SPECS[key]
             if spec.get("kind") == "url":
                 value = f"https://service.invalid/config/{key.lower()}-token"
-            elif spec.get("kind") == "multiline":
+            elif spec.get("kind") in ("multiline", "indexers"):
                 value = (f"synthetic|https://indexer.invalid/{key.lower()}|"
                          "synthetic-indexer-credential")
             else:

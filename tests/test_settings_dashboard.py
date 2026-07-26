@@ -18,7 +18,7 @@ _TMP = tempfile.mkdtemp(prefix="sp-settings-test-")
 os.environ.setdefault("ADDON_SECRET", "test-secret")
 os.environ["CONFIG_FILE"] = os.path.join(_TMP, "config.json")
 
-from app import config, connections, envref, knobs, settings_ui
+from app import config, connect_ui, connections, envref, home_ui, knobs, tune_ui
 
 
 def _wipe_store():
@@ -103,6 +103,47 @@ class ConfigStoreTests(unittest.TestCase):
                      "def|https://def.example/api|k2\n\n"})
         self.assertEqual("abc|https://abc.example/api|k1;"
                          "def|https://def.example/api|k2",
+                         config.pending("NZB_INDEXERS"))
+
+    def test_indexer_rows_keep_untyped_keys_without_ever_exposing_them(self):
+        """The row editor shows a name and a URL but never a saved API key, so
+        an untouched row serialises to @keep:<i> and the server resolves it.
+        Editing one indexer must not mean retyping every other one's key."""
+        config.save({"NZB_INDEXERS":
+                     "geek|https://geek.example/api|SECRETKEY111;"
+                     "planet|https://planet.example/api|SECRETKEY222"})
+        html = connect_ui.render()
+        self.assertNotIn("SECRETKEY111", html)
+        self.assertNotIn("SECRETKEY222", html)
+        self.assertIn("@keep:0", html)          # row 0's placeholder claim
+        self.assertIn("ixrow", html)
+
+        # rename row 0 and re-point row 1, retyping neither key
+        config.save({"NZB_INDEXERS":
+                     "NZBgeek|https://geek.example/api|@keep:0;"
+                     "planet|https://new.planet.example/api|@keep:1"})
+        self.assertEqual("NZBgeek|https://geek.example/api|SECRETKEY111;"
+                         "planet|https://new.planet.example/api|SECRETKEY222",
+                         config.pending("NZB_INDEXERS"))
+
+        # typing a replacement in one row leaves the other's key alone
+        config.save({"NZB_INDEXERS":
+                     "NZBgeek|https://geek.example/api|@keep:0;"
+                     "planet|https://new.planet.example/api|BRANDNEW333"})
+        self.assertIn("|SECRETKEY111;", config.pending("NZB_INDEXERS"))
+        self.assertTrue(config.pending("NZB_INDEXERS").endswith("BRANDNEW333"))
+
+    def test_indexer_rows_reject_incomplete_and_unknown_keeps(self):
+        config.save({"NZB_INDEXERS": "geek|https://geek.example/api|K1"})
+        for bad in ("noname|https://x.example/api|",     # missing key
+                    "name||somekey",                     # missing URL
+                    "name|https://x.example/api|@keep:9",  # no such saved row
+                    "justaname"):                        # not three parts
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    config.save({"NZB_INDEXERS": bad})
+        # a rejected save leaves the stored spec untouched
+        self.assertEqual("geek|https://geek.example/api|K1",
                          config.pending("NZB_INDEXERS"))
 
     def test_apply_env_overlays(self):
@@ -246,12 +287,17 @@ class SecretHygieneTests(unittest.TestCase):
         os.environ["JELLYFIN_PASSWORD"] = "jellyfin-secret-password-2468"
         os.environ["NZB_INDEXERS"] = "idx|https://idx.example|secret-indexer-key"
         try:
-            page = settings_ui.render()
-            self.assertNotIn("tmdb-secret-value-98765", page)
-            self.assertNotIn("davpass-secret-55555", page)
-            self.assertNotIn("secret-config-path", page)
-            self.assertNotIn("jellyfin-secret-password-2468", page)
-            self.assertNotIn("secret-indexer-key", page)
+            # every page that can touch a configured value: the install/status
+            # home, the connection catalog, and the knobs
+            for page in (home_ui.render([], [("Auto Stream", "http://x/m.json")],
+                                        []),
+                         connect_ui.render(), tune_ui.render()):
+                self.assertNotIn("tmdb-secret-value-98765", page)
+                self.assertNotIn("davpass-secret-55555", page)
+                self.assertNotIn("secret-config-path", page)
+                self.assertNotIn("jellyfin-secret-password-2468", page)
+                self.assertNotIn("secret-indexer-key", page)
+            page = connect_ui.render()
             # Sensitive URLs/multiline specs are fully hidden; ordinary secret
             # fields show only their harmless four-character tail.
             self.assertGreaterEqual(page.count("kept · hidden"), 2)
@@ -305,7 +351,7 @@ class SecretHygieneTests(unittest.TestCase):
             export = envref.current_dotenv()
             self.assertNotIn("torz-debrid-key-abcd", export)
             self.assertNotIn("mf-debrid-blob-wxyz", export)
-            page = settings_ui.render()
+            page = connect_ui.render()
             self.assertNotIn("torz-debrid-key-abcd", page)
             self.assertNotIn("mf-debrid-blob-wxyz", page)
         finally:
@@ -374,30 +420,127 @@ class RouteTests(unittest.TestCase):
         self.assertIn("Basic", r.headers.get("www-authenticate", ""))
 
     def test_dashboard_is_clean_local_paths(self):
-        for path in ("/", "/settings", "/stats"):
+        for path in ("/", "/connect", "/tune", "/health/sources",
+                     "/private-trackers"):
             r = self.client.get(path, headers=self.LOCAL)
             self.assertEqual(200, r.status_code, path)
-        # one site: every admin page carries the shared tab nav
-        self.assertIn("adminnav", self.client.get("/", headers=self.LOCAL).text)
+            # one site: every admin page carries the shared app-shell nav
+            self.assertIn("rail-nav", r.text, path)
+
+    def test_the_catalog_builder_lives_in_the_same_chrome(self):
+        """Daily Picks is a permanent nav item, so /picks has to render the
+        shared shell in both states — including on an install with no
+        SETUP_SECRET, where a bare 503 body would be a dead link in the nav."""
+        from unittest import mock
+        with mock.patch.dict(os.environ, {"SETUP_SECRET": ""}):
+            r = self.client.get("/picks", headers=self.LOCAL)
+        self.assertEqual(503, r.status_code)
+        self.assertIn("rail-nav", r.text)
+        self.assertIn("SETUP_SECRET", r.text)
+        with mock.patch.dict(os.environ, {"SETUP_SECRET": "picks-secret"}):
+            r = self.client.get("/picks", headers=self.LOCAL)
+        self.assertEqual(200, r.status_code)
+        self.assertIn("rail-nav", r.text)
+        self.assertIn("Catalog builder", r.text)
+
+    def test_pre_redesign_paths_still_resolve(self):
+        # old bookmarks must land on the renamed page, not 404
+        for old, new in (("/connections", "/connect"), ("/settings", "/tune"),
+                         ("/stats", "/health/sources")):
+            r = self.client.get(old, headers=self.LOCAL, follow_redirects=False)
+            self.assertEqual(301, r.status_code, old)
+            self.assertTrue(r.headers["location"].startswith(new), old)
 
     def test_public_client_is_blocked(self):
         # a request forwarded from the public internet must not see the dashboard
         pub = {**self.LOCAL, "x-forwarded-for": "8.8.8.8"}
-        for path in ("/", "/settings", "/stats", "/api/settings/status.json"):
+        for path in ("/", "/connect", "/tune", "/health/sources", "/picks",
+                     "/connections", "/settings", "/stats",
+                     "/api/settings/status.json"):
             self.assertEqual(404, self.client.get(path, headers=pub).status_code,
                              path)
 
-    def test_settings_page_renders(self):
-        r = self.client.get("/settings", headers=self.LOCAL)
+    def test_every_theme_is_offered_and_its_art_is_served(self):
+        """The picker lists every theme in uitheme.THEMES, and the ids it can
+        write are the same set the pre-paint restore script will accept — a
+        mismatch means a theme you can pick but that never applies."""
+        from app import uitheme
+        page = self.client.get("/", headers=self.LOCAL).text
+        ids = [tid for tid, _label, _sw in uitheme.THEMES]
+        self.assertIn("shark", ids)
+        for tid, label, _sw in uitheme.THEMES:
+            with self.subTest(theme=tid):
+                self.assertIn(f'data-theme-id="{tid}"', page)
+                self.assertIn(label.split(" ")[0], page)
+        # the restore script's allowlist must cover every non-auto id
+        for tid in ids:
+            if tid:
+                self.assertIn(f"'{tid}'", page)
+        # skinned themes need their backdrop, and nothing else is reachable
+        for name in ("shark", "kdrama"):
+            r = self.client.get(f"/skin/{name}.jpg")
+            self.assertEqual(200, r.status_code, name)
+            self.assertEqual("image/jpeg", r.headers["content-type"])
+        self.assertEqual(404, self.client.get("/skin/notathing.jpg").status_code)
+
+    def test_theme_assets_carry_no_stray_control_characters(self):
+        r"""The CSS and JS ship as plain Python strings, where a CSS escape
+        like '\00b7' is read as an *octal* escape and plants a NUL — which
+        voids the declaration it sits in, silently and invisibly. Caught
+        one of these in the paused-HUD rule; cheap to keep asserting."""
+        from app import uitheme
+        for name in ("BASE_CSS", "SKIN_CSS", "SKIN_JS", "_THEME_JS",
+                     "_THEME_RESTORE"):
+            blob = getattr(uitheme, name)
+            bad = sorted({c for c in blob if ord(c) < 32 and c not in "\n\t"})
+            self.assertFalse(bad, f"{name} has control chars: {bad!r}")
+
+    def test_the_shark_game_cannot_touch_a_setting(self):
+        """Feeding Frenzy runs on top of a live settings page, so the click
+        shield is load-bearing: while a round is up it must sit above the
+        content and swallow anything that isn't prey. Losing this means a
+        missed tap silently flips a lane."""
+        page = self.client.get("/", headers=self.LOCAL).text
+        self.assertIn('id="sharkshield"', page)
+        self.assertIn('id="sharkhud"', page)
+        # the shield covers the page; the rail stays above it as an escape
+        # hatch, and the HUD above that so quit is always reachable
+        shield_z = re.search(r"#sharkshield\{[^}]*z-index:(\d+)", page)
+        rail_z = re.search(r"\n\.rail\{[^}]*z-index:(\d+)", page)
+        hud_z = re.search(r"#sharkhud\{[^}]*z-index:(\d+)", page)
+        self.assertTrue(shield_z and rail_z and hud_z, "z-index rules missing")
+        self.assertLess(int(shield_z.group(1)), int(rail_z.group(1)))
+        self.assertLess(int(rail_z.group(1)), int(hud_z.group(1)))
+        # you steer the shark, so prey must never swallow the pointer that is
+        # doing the steering, and a drag has to swim rather than scroll
+        self.assertRegex(page, r"#sharkfx \.prey\{[^}]*pointer-events:none")
+        self.assertRegex(page, r"#sharkshield\{[^}]*touch-action:none")
+        # and none of it exists for someone who asked for less motion —
+        # the skin's own reduce block, not BASE_CSS's transition killer
+        reduced = page.split("prefers-reduced-motion:reduce")[-1][:220]
+        for el in ("#sharkfx", "#sharkpet", "#sharkhud", "#sharkshield"):
+            self.assertIn(el, reduced)
+
+    def test_tune_page_renders(self):
+        r = self.client.get("/tune", headers=self.LOCAL)
         self.assertEqual(200, r.status_code)
         self.assertEqual("no-store", r.headers.get("cache-control"))
         self.assertEqual("DENY", r.headers.get("x-frame-options"))
         self.assertIn("frame-ancestors 'none'",
                       r.headers.get("content-security-policy", ""))
         self.assertIn("Stream path", r.text)
-        self.assertIn("Connections", r.text)
         self.assertIn("Advanced tuning", r.text)
         self.assertIn("FAST_TIMEOUT", r.text)
+
+    def test_connect_page_renders(self):
+        r = self.client.get("/connect", headers=self.LOCAL)
+        self.assertEqual(200, r.status_code)
+        self.assertEqual("no-store", r.headers.get("cache-control"))
+        # lane masters and the tested service cards live here; the knobs
+        # themselves stayed on /tune (the palette index aside)
+        self.assertIn('id="public_trackers_master"', r.text)
+        self.assertIn("Sources", r.text)
+        self.assertNotIn('data-key="FAST_TIMEOUT"', r.text)
 
     def test_export_env_route(self):
         r = self.client.get("/api/settings/export.env", headers=self.LOCAL)

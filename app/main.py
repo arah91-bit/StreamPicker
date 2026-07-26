@@ -27,11 +27,11 @@ try:
 except ValueError as exc:
     raise RuntimeError(f"invalid stream-picker configuration: {exc}") from exc
 
-from app import (acquire, admin_auth, adminui, anime, connections, dashboard,  # noqa: E402
-                 envref, library, meta, overview, picker, private_trackers,
-                 picks_ui, private_ui, probe, prowlarr, proxy, recs_mount,
-                 reputation, scrapers, settings_ui, sources, tbcache,
-                 telemetry, usenet, usenet_health, vprobe, wizard)
+from app import (acquire, admin_auth, adminui, anime, connect_ui, connections,  # noqa: E402
+                 dashboard, envref, home_ui, library, meta, picker, picks_ui,
+                 private_trackers, private_ui, probe, prowlarr, proxy,
+                 recs_mount, reputation, scrapers, sources, tbcache, telemetry,
+                 tune_ui, usenet, usenet_health, vprobe, wizard)
 
 NOTICE_FILE = pathlib.Path(__file__).parent / "static" / "notice.mp4"
 NOTICE_THEATRICAL_FILE = (pathlib.Path(__file__).parent / "static"
@@ -108,6 +108,14 @@ async def _lifespan(_app: FastAPI):
 
 app = FastAPI(lifespan=_lifespan)
 
+# Every admin HTML page, including the pre-redesign paths that now redirect.
+# These get no-store + the strict CSP below; keep new pages in sync here.
+_ADMIN_PAGES = frozenset({
+    "/", "/connect", "/tune", "/health/sources", "/setup", "/picks",
+    "/private-trackers", "/private-trackers/setup",
+    "/settings", "/connections", "/stats",
+})
+
 
 @app.middleware("http")
 async def _log_request(request: Request, call_next):
@@ -118,7 +126,7 @@ async def _log_request(request: Request, call_next):
     resp.headers.setdefault("X-Content-Type-Options", "nosniff")
     resp.headers.setdefault("Referrer-Policy", "no-referrer")
     resp.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
-    if (request.url.path in ("/", "/settings", "/stats", "/private-trackers")
+    if (request.url.path in _ADMIN_PAGES
             or request.url.path.startswith("/api/")):
         resp.headers["Cache-Control"] = "no-store"
         resp.headers.setdefault("X-Frame-Options", "DENY")
@@ -214,7 +222,10 @@ def _readiness() -> tuple[bool, str]:
 
 @app.get("/health/live")
 async def health_live():
-    return {"ok": True, "status": "alive"}
+    # `instance` is an opaque per-process nonce, not a secret — it lets the
+    # public-URL check confirm the address it was given loops back to *this*
+    # server rather than to some other host that happens to answer.
+    return {"ok": True, "status": "alive", "instance": adminui.INSTANCE_ID}
 
 
 @app.get("/health/ready")
@@ -228,6 +239,20 @@ async def health_ready():
 async def health():
     """Compatibility/readiness endpoint used by the container healthcheck."""
     return await health_ready()
+
+
+SKIN_DIR = pathlib.Path(__file__).parent / "static" / "skins"
+
+
+@app.get("/skin/{name}.jpg")
+async def skin(name: str):
+    """Backdrop art for the loud dashboard themes. Ungated like the notice
+    video — it is decoration, discloses nothing, and a CSS background can't
+    carry the admin session on every browser."""
+    if name not in ("shark", "kdrama"):
+        raise HTTPException(status_code=404)
+    return FileResponse(SKIN_DIR / f"{name}.jpg", media_type="image/jpeg",
+                        headers={"Cache-Control": "public, max-age=604800"})
 
 
 @app.get("/notice.mp4")
@@ -359,7 +384,8 @@ async def private_playback(token: str, request: Request):
 
 # ── local admin dashboard (clean paths, no secret; see _admin guard) ─────────
 def _addon_links(request: Request) -> list[tuple[str, str]]:
-    """Manifest URLs for every picker variant, ready to paste into Stremio.
+    """Manifest URLs for every picker variant, ready to paste into the player
+    (Nuvio, Stremio, or any Stremio-protocol client).
     Prefer the configured public URL; a plain-LAN install falls back to the
     address the dashboard itself was reached on."""
     base = (os.environ.get("ADDON_PUBLIC_URL") or "").rstrip("/")
@@ -384,15 +410,58 @@ async def dash_home(request: Request):
         # Fresh install with no stream source yet: the overview would be an
         # empty ledger, so the home tab walks through setup instead.
         return HTMLResponse(wizard.render())
-    return HTMLResponse(overview.render(telemetry.load(),
-                                        addons=_addon_links(request)))
+    blocks = reputation.listing() + usenet_health.blocked_listing()
+    return HTMLResponse(home_ui.render(telemetry.load(),
+                                       addons=_addon_links(request),
+                                       blocks=blocks))
+
+
+# New IA paths (Home / Connect / Tune / Health); the pre-redesign paths
+# redirect so old bookmarks keep working.
+@app.get("/connect")
+async def connect_page(request: Request):
+    await _admin(request)
+    return HTMLResponse(connect_ui.render())
+
+
+@app.get("/tune")
+async def tune_page(request: Request):
+    await _admin(request)
+    return HTMLResponse(tune_ui.render())
+
+
+@app.get("/health/sources")
+async def health_page(request: Request, min_n: int = 3):
+    # Nested under /health so the bare /health readiness JSON above keeps its
+    # ungated contract for container healthchecks and external monitors.
+    await _admin(request)
+    blocks = reputation.listing() + usenet_health.blocked_listing()
+    return HTMLResponse(dashboard.render(telemetry.load(), blocks, min_n=min_n))
+
+
+@app.get("/connections")
+async def connections_page(request: Request):
+    await _admin(request)
+    return RedirectResponse("/connect", status_code=301)
+
+
+@app.get("/settings")
+async def settings_page(request: Request):
+    await _admin(request)
+    return RedirectResponse("/tune", status_code=301)
+
+
+@app.get("/stats")
+async def stats(request: Request, min_n: int = 3):
+    await _admin(request)
+    return RedirectResponse(f"/health/sources?min_n={min_n}", status_code=301)
 
 
 @app.get("/setup")
 async def setup_wizard(request: Request):
     """The guided first-run setup; revisitable any time by URL."""
     await _admin(request)
-    return HTMLResponse(wizard.render())
+    return HTMLResponse(wizard.render(active=""))
 
 
 @app.post("/api/setup/apply")
@@ -435,19 +504,6 @@ async def admin_setup(request: Request):
     return {"ok": True, "username": username}
 
 
-@app.get("/settings")
-async def settings_page(request: Request):
-    await _admin(request)
-    return HTMLResponse(settings_ui.render())
-
-
-@app.get("/stats")
-async def stats(request: Request, min_n: int = 3):
-    await _admin(request)
-    blocks = reputation.listing() + usenet_health.blocked_listing()
-    return HTMLResponse(dashboard.render(telemetry.load(), blocks, min_n=min_n))
-
-
 @app.get("/private-trackers")
 async def private_trackers_page(request: Request):
     await _admin(request)
@@ -461,8 +517,9 @@ async def picks_page(request: Request):
     await _admin(request)
     setup_secret = os.environ.get("SETUP_SECRET", "")
     if not setup_secret:
-        raise HTTPException(503, "Daily Picks is not configured (SETUP_SECRET "
-                                 "is unset)")
+        # Picks is a permanent nav item, so an install without it must land on
+        # a page that explains itself rather than a raw 503 body.
+        return HTMLResponse(picks_ui.render_unconfigured(), status_code=503)
     return HTMLResponse(picks_ui.render(setup_secret))
 
 
@@ -542,7 +599,7 @@ async def unblock(request: Request, sig: str):
         usenet_health.unblock(sig)
     else:
         reputation.unblock(sig)
-    return RedirectResponse(url="/stats", status_code=303)
+    return RedirectResponse(url="/health/sources", status_code=303)
 
 
 @app.post("/api/decode/clear")
@@ -550,14 +607,14 @@ async def decode_clear(request: Request, key: str):
     await _admin(request, mutation=True)
     from app import decode_health
     decode_health.clear(key)
-    return RedirectResponse(url="/stats", status_code=303)
+    return RedirectResponse(url="/health/sources", status_code=303)
 
 
 @app.post("/api/nzb-indexer/clear")
 async def nzb_indexer_clear(request: Request, name: str):
     await _admin(request, mutation=True)
     usenet_health.clear_fetch_health(name)
-    return RedirectResponse(url="/stats", status_code=303)
+    return RedirectResponse(url="/health/sources", status_code=303)
 
 
 @app.get("/api/settings/status.json")
@@ -707,5 +764,14 @@ async def proxy_hls(token: str, request: Request):
 # it dispatches, /{secret}/manifest.json and /{secret}/stream/… — is already in
 # the table and wins the match. Anything app/recs adds here is a path this
 # service does not otherwise serve.
-_RECS_ROUTES = recs_mount.attach(app)
-logger.info("recs: mounted %d Daily Picks routes", _RECS_ROUTES)
+try:
+    _RECS_ROUTES = recs_mount.attach(app)
+    logger.info("recs: mounted %d Daily Picks routes", _RECS_ROUTES)
+except Exception:
+    # Same contract as its startup below, moved to import time: app/recs reads
+    # its own required keys (TMDB, Trakt) at module import, so an install that
+    # has not configured Daily Picks would otherwise fail to boot at all —
+    # catalogs taking streaming down with them.
+    _RECS_ROUTES = 0
+    logger.exception("recs: mount failed; catalogs unavailable, "
+                     "streaming unaffected")

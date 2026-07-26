@@ -295,7 +295,9 @@ class RouteTests(unittest.TestCase):
         r = self.client.get("/", headers=self.LOCAL)
         self.assertEqual(200, r.status_code)
         self.assertIn("Set up your streams", r.text)
-        self.assertIn("adminnav", r.text)
+        # the wizard is a real page in the app, not a modal dead-end: the
+        # rail is there so nothing traps a first-run operator
+        self.assertIn("rail-nav", r.text)
         os.environ["FAST_BASE_URL"] = "https://comet.example/abc"
         try:
             r = self.client.get("/", headers=self.LOCAL)
