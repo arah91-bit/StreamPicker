@@ -18,7 +18,7 @@ from itertools import combinations
 
 from app.recs import config, db, preseed, tmdb, trakt
 from app.recs.holidays import active_holiday
-from app.recs.kids import effective_kid_age
+from app.recs.kids import band_for_age, effective_kid_age
 from app.recs.profile import build_profile
 from app.recs import history as local_history
 
@@ -57,6 +57,17 @@ SCORE_POPULAR = 30
 SCORE_DEPTH = 33
 
 KID_EXCLUDED_GENRES = {"horror", "war", "crime"}
+
+# A kid age is more than a certification ceiling: it says which rows are worth
+# building at all. Both weights below drive tmdb.kid_age_appeal, so the same
+# explainable signal that orders items inside a row also orders the rows, and
+# steers which strategies the depth planner reaches for. Capped so a strong
+# developmental fit can rearrange the broad/deep part of the surface without
+# ever lifting a discovery row above an intent row such as Watchlist.
+BAND_FIT_WEIGHT = 2.0
+BAND_FIT_LIMIT = 10.0
+BAND_STRATEGY_WEIGHT = 1.2
+BAND_STRATEGY_LIMIT = 6.0
 
 FALLBACK_GENRES = {
     "movie": [
@@ -159,6 +170,43 @@ class Generator:
             return 0.4
         return 0.0
 
+    def _band_fit(self, metas: list[dict]) -> float | None:
+        """Mean developmental-age appeal across a row's items.
+
+        None for a viewer who is not a kid profile, which is what keeps every
+        adult surface byte-for-byte unchanged.
+        """
+        scorer = getattr(tmdb, "kid_age_appeal_score", None)
+        if self.kid_age is None or not metas or not callable(scorer):
+            return None
+        scored = []
+        for meta in metas:
+            try:
+                scored.append(float(scorer(meta, self.kid_age)))
+            except (TypeError, ValueError):
+                continue
+        return sum(scored) / len(scored) if scored else None
+
+    def _band_strategy_shift(self, slugs: list[str]) -> float:
+        """How well a candidate row strategy suits this viewer's age band.
+
+        Scored from the strategy's own genres, so "Acclaimed Drama Movies"
+        sinks for a preschooler while "Family + Adventure" rises, and a
+        school-age viewer still gets mystery and science fiction rather than
+        being pushed back to preschool programming.
+        """
+        appeal = getattr(tmdb, "kid_age_appeal_score", None)
+        if self.kid_age is None or not slugs or not callable(appeal):
+            return 0.0
+        try:
+            score = float(appeal(
+                {"genres": [tmdb.genre_label(slug) for slug in slugs]},
+                self.kid_age))
+        except (TypeError, ValueError):
+            return 0.0
+        return max(-BAND_STRATEGY_LIMIT,
+                   min(BAND_STRATEGY_LIMIT, score * BAND_STRATEGY_WEIGHT))
+
     def _freshen(self, metas: list[dict], limit: int,
                  depth: int | None = None) -> list[dict]:
         """Daily, relevance-preserving rotation of a candidate list.
@@ -241,15 +289,27 @@ class Generator:
         if len(clean) < min_items:
             logger.info(f"[{self.token[:8]}] skipping row '{name}' ({len(clean)} items)")
             return False
-        row_score = score + self.rng.uniform(-4, 4)
+        # A row that is technically allowed for this age is not necessarily a
+        # row worth putting near the top of a child's home screen. The items
+        # already passed the certification gate; this orders what survived by
+        # how well it actually suits the viewer's stage.
+        fit = self._band_fit(clean)
+        fit_bonus = 0.0 if fit is None else max(
+            -BAND_FIT_LIMIT, min(BAND_FIT_LIMIT, fit * BAND_FIT_WEIGHT))
+        row_score = score + fit_bonus + self.rng.uniform(-4, 4)
+        measurement = {
+            "strategy": cat_id,
+            "candidate_source": self._candidate_source(cat_id),
+            "rank_score": row_score,
+        }
+        if fit is not None:
+            measurement["kid_age"] = self.kid_age
+            measurement["kid_age_band"] = band_for_age(self.kid_age)["id"]
+            measurement["kid_band_fit"] = round(fit, 2)
         self.rows.append((row_score,
                           {"id": cat_id, "type": ctype, "name": name,
                            "metas": clean,
-                           "measurement": {
-                               "strategy": cat_id,
-                               "candidate_source": self._candidate_source(cat_id),
-                               "rank_score": row_score,
-                           }}))
+                           "measurement": measurement}))
         self.used_imdb.update(m["id"] for m in clean)
         return True
 
@@ -459,7 +519,8 @@ class Generator:
 
         def append(priority: float, spec_id: str, kind: str, name: str,
                    params: dict, score: float = SCORE_DEPTH,
-                   exploration: float = 0.3) -> None:
+                   exploration: float = 0.3,
+                   genres: list[str] | None = None) -> None:
             media = _kind_to_tmdb(kind)
             # The control only rearranges the broad/deep candidate plan. It
             # never dislodges intent rows such as Watchlist or Top Picks, and
@@ -468,7 +529,12 @@ class Generator:
             adventure_shift = (
                 (self.adventurousness - 30) * (exploration - 0.3) * 0.18
             )
-            specs.append((priority + adventure_shift
+            # Which strategies are worth attempting at all: the planner stops
+            # once the surface is full, so for a kid profile this decides
+            # whether the last slots go to another adult-shaped lens or to
+            # something built for their stage.
+            band_shift = self._band_strategy_shift(genres or [])
+            specs.append((priority + adventure_shift + band_shift
                           + seeded.uniform(-0.75, 0.75), {
                 "id": f"nr-depth-{spec_id}",
                 "media": media,
@@ -505,7 +571,8 @@ class Generator:
                 append(98 - index * 7, f"combo-{kind}-{left}-{right}", kind,
                        title, params, SCORE_DEPTH + 3 - index,
                        exploration=(0.15 if left in profile_genres[kind]
-                                    and right in profile_genres[kind] else 0.65))
+                                    and right in profile_genres[kind] else 0.65),
+                       genres=[left, right])
 
         # Human-readable moods backed by explicit, auditable genre pairs.
         for mood_index, (title, left, right) in enumerate(MOOD_STRATEGIES):
@@ -524,7 +591,7 @@ class Generator:
                 params.update({"sort_by": "popularity.desc", "vote_count.gte": 30})
                 append(94 - mood_index * 2, f"mood-{kind}-{left}-{right}", kind,
                        f"{title} — {noun}", params, SCORE_DEPTH + 2,
-                       exploration=0.45)
+                       exploration=0.45, genres=[left, right])
 
         # Quality, recency, and under-the-radar lenses ensure the deeper page
         # is not merely the same popularity query with different labels.
@@ -542,20 +609,22 @@ class Generator:
                               "vote_average.gte": 7.0, "vote_count.gte": 500}
                 append(93 - index * 8, f"acclaimed-{kind}-{slug}", kind,
                        f"Acclaimed {label} {noun}", acclaimed,
-                       SCORE_ACCLAIMED - index, exploration=0.05)
+                       SCORE_ACCLAIMED - index, exploration=0.05,
+                       genres=[slug])
 
                 recent = {**genre, "sort_by": "popularity.desc",
                           "vote_count.gte": 35, date_gte: recent_cutoff}
                 append(89 - index * 8, f"recent-{kind}-{slug}", kind,
                        f"Recent {label} {noun}", recent,
-                       SCORE_NEW_RELEASES - 8 - index, exploration=0.15)
+                       SCORE_NEW_RELEASES - 8 - index, exploration=0.15,
+                       genres=[slug])
 
                 underseen = {**genre, "sort_by": "vote_average.desc",
                              "vote_average.gte": 6.8, "vote_count.gte": 50,
                              "vote_count.lte": 1800}
                 append(85 - index * 8, f"underseen-{kind}-{slug}", kind,
                        f"Under-the-Radar {label} {noun}", underseen,
-                       SCORE_GEMS - index, exploration=0.85)
+                       SCORE_GEMS - index, exploration=0.85, genres=[slug])
 
         # Favorite eras crossed with favorite genres. Use complete past decades
         # as exploration options only when history has no era signal.
@@ -583,7 +652,7 @@ class Generator:
                 }
                 append(79 - index * 6, f"era-{kind}-{decade}-{slug}", kind,
                        f"{decade}s {tmdb.genre_label(slug)} {noun}", params,
-                       SCORE_DECADE - index, exploration=0.25)
+                       SCORE_DECADE - index, exploration=0.25, genres=[slug])
 
         # Honor demonstrated language taste, then offer a small amount of
         # bottom-of-page adjacent discovery tied to a favorite genre.
@@ -611,7 +680,8 @@ class Generator:
                        f"language-{kind}-{code}-{slug}", kind,
                        f"{language} {tmdb.genre_label(slug)} Discoveries — {noun}",
                        params, SCORE_LANG - 5 - language_index,
-                       exploration=(0.4 if code in profile_languages else 1.0))
+                       exploration=(0.4 if code in profile_languages else 1.0),
+                       genres=[slug])
 
         # Last-resort breadth is still labeled and filtered by two concrete
         # taste areas. OR makes these pools resilient after earlier rows have
@@ -628,7 +698,8 @@ class Generator:
                 append(55 - index * 3, f"explore-{kind}-{left}-{right}", kind,
                        f"{tmdb.genre_label(left)} & {tmdb.genre_label(right)} "
                        f"Discoveries — {noun}", params,
-                       SCORE_POPULAR - 2 - index, exploration=0.75)
+                       SCORE_POPULAR - 2 - index, exploration=0.75,
+                       genres=[left, right])
 
         specs.sort(key=lambda item: item[0], reverse=True)
         return [spec for _, spec in specs]

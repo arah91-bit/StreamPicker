@@ -16,6 +16,7 @@ import json
 import os
 
 from app import uitheme
+from app.recs import kids
 
 ADDON_NAME = os.environ.get("ADDON_NAME", "Auto Stream")
 
@@ -76,7 +77,9 @@ color:var(--accent);border:1px solid var(--line)}
 .row{display:flex;align-items:center;gap:12px;padding:9px 11px;border:1px solid var(--line);
 border-radius:9px;margin-bottom:6px}
 .row .pos{font:12px var(--mono);color:var(--mut);min-width:20px}
-.row .info{flex:1}.row .t{font-size:14px}.row .d{color:var(--mut);font-size:12.5px}
+.row .info,.khead .info{flex:1}
+.row .t,.khead .t{font-size:14px}
+.row .d,.khead .d{color:var(--mut);font-size:12.5px}
 .row.fixed{opacity:.7}
 button.sw{font:600 12.5px var(--sans);padding:5px 13px;border-radius:7px;
 cursor:pointer;border:1px solid var(--line2);white-space:nowrap}
@@ -107,7 +110,42 @@ color:var(--accent);transition:border-color .12s,background .12s}
 .code{font:22px/1.3 var(--mono);letter-spacing:.22em;text-align:center;
 background:var(--inset);border:1px dashed var(--line2);border-radius:8px;
 padding:12px;margin:10px 0;max-width:320px}
+/* One card per viewer, built in JS and stacked. uitheme's .card is a bare
+   surface with neither padding nor margin, so without these the viewers run
+   together into one undivided wall of rows with their text on the border. */
+#out{display:flex;flex-direction:column;gap:16px}
+#out>.card,#add{padding:15px 17px}
+#add{margin-top:16px}
+.kidbox{border:1px solid var(--line);border-radius:9px;padding:10px 12px;margin-bottom:12px}
+.khead{display:flex;align-items:center;gap:12px}
+.agebox{margin-top:11px}
+.agehead{display:flex;align-items:baseline;gap:7px;flex-wrap:wrap;font-size:13.5px}
+.agehead .band{font-weight:650;color:var(--accent)}
+.agebox input[type=range]{display:block;width:100%;max-width:430px;margin:9px 0 0}
+/* Each label is flex-weighted by how many years its band covers, so a label
+   sits under the stretch of track it actually applies to. */
+.scale{display:flex;max-width:430px;font-size:11px;color:var(--mut);margin-top:3px}
+.scale span{text-align:center}
+.scale span:first-child{text-align:left}
+.scale span:last-child{text-align:right}
+.effect{color:var(--mut);font-size:12.5px;margin-top:8px;max-width:660px}
+.note{color:var(--mut);font-size:12px;margin-top:6px}
+.agebox .fix{margin-top:9px}
 """
+
+def _scale_html() -> str:
+    """Band labels under the slider track, each weighted by the span of ages
+    it covers. Built from kids.AGE_BANDS so the page cannot name a band the
+    recommender does not actually score against."""
+    spans, low = [], kids.MIN_AGE
+    for band in kids.AGE_BANDS:
+        spans.append(f'<span style="flex:{band["max_age"] - low + 1}">'
+                     f'{uitheme.esc(band["label"])}</span>')
+        low = band["max_age"] + 1
+    return "".join(spans)
+
+
+_SCALE_HTML = _scale_html()
 
 
 
@@ -150,9 +188,16 @@ def render(setup_secret: str) -> str:
     <div class="field"><label for="nm">Name</label>
       <input id="nm" type="text" placeholder="e.g. Arah"></div>
     <label class="chk"><input id="kid" type="checkbox"> Kids profile</label>
-    <div class="field hidden" id="agewrap">
-      <label for="age">Age (2–17, grows automatically)</label>
-      <input id="age" type="number" min="2" max="17" value="8"></div>
+    <div class="agebox hidden" id="agewrap">
+      <div class="agehead">Age <b id="agev">{kids.DEFAULT_AGE}</b> ·
+        <span class="band" id="ageband"></span></div>
+      <input id="age" type="range" min="{kids.MIN_AGE}" max="{kids.MAX_AGE}"
+             value="{kids.DEFAULT_AGE}">
+      <div class="scale">{_SCALE_HTML}</div>
+      <div class="effect" id="ageeffect"></div>
+      <div class="note">Set this once — the age advances on its own from
+        here, so a 13-year-old today is 14 next year.</div>
+    </div>
     <div class="acts"><button id="connect">Connect Trakt</button></div>
   </div>
   <div id="add-step2" class="hidden">
@@ -168,6 +213,10 @@ def render(setup_secret: str) -> str:
 const SETUP = {json.dumps(setup_secret)};
 const SPECS = {json.dumps(list(ROW_SPECS))};
 const FAMILIES = {json.dumps(list(FAMILY_SPECS))};
+const BANDS = {json.dumps(list(kids.AGE_BANDS))};
+const AGE = {json.dumps({"min": kids.MIN_AGE, "max": kids.MAX_AGE,
+                         "fallback": kids.DEFAULT_AGE})};
+const SCALE = {json.dumps(_SCALE_HTML)};
 const api = p => "/setup/" + SETUP + "/api" + p;
 const $ = id => document.getElementById(id);
 
@@ -177,6 +226,68 @@ function ago(ts) {{
   if (h < 1) return Math.round(h * 60) + "m ago";
   if (h < 48) return Math.round(h) + "h ago";
   return Math.round(h / 24) + "d ago";
+}}
+
+const bandFor = age => BANDS.find(b => age <= b.max_age) || BANDS[BANDS.length - 1];
+
+async function setKid(u, isKid, age, control) {{
+  control.disabled = true;
+  // Kid mode with no age filters nothing, so switching it on always carries
+  // one. Switching it off omits it, which leaves the anchor untouched for
+  // when it goes back on.
+  const body = age === null ? {{is_kid: isKid}} : {{is_kid: isKid, kid_age: age}};
+  await fetch(api("/kid/" + u.token), {{
+    method: "POST", headers: {{"Content-Type": "application/json"}},
+    body: JSON.stringify(body),
+  }});
+  load();
+}}
+
+function kidEl(u) {{
+  const on = !!u.is_kid;
+  const age = u.kid_age == null ? AGE.fallback : u.kid_age;
+  // Kid mode carrying no age filters nothing. New writes cannot land in that
+  // state, but a row already in it needs a way out that does not depend on
+  // moving the slider — releasing it on the value it already shows saves
+  // nothing, because no change event fires.
+  const unset = on && u.kid_age == null;
+  const el = document.createElement("div");
+  el.className = "kidbox";
+  el.innerHTML = `<div class="khead">
+      <span class="info"><div class="t">Kids profile</div>
+        <div class="d">Holds every row to what this age is rated for, and
+          ranks what suits it highest.</div></span>
+      <button class="sw ${{on ? "on" : "off"}}">${{on ? "On" : "Off"}}</button>
+    </div>
+    <div class="agebox${{on ? "" : " hidden"}}">
+      <div class="agehead">Age <b class="v"></b> · <span class="band"></span></div>
+      <input type="range" min="${{AGE.min}}" max="${{AGE.max}}">
+      <div class="scale">${{SCALE}}</div>
+      <div class="effect"></div>
+      <div class="note">${{unset
+        ? "No age is set, so this profile is not being filtered at all."
+        : "Advances on its own — 13 today is 14 next year."}}</div>
+      ${{unset ? '<button class="sw on fix">Set this age</button>' : ""}}
+    </div>`;
+  const slider = el.querySelector("input");
+  slider.value = age;
+  const paint = value => {{
+    const band = bandFor(value);
+    el.querySelector(".agehead .v").textContent = value;
+    el.querySelector(".agehead .band").textContent = band.label;
+    el.querySelector(".effect").textContent = band.effect;
+  }};
+  paint(age);
+  // Live while dragging, saved on release — a POST per intermediate age would
+  // queue a catalog rebuild for every year the thumb passes over.
+  slider.oninput = () => paint(parseInt(slider.value, 10));
+  slider.onchange = () => setKid(u, true, parseInt(slider.value, 10), slider);
+  const fix = el.querySelector(".fix");
+  if (fix) fix.onclick =
+    ev => setKid(u, true, parseInt(slider.value, 10), ev.target);
+  el.querySelector(".khead button").onclick =
+    ev => setKid(u, !on, on ? null : age, ev.target);
+  return el;
 }}
 
 function rowEl(u, spec, pos) {{
@@ -219,7 +330,11 @@ async function load() {{
     card.innerHTML = `
       <div class="who"><span class="nm"></span>
         <span class="pill trakt"></span>
-        ${{u.is_kid ? '<span class="pill">Kid · age ' + u.kid_age + '</span>' : ""}}
+        ${{u.is_kid && u.kid_age != null
+            ? '<span class="pill">Kid · ' + u.kid_age + ' · '
+              + bandFor(u.kid_age).label + '</span>' : ""}}
+        ${{u.is_kid && u.kid_age == null
+            ? '<span class="pill err">kid profile, no age set</span>' : ""}}
         ${{u.last_error ? '<span class="pill err">last build failed</span>' : ""}}
       </div>
       <div class="meta"></div>
@@ -261,6 +376,7 @@ async function load() {{
     }}
 
     const rows = card.querySelector(".rows");
+    card.insertBefore(kidEl(u), rows);
     SPECS.forEach((spec, i) => rows.appendChild(rowEl(u, spec, i + 1)));
 
     const slate = document.createElement("div");
@@ -308,6 +424,15 @@ let deviceCode = null, polling = false;
 
 $("kid").onchange = () => $("agewrap").classList.toggle("hidden", !$("kid").checked);
 
+function paintAddAge() {{
+  const band = bandFor(parseInt($("age").value, 10));
+  $("agev").textContent = $("age").value;
+  $("ageband").textContent = band.label;
+  $("ageeffect").textContent = band.effect;
+}}
+$("age").oninput = paintAddAge;
+paintAddAge();
+
 $("connect").onclick = async () => {{
   $("connect").disabled = true;
   const d = await (await fetch(api("/device-code"), {{method: "POST"}})).json();
@@ -338,7 +463,7 @@ async function poll(interval) {{
     device_code: deviceCode,
     name: $("nm").value,
     is_kid: $("kid").checked,
-    kid_age: parseInt($("age").value, 10) || 8,
+    kid_age: parseInt($("age").value, 10) || AGE.fallback,
   }};
   const d = await (await fetch(api("/poll"), {{
     method: "POST", headers: {{"Content-Type": "application/json"}},

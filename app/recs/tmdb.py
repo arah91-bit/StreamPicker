@@ -16,7 +16,7 @@ from typing import Any, Literal, TypedDict
 
 import httpx
 
-from app.recs import config, db
+from app.recs import config, db, kids
 
 IMG = "https://image.tmdb.org/t/p"
 
@@ -177,15 +177,10 @@ def _meta_year(meta: dict) -> int | None:
 
 
 def _kid_age_band(kid_age: int | None) -> KidAgeBand:
-    if kid_age is None:
-        return "not-applicable"
-    if kid_age <= 5:
-        return "preschool"
-    if kid_age <= 8:
-        return "early-childhood"
-    if kid_age <= 12:
-        return "school-age"
-    return "teen"
+    # kids.AGE_BANDS is the single definition of these boundaries; the catalog
+    # builder labels its age slider from the same table.
+    band = kids.band_for_age(kid_age)
+    return band["id"] if band else "not-applicable"
 
 
 def kid_age_appeal(meta: dict, kid_age: int | None) -> KidAgeAppeal:

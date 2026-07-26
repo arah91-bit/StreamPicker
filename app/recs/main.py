@@ -17,7 +17,7 @@ from pydantic import BaseModel
 from app.recs import (config, db, dramas, kids_catalogs, playhistory,
                       profile_streaming, trakt, trakt_import, watching)
 from app.recs.catalogs import generate_for_user
-from app.recs.kids import birthdate_from_age, effective_kid_age
+from app.recs.kids import birthdate_from_age, clamp_age, effective_kid_age
 from app.recs import scheduler
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -196,7 +196,7 @@ async def poll(secret: str, body: PollBody):
     username = await trakt.get_username(tokens["access_token"])
     token = secrets.token_urlsafe(16)
     expires_at = int(time.time()) + int(tokens.get("expires_in", 7776000))
-    kid_age = max(2, min(17, body.kid_age or 8)) if body.is_kid else None
+    kid_age = clamp_age(body.kid_age) if body.is_kid else None
     await db.create_user(token, body.name.strip() or (username or "user"),
                          username, tokens["access_token"],
                          tokens["refresh_token"], expires_at,
@@ -236,6 +236,9 @@ async def list_users(secret: str):
             "name": u["name"],
             "trakt_username": u["trakt_username"],
             "is_kid": bool(u["is_kid"]),
+            # Always the live age computed from the internal anchor. The
+            # anchor date itself is deliberately not exposed: nobody is asked
+            # for a birthday, and showing one back would imply we hold it.
             "kid_age": effective_kid_age(u),
             "preferred_media": u.get("preferred_media") or "balanced",
             "adventurousness": u.get("adventurousness", 30),
@@ -317,8 +320,14 @@ async def admin_update_kid(secret: str, token: str, body: KidBody):
     _check_setup_secret(secret)
     user = await _require_user(token)
     if body.kid_age is not None:
-        age = max(2, min(17, body.kid_age))
+        age = clamp_age(body.kid_age)
         await db.update_kid(token, body.is_kid, age, birthdate_from_age(age))
+    elif body.is_kid and not (user.get("kid_birthdate") or user.get("kid_age")):
+        # An omitted age means "keep the existing anchor", and there isn't
+        # one. Kid mode without an age filters nothing at all, so a profile
+        # marked as a child would be the one surface with no ceiling on it.
+        age = clamp_age(None)
+        await db.update_kid(token, True, age, birthdate_from_age(age))
     else:
         await db.update_kid(token, body.is_kid, None, None)
     user = await db.get_user(token)
