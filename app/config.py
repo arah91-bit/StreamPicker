@@ -275,9 +275,10 @@ SETTINGS = [
          hidden=True, label="Scrapers"),
 ]
 
-# field kind: url | text | secret | multiline. Secrets render masked and an
-# empty submit means "keep what's stored". NZB_INDEXERS is one name|url|key
-# per line in the UI, ';'-joined in storage (the format usenet.py parses).
+# field kind: url | text | secret | multiline | indexers. Secrets render
+# masked and an empty submit means "keep what's stored". `indexers` is the
+# NZB_INDEXERS row editor — a name/url/key triple per row, ';'-joined in
+# storage (the format usenet.py parses); see _normalize_indexers.
 # Connections are grouped under these collapsible headings on the settings
 # page, in this order. Each connection below carries a matching `cat`. (id,
 # title, blurb)
@@ -301,8 +302,8 @@ CONNECTIONS = [
     # debrid key — not as connection cards here.
     dict(id="indexers", name="Usenet indexers",
          role="Direct usenet searches (Newznab)", cat="usenet",
-        fields=[dict(key="NZB_INDEXERS", label="One per line: name|api-url|apikey",
-                      kind="multiline", sensitive=True)]),
+        fields=[dict(key="NZB_INDEXERS", label="Indexers",
+                     kind="indexers", sensitive=True)]),
     dict(id="nzbdav", name="nzbdav",
          role="Mounts NZBs so usenet releases stream directly", cat="usenet",
          fields=[dict(key="NZBDAV_URL", label="Base URL", kind="url"),
@@ -637,7 +638,89 @@ def _trusted_proxies(raw: str) -> str:
     return ",".join(parts)
 
 
-def _normalize(spec: dict, raw: str):
+_KEEP_KEY = re.compile(r"@keep:(\d+)\Z")
+
+
+def parse_indexers(spec_value: str) -> list[tuple[str, str, str]]:
+    """The stored ';'-joined spec as (name, api url, api key) triples. Shared
+    by the row editor and anything else that needs the entries individually;
+    usenet.py parses the same format at import time."""
+    out = []
+    for part in spec_value.split(";"):
+        bits = [b.strip() for b in part.split("|")]
+        if len(bits) == 3 and all(bits):
+            out.append((bits[0], bits[1], bits[2]))
+    return out
+
+
+def resolve_indexers(raw: str) -> list[tuple[str, str, str]]:
+    """A submitted indexer spec as usable (name, url, key) triples, with any
+    ``@keep:<i>`` placeholder swapped for the saved key it refers to.
+
+    The row editor sends @keep for every row whose key the operator did not
+    retype, so anything that wants to *use* the submitted values — the live
+    Test, above all — has to resolve them first. Unresolvable rows are dropped
+    rather than raised on: this is the lenient read side; _normalize_indexers
+    is the strict one that guards what gets stored."""
+    stored = parse_indexers(pending("NZB_INDEXERS"))
+    out = []
+    for part in raw.replace("\n", ";").split(";"):
+        bits = [b.strip() for b in part.split("|")]
+        if len(bits) != 3 or not (bits[0] and bits[1]):
+            continue
+        name, url, key = bits
+        keep = _KEEP_KEY.match(key)
+        if keep:
+            i = int(keep.group(1))
+            if i >= len(stored):
+                continue
+            key = stored[i][2]
+        if key:
+            out.append((name, url.rstrip("/"), key))
+    return out
+
+
+def _normalize_indexers(spec: dict, raw: str, current: str | None) -> str:
+    """One 'name|api-url|api-key' entry per line (or ';'-joined), stored in the
+    ';'-joined form usenet.py parses.
+
+    An api-key of ``@keep:<i>`` means "reuse entry i of what is already
+    stored". The editor never receives saved keys — it shows them masked — so
+    that token is how a row the operator did not retype survives a save.
+    ``current`` is the value being replaced, and is None when validating a
+    value that is *already* stored: a resolved spec never contains @keep, so
+    finding one there means the file is corrupt."""
+    key = spec["key"]
+    if len(raw.encode("utf-8")) > 64 * 1024 or "\x00" in raw:
+        raise ValueError(f"{key}: value is too long or invalid")
+    stored = parse_indexers(current or "")
+    out = []
+    for entry in (p.strip() for chunk in raw.split("\n")
+                  for p in chunk.split(";")):
+        if not entry:
+            continue
+        bits = [b.strip() for b in entry.split("|")]
+        if len(bits) != 3:
+            raise ValueError(
+                f"{key}: each indexer needs a name, an API URL and an API key")
+        name, url, api_key = bits
+        keep = _KEEP_KEY.match(api_key)
+        if keep:
+            i = int(keep.group(1))
+            if current is None or i >= len(stored):
+                raise ValueError(f"{key}: {name or 'an indexer'} refers to a "
+                                 "saved key that no longer exists")
+            api_key = stored[i][2]
+        if not (name and url and api_key):
+            raise ValueError(
+                f"{key}: {name or 'an indexer'} is missing its "
+                + ("API URL" if not url else "API key" if not api_key
+                   else "name"))
+        out.append(f"{name}|{url.rstrip('/')}|{api_key}")
+    return ";".join(out)
+
+
+def _normalize(spec: dict, raw: str, current: str | None = None):
     """Validate one submitted value against its schema entry. Returns the
     string to store, or None for 'no change' (blank secret), or the sentinel
     '' meaning 'store empty' / raises ValueError on garbage."""
@@ -677,6 +760,8 @@ def _normalize(spec: dict, raw: str):
         if raw not in [c[0] for c in spec["choices"]]:
             raise ValueError(f"{spec['key']}: not one of the choices")
         return raw
+    if kind == "indexers":
+        return _normalize_indexers(spec, raw, current)
     if kind == "multiline":
         if len(raw.encode("utf-8")) > 64 * 1024 or "\x00" in raw:
             raise ValueError(f"{spec['key']}: value is too long or invalid")
@@ -890,7 +975,8 @@ def save(values: dict[str, str]) -> dict:
         spec = _SPECS.get(key)
         if spec is None:
             raise ValueError(f"unknown setting: {key[:40]}")
-        norm = _normalize(spec, str(raw))
+        norm = _normalize(spec, str(raw),
+                          current=pending_from(original, key))
         if norm is None:
             continue
         before = pending_from(original, key)

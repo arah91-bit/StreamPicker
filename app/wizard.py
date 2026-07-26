@@ -44,7 +44,7 @@ import os
 
 import httpx
 
-from app import adminui, config
+from app import adminui, config, settings_ui, uitheme
 
 logger = logging.getLogger("stream-picker")
 
@@ -90,10 +90,7 @@ SOURCE_CARDS = [
     dict(id="indexers", title="Usenet indexers", test="indexers", source=True,
          blurb="Newznab indexers you have accounts with. Switch on the nzbdav "
                "mount below too — the usenet lane needs both to play anything.",
-         fields=[_f("NZB_INDEXERS",
-                    "name | api-url | apikey — one indexer per line",
-                    "multiline",
-                    "myindexer | https://api.myindexer.com/api | abcd1234")]),
+         fields=[_f("NZB_INDEXERS", "Indexers", "indexers")]),
     dict(id="jellyfin", title="Jellyfin library", test="jellyfin", source=True,
          blurb="Plays titles you already own through Jellyfin's native API. "
                "Credentials are encrypted and never sent to the player.",
@@ -105,7 +102,8 @@ SOURCE_CARDS = [
          blurb="A broad community scraper. Slower first hit; widens the search.",
          fields=[_f("MEDIAFUSION_BASE_URL", "Manifest base URL", "url",
                     "https://mediafusion.example")]),
-    dict(id="addon", title="Another Stremio addon", test="addon", source=True,
+    dict(id="addon", title="Another Nuvio/Stremio addon", test="addon",
+         source=True,
          blurb="Any addon that returns streams — paste its manifest URL.",
          fields=[_f("__name", "A name for it", "text", "My addon"),
                  _f("url", "Manifest URL", "url",
@@ -388,78 +386,44 @@ async def apply(body: dict) -> dict:
 
 
 _CSS = """
-:root{color-scheme:light dark;--bg:#fbfbfa;--card:#fff;--fg:#1a1a18;--mut:#6b6b66;
---line:#e6e6e2;--bad:#c0392b;--good:#2e7d5b;--accent:#3b6ea5;
---accent-soft:#eef3f9;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;}
-@media (prefers-color-scheme:dark){:root{--bg:#16171a;--card:#1e2024;--fg:#e9e9e6;
---mut:#9a9a94;--line:#2c2f34;--bad:#ff6b5e;--good:#5cc99a;
---accent:#6ea3d8;--accent-soft:#232c37;}}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--fg);
-font:15px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
-padding:24px 16px 130px}
-.wrap{max-width:760px;margin:0 auto}
-h1{font-size:24px;margin:6px 0 6px}
-.sub{color:var(--mut);margin:0 0 26px;font-size:14px;max-width:600px}
-h2{font-size:16px;margin:30px 0 4px}
-.blurb{color:var(--mut);font-size:13px;margin:0 0 12px;max-width:620px}
-.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:12px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:12px;
-padding:15px 16px;transition:border-color .15s}
-.card.on{border-color:var(--accent)}
+/* page-specific layout — tokens & common components live in uitheme.BASE_CSS */
+body{padding-bottom:160px}
+.blurb{color:var(--mut);font-size:13px;margin:-6px 0 12px;max-width:62ch}
+.cards .card{padding:15px 16px;transition:border-color .15s,box-shadow .15s}
+.cards .card.on{border-color:var(--accent);
+box-shadow:0 0 0 1px var(--accent),var(--shadow)}
 .chead{display:flex;justify-content:space-between;align-items:center;gap:10px}
 .cname{font-weight:650;font-size:15px;display:flex;align-items:center}
-.badge{font-size:9.5px;font-weight:700;color:var(--accent);background:var(--accent-soft);
-border-radius:99px;padding:2px 7px;margin-left:8px;text-transform:uppercase;
-letter-spacing:.04em}
-.keylink{font-size:12px;color:var(--accent);text-decoration:none;white-space:nowrap}
-.keylink:hover{text-decoration:underline}
+.cname .badge{margin-left:8px}
+.keylink{font-size:12px;white-space:nowrap}
 .kfield{margin-top:12px}
 .kfield[hidden]{display:none}
-.kfield label,.flabel{display:block;font-size:11.5px;color:var(--mut);margin:10px 0 4px}
+.kfield label,.flabel{display:block;font-size:11.5px;color:var(--mut);
+margin:10px 0 4px}
 .kfield .flabel:first-of-type{margin-top:0}
 .cblurb{font-size:12px;color:var(--mut);margin:0 0 8px;line-height:1.45}
 .cnote{font-size:11.5px;color:var(--mut);margin:7px 0 0;font-style:italic}
-input[type=password],input[type=text],input[type=url],textarea{width:100%;
-background:var(--bg);color:var(--fg);border:1px solid var(--line);
-border-radius:8px;padding:9px 11px;font:13px var(--mono)}
-textarea{resize:vertical;min-height:66px;line-height:1.5}
-input::placeholder,textarea::placeholder{color:var(--mut);opacity:.8}
-.swi{appearance:none;-webkit-appearance:none;width:42px;height:24px;margin:0;
-border-radius:99px;background:var(--line);position:relative;cursor:pointer;
-transition:background .15s;flex-shrink:0}
-.swi::before{content:'';position:absolute;top:3px;left:3px;width:18px;height:18px;
-border-radius:50%;background:var(--card);box-shadow:0 1px 2px rgba(0,0,0,.25);
-transition:transform .15s}
-.swi:checked{background:var(--accent)}
-.swi:checked::before{transform:translateX(18px)}
 .hintlist{margin:6px 0 4px;padding-left:18px;font-size:12px;color:var(--mut)}
 .hintlist li{margin:3px 0;line-height:1.45}
 .hintlist code{font:11.5px var(--mono);background:var(--accent-soft);
 border-radius:5px;padding:1px 5px;color:var(--fg)}
-details.adv{margin-top:26px;color:var(--mut)}
-details.adv summary{cursor:pointer;font-size:13px}
-details.adv .card{margin-top:10px}
+details.acc{margin-top:26px}
+details.acc .card{margin-top:10px;padding:2px 16px 8px}
 .later{margin-top:26px;font-size:13px;color:var(--mut)}
-.later a{color:var(--accent)}
 .gobar{position:fixed;left:50%;transform:translateX(-50%);bottom:18px;
 display:flex;flex-direction:column;gap:8px;background:var(--card);
 border:1px solid var(--line);border-radius:14px;padding:12px 18px;
-box-shadow:0 6px 24px rgba(0,0,0,.14);z-index:10;min-width:320px;max-width:92vw}
+box-shadow:var(--shadow2);z-index:50;min-width:340px;max-width:92vw}
 .gorow{display:flex;align-items:center;gap:14px;justify-content:space-between}
-.btn{font:600 14px inherit;color:#fff;background:var(--accent);border:0;
-border-radius:9px;padding:10px 22px;cursor:pointer;white-space:nowrap}
-.btn:disabled{opacity:.5;cursor:default}
 .gomsg{font-size:13px;color:var(--mut)}
 .gomsg b{color:var(--fg)}
 .checks{display:none;flex-direction:column;gap:3px;font:12.5px var(--mono);
 max-height:34vh;overflow:auto}
 .checks.show{display:flex}
-.checks .ok{color:var(--good)}
+.checks .ok{color:var(--ok)}
 .checks .bad{color:var(--bad)}
-:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-@media (prefers-reduced-motion:reduce){*{transition:none!important}}
-""" + adminui.NAV_CSS
+
+"""
 
 _JS = """
 const $=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)];
@@ -469,7 +433,7 @@ $$('.swi').forEach(sw=>sw.addEventListener('change',()=>{
  if(kf){kf.hidden=!sw.checked;
   if(sw.checked){const f=kf.querySelector('input,textarea');if(f)f.focus();}}
 }));
-const csrf=()=>document.querySelector('.adminnav').dataset.csrf;
+const csrf=()=>document.querySelector('[data-csrf]').dataset.csrf;
 async function post(url,body){
  const r=await fetch(url,{method:'POST',
   headers:{'Content-Type':'application/json','X-CSRF-Token':csrf()},
@@ -542,6 +506,22 @@ $('#gobtn').addEventListener('click',async()=>{
   msg.innerHTML='<span style="color:var(--bad)">'+
    String(e.message).replace(/</g,'&lt;')+'</span>';}
 });
+
+/* Public address: call it and see whether it lands back on this server.
+   Unreachable is inconclusive (NAT loopback), so it reads as a warning. */
+$('#pubtest').addEventListener('click',async()=>{
+ const btn=$('#pubtest'),out=$('#pubres');
+ const url=$('#publicurl').value.trim();
+ if(!url){out.className='result';out.textContent=
+  'Enter an address first, or leave it blank for home-network-only.';return;}
+ btn.disabled=true;out.className='result';out.textContent='Calling it…';
+ try{const r=await post('/api/settings/test/publicurl',
+   {values:{ADDON_PUBLIC_URL:url}});
+  out.className='result '+(r.ok?'ok':'bad');
+  out.textContent=(r.ok?'✓ ':'✗ ')+r.detail;
+ }catch(e){out.className='result bad';out.textContent=e.message;}
+ btn.disabled=false;
+});
 """
 
 
@@ -562,6 +542,11 @@ def _field_html(card_id: str, fld: dict) -> str:
     label = html.escape(fld["label"])
     ph = html.escape(fld.get("placeholder", ""))
     key = html.escape(fld["key"])
+    if fld["kind"] == "indexers":
+        # Same row editor as /connect, wired by the shared ixeditor script.
+        # Nothing is saved yet on first run, so it starts as one blank row.
+        return (f'<label class="flabel">{label}</label>'
+                f'{settings_ui._indexer_editor(fld["key"])}')
     if fld["kind"] == "multiline":
         control = (f'<textarea data-key="{key}" id="{fid}" rows="3" '
                    f'autocomplete="off" spellcheck="false" '
@@ -575,7 +560,7 @@ def _field_html(card_id: str, fld: dict) -> str:
 
 def _source_card(card: dict) -> str:
     fields = "".join(_field_html(card["id"], f) for f in card["fields"])
-    badge = ('<span class="badge">recommended</span>'
+    badge = ('<span class="badge info">recommended</span>'
              if card.get("recommended") else "")
     blurb = (f'<p class="cblurb">{html.escape(card["blurb"])}</p>'
              if card.get("blurb") else "")
@@ -592,45 +577,37 @@ def _source_card(card: dict) -> str:
 </div>"""
 
 
-def render() -> str:
+def render(*, active: str = "home") -> str:
+    """The guided setup. ``active`` is the rail tab to light up: "home" when
+    this is standing in for the home page on a fresh install, "" when it was
+    reached deliberately at /setup (nothing in the rail is where you are)."""
     debrid_cards = "".join(_debrid_card(sid, label, key_url)
                            for sid, label, _, key_url in DEBRIDS)
     source_cards = "".join(_source_card(c) for c in SOURCE_CARDS)
     helper_cards = "".join(_source_card(c) for c in HELPER_CARDS)
     meta_cards = "".join(_source_card(c) for c in META_CARDS)
-    name = html.escape(ADDON_NAME)
-    return f"""<!doctype html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="robots" content="noindex,nofollow">
-<title>{name} — setup</title><style>{_CSS}</style></head><body>
-<div class="wrap">
-{adminui.nav("overview", ADDON_NAME)}
-<h1>Set up your streams</h1>
-<p class="sub">Switch on the things you actually have and fill in their
-details — leave the rest off. Each one is tested before it's saved, and it's
-all changeable later in Settings.</p>
-
-<h2>Debrid services</h2>
+    body = f"""
+{uitheme.section("TORRENT LANES", "Debrid services")}
 <p class="blurb">Where most streams come from. Switch on any you have — one is
 enough — and the two torrent search lanes are built for you.</p>
 <div class="cards">{debrid_cards}</div>
 
-<h2>More sources of streams</h2>
+{uitheme.section("SOURCES", "More sources of streams")}
 <p class="blurb">Optional. Any of these can stand in for — or add to — a
 debrid.</p>
 <div class="cards">{source_cards}</div>
 
-<h2>Usenet mount &amp; automation</h2>
+{uitheme.section("AUTOMATION", "Usenet mount & automation")}
 <p class="blurb">Optional helpers. They don't provide streams on their own,
 but improve or extend the sources above.</p>
 <div class="cards">{helper_cards}</div>
 
-<h2>Metadata</h2>
+{uitheme.section("METADATA", "Metadata")}
 <p class="blurb">Optional, all free. Better titles, languages, and
 episode handling.</p>
 <div class="cards">{meta_cards}</div>
 
-<h2>Watch away from home</h2>
+{uitheme.section("REMOTE", "Watch away from home")}
 <div class="cards">
  <div class="card">
   <div class="kfield">
@@ -647,14 +624,19 @@ episode handling.</p>
    <label class="flabel" for="publicurl">Public address (optional)</label>
    <input type="url" id="publicurl" autocomplete="off" spellcheck="false"
           placeholder="https://streams.example.com — or leave blank">
-   <p class="cnote">We can't verify this from here — it's whatever address
-    works from outside your network.</p>
+   <div class="btnrow" style="margin-top:10px">
+    <button type="button" class="btn ghost sm" id="pubtest">Test address</button>
+    <span class="result" id="pubres"></span>
+   </div>
+   <p class="cnote">The test calls that address and checks it lands back here.
+    If it can't, the address may still be fine — many routers won't route a
+    local request to their own public name.</p>
   </div>
  </div>
 </div>
 
-<details class="adv"><summary>Advanced — use different Comet / StremThru
-servers</summary>
+<details class="acc"><summary><span class="acc-t">Advanced</span>
+<span class="acc-hint">use different Comet / StremThru servers</span></summary>
  <div class="card">
   <div class="kfield"><label class="flabel" for="cometbase">Comet server</label>
    <input type="url" id="cometbase" value="{COMET_PUBLIC}"></div>
@@ -663,12 +645,23 @@ servers</summary>
  </div></details>
 
 <p class="later">Everything here — and more knobs besides — lives in
-<a href="/settings">Settings</a> too.</p>
-</div>
+<a href="/tune">Tune</a> too.</p>
 
 <div class="gobar">
  <div id="checks" class="checks"></div>
  <div class="gorow"><span id="gomsg" class="gomsg">Takes about a minute.</span>
  <button id="gobtn" class="btn">Set up my streams</button></div>
-</div>
-<script>{_JS}</script></body></html>"""
+</div>"""
+    head_block = (
+        "<div class='pagehead'><p class='eyebrow'>FIRST RUN</p>"
+        "<h1>Set up your streams</h1>"
+        "<p class='sub'>Switch on the things you actually have and fill in "
+        "their details — leave the rest off. Each one is tested before it's "
+        "saved, and it's all changeable later in Tune.</p></div>")
+    return uitheme.shell(
+        title="setup", name=ADDON_NAME, active=active,
+        csrf=adminui.csrf_token(),
+        body=head_block + body,
+        head=f"<style>{_CSS}{settings_ui.INDEXER_CSS}</style>",
+        scripts=f"<script>{settings_ui.INDEXER_JS}{_JS}</script>",
+        robots="noindex,nofollow")

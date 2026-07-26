@@ -1,0 +1,236 @@
+"""Renders / — Home, the "is it working?" page.
+
+Opens with a single status hero (streaming / attention / restart / ready),
+then the Add-to-Nuvio/Stremio install card with copyable manifest URLs, the
+lane switches, an at-a-glance service summary deep-linking into /connect,
+and the telemetry tiles that show what the addon has been doing.
+
+Everything actionable here is the same machinery the other pages use — lane
+switches save immediately via /api/settings/save, and the save bar handles
+restart — so the page never drifts from config.json / .env parity.
+"""
+
+import os
+
+from app import adminui, config, overview, proxy, settings_ui, uitheme
+
+ADDON_NAME = os.environ.get("ADDON_NAME", "Auto Stream")
+
+_esc = uitheme.esc
+
+_CSS = """
+/* home page — tokens & shared components live in uitheme.BASE_CSS */
+.hero{display:flex;align-items:center;gap:20px;padding:24px 24px;
+margin-bottom:16px;flex-wrap:wrap}
+.hero .hdot{width:16px;height:16px;border-radius:50%;flex-shrink:0}
+.hero .hstate{font-size:22px;font-weight:700;letter-spacing:-.01em}
+.hero .hsub{color:var(--mut);font-size:13.5px;margin-top:3px;max-width:60ch}
+.hero .hact{margin-left:auto;display:flex;gap:10px;flex-wrap:wrap}
+.install{margin-bottom:16px;padding:16px 18px}
+.install .irow{display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+margin-top:10px}
+.install .murl{flex:1;min-width:200px;font:12px var(--mono);color:var(--mut);
+background:var(--inset);border:1px solid var(--line);border-radius:var(--r-s);
+padding:9px 12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.install details{margin-top:12px}
+.install summary{cursor:pointer;font-size:12.5px;color:var(--mut)}
+.install summary:hover{color:var(--accent)}
+.install .variant{display:flex;align-items:center;gap:10px;margin-top:8px;
+flex-wrap:wrap}
+.install .vname{font-size:12.5px;min-width:150px;font-weight:600}
+.glance{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));
+gap:10px;margin-bottom:8px}
+.gitem{display:flex;align-items:center;gap:11px;padding:12px 14px;
+background:var(--card);border:1px solid var(--line);border-radius:var(--r);
+box-shadow:var(--shadow);text-decoration:none;color:var(--fg);
+transition:border-color .12s}
+.gitem:hover{border-color:var(--line2);text-decoration:none}
+.gitem .gn{font-weight:600;font-size:13.5px}
+.gitem .gr{color:var(--mut);font-size:11.5px;margin-top:1px}
+.gitem .gstate{margin-left:auto;font:11px var(--mono);color:var(--mut)}
+.gitem .gstate.ok{color:var(--ok)}
+/* unconfigured services: one closed row per category */
+.notset{display:flex;flex-direction:column;gap:8px;margin-top:10px}
+details.ngroup{overflow:hidden}
+details.ngroup>summary{cursor:pointer;list-style:none;display:flex;
+align-items:center;gap:10px;padding:11px 14px}
+details.ngroup>summary::-webkit-details-marker{display:none}
+details.ngroup>summary:hover .ngname{color:var(--accent)}
+.ngname{font-weight:600;font-size:13px;transition:color .12s}
+.ngcount{margin-left:auto;font:11px var(--mono);color:var(--mut)}
+details.ngroup>summary .chev{color:var(--mut);transition:transform .15s;
+flex-shrink:0}
+details.ngroup[open]>summary .chev{transform:rotate(90deg)}
+.ngbody{padding:2px 14px 12px;border-top:1px solid var(--line)}
+.ngbody .glance{margin:10px 0 0}
+.ngbody .gitem{background:var(--inset)}
+"""
+
+
+def _hero(recs: list[dict], blocks: list[dict], names: dict[str, str]) -> str:
+    """The one-glance answer. Priority: restart > now playing > attention >
+    streaming history > fresh-and-ready."""
+    restart = config.restart_pending()
+    playing = proxy.active_stream_details()
+    plays = [r for r in recs if r.get("kind") == "play"]
+
+    if restart:
+        state, dot, sub, act = (
+            "Restart to apply changes", "warn",
+            "Saved settings only take effect on the way back up. The save bar "
+            "below has the restart button.",
+            "")
+    elif playing:
+        first = playing[0]
+        title = names.get(first.get("media_id", ""),
+                          first.get("media_id", "")) or "Unknown"
+        more = f" and {len(playing) - 1} more" if len(playing) > 1 else ""
+        state, dot, sub, act = (
+            f"Streaming now", "run",
+            f"Serving <b>{_esc(title)}</b>{more} through the proxy — "
+            "failover and read-ahead are live.",
+            "")
+    elif blocks:
+        state, dot, sub, act = (
+            f"{len(blocks)} source{'s' if len(blocks) != 1 else ''} need"
+            " attention", "warn",
+            "Some sources are erroring or blocked. Health has the details and "
+            "the one-click unblock.",
+            f"<a class='btn ghost' href='/health/sources'>"
+            f"{uitheme.icon('activity')}Open Health</a>")
+    elif plays:
+        total_mb = sum(r.get("mb") or 0 for r in plays)
+        dv, du = overview._data(total_mb)
+        state, dot, sub, act = (
+            "All systems go", "ok",
+            f"{overview._num(len(plays))} stream"
+            f"{'s' if len(plays) != 1 else ''} served — {dv} {du} through the "
+            "proxy since telemetry reset.",
+            "")
+    else:
+        state, dot, sub, act = (
+            "Ready", "ok",
+            "Everything is plugged in. Play something in Nuvio/Stremio and "
+            "live stats show up here.",
+            "")
+    return (f"<section class='card hero'>"
+            f"<span class='hdot dot {dot}' aria-hidden='true'></span>"
+            f"<div><div class='hstate'>{_esc(state)}</div>"
+            f"<div class='hsub'>{sub}</div></div>"
+            f"<div class='hact'>{act}</div></section>")
+
+
+def _install(addons: list[tuple[str, str]]) -> str:
+    """The manifest card: primary URL with copy + deep link, variants folded."""
+    if not addons:
+        return ""
+    _name, primary = addons[0]
+    deep = "stremio://" + primary.split("://", 1)[-1]
+    variants = "".join(
+        f"<div class='variant'><span class='vname'>{_esc(n)}</span>"
+        f"<span class='murl'>{_esc(u)}</span>"
+        f"{uitheme.copybtn(u)}</div>"
+        for n, u in addons[1:])
+    folded = (f"<details><summary>Mobile &amp; slow-picker variants</summary>"
+              f"{variants}</details>") if variants else ""
+    return (
+        uitheme.section("INSTALL", "Add to Nuvio/Stremio",
+                        "paste this manifest URL into Nuvio/Stremio — or open the "
+                        "deep link on a device with the app")
+        + f"<div class='card install'>"
+          f"<div class='irow'><span class='murl'>{_esc(primary)}</span>"
+          f"{uitheme.copybtn(primary, 'Copy manifest URL', cls='btn sm')}"
+          f"<a class='btn ghost sm' href='{_esc(deep)}'>"
+          f"{uitheme.icon('external', size=14)}Open in Nuvio/Stremio</a></div>"
+          f"{folded}"
+          f"<p class='blurb' style='margin:10px 0 0'>First time here, or want "
+          f"to redo the basics? <a href='/setup'>Re-run the setup guide</a>."
+          f"</p></div>")
+
+
+def _gitem(conn: dict, *, configured: bool) -> str:
+    """One compact dot + name tile, deep-linked to its card on /connect."""
+    state = "ok" if configured else "idle"
+    label = "configured" if configured else "not set"
+    return (f"<a class='gitem' href='/connect#conn-{_esc(conn['id'])}'>"
+            f"{uitheme.status_dot(state)}"
+            f"<span><span class='gn'>{_esc(conn['name'])}</span>"
+            f"<div class='gr'>{_esc(conn['role'])}</div></span>"
+            f"<span class='gstate {state}'>{label}</span></a>")
+
+
+def _glance() -> str:
+    """What's plugged in, on top; what isn't, folded away by category.
+
+    The answer this section owes you is "what is actually running", so the
+    configured services are the only thing on screen by default. Everything
+    unconfigured is optional by definition — it collapses into one row per
+    category that you open when you want to add something."""
+    on, off = [], []
+    for c in config.CONNECTIONS:
+        (on if settings_ui._conn_configured(c) else off).append(c)
+    if not (on or off):
+        return ""
+
+    live = (f"<div class='glance'>"
+            f"{''.join(_gitem(c, configured=True) for c in on)}</div>"
+            if on else uitheme.empty(
+                "Nothing is connected yet. Open a category below, or run the "
+                "<a href='/setup'>setup guide</a>."))
+
+    # unconfigured, grouped by category and closed; categories keep
+    # config.CONNECTION_GROUPS order, with anything uncategorized last
+    known = [gid for gid, _t, _b in config.CONNECTION_GROUPS]
+    titles = {gid: t for gid, t, _b in config.CONNECTION_GROUPS}
+    buckets: dict[str, list[dict]] = {}
+    for c in off:
+        buckets.setdefault(c.get("cat") or "other", []).append(c)
+    order = [g for g in known if g in buckets]
+    order += [g for g in buckets if g not in known]
+    folds = "".join(
+        f"<details class='card ngroup'><summary>"
+        f"<span class='ngname'>{_esc(titles.get(gid, 'Other'))}</span>"
+        f"<span class='ngcount'>{len(cs)} available</span>"
+        f"{uitheme.icon('arrow-right', size=14, cls='chev')}</summary>"
+        f"<div class='ngbody'><div class='glance'>"
+        f"{''.join(_gitem(c, configured=False) for c in cs)}"
+        f"</div></div></details>"
+        for gid, cs in ((g, buckets[g]) for g in order))
+
+    return (uitheme.section("AT A GLANCE", "Services",
+                            "everything this instance talks to — click one to "
+                            "configure it",
+                            tally=f"{len(on)} of {len(on) + len(off)} connected",
+                            tone="ok" if on else "")
+            + live
+            + (f"<div class='notset'>{folds}</div>" if folds else ""))
+
+
+def render(recs: list[dict], addons: list[tuple[str, str]],
+           blocks: list[dict]) -> str:
+    """/ — status hero, what's playing, install, lanes, glance, then the ledger.
+
+    Ordered by urgency: act now (hero, on air), set up (install, lanes,
+    services), look back (ledger). The page auto-refreshes only while
+    something is actually streaming."""
+    names = overview._title_map(recs)
+    playing = overview.now_playing(recs)
+    restart = "1" if config.restart_pending() else "0"
+    body = f"""
+{_hero(recs, blocks, names)}
+{settings_ui._savebar(restart)}
+{playing}
+{_install(addons)}
+{uitheme.section("LANES", "Stream sources on/off",
+                 "flip a whole lane without touching its credentials — saves "
+                 "immediately")}
+{settings_ui._lane_masters()}
+{_glance()}
+{overview.ledger(recs)}"""
+    return uitheme.shell(
+        title="Home", name=ADDON_NAME, active="home",
+        csrf=adminui.csrf_token(), body=body,
+        head=f"<style>{settings_ui._CSS}{overview.CSS}{_CSS}</style>",
+        scripts=f"<script>{settings_ui._JS}</script>",
+        search=settings_ui.search_index(),
+        refresh=30 if playing else None)
