@@ -255,7 +255,8 @@ class WrapIntegrationTests(unittest.TestCase):
         self._mint = proxy._mint
         self.minted = []
 
-        def fake_mint(cands, pool, media, media_id, picker, hls=False):
+        def fake_mint(cands, pool, media, media_id, picker, hls=False,
+                      viewer="", viewer_key=""):
             self.minted.append((cands, hls))
             return "tok"
 

@@ -62,7 +62,7 @@ that account through the browser's normal sign-in prompt. For unattended deploym
 After signing in you land on the **guided setup** — a plain "do you have
 this?" checklist. Every kind of source, mount, automation and metadata
 provider is a card you switch on *only if you have it*; leave the rest off.
-Switch on a debrid (TorBox, Real-Debrid, AllDebrid, Premiumize) and it builds
+Switch on a debrid account and it builds
 and live-tests the two torrent search lanes from just the API key — but a
 debrid isn't required: usenet indexers, a Jellyfin library, MediaFusion, or
 another Stremio addon can each stand alone as your source of streams. Optional
@@ -94,7 +94,8 @@ The optional **Private Trackers** tab is an isolated home for local downloads:
 private releases never go to debrid, and draggable release preferences let you
 favor episodes, season packs, or full-series packs. rqbit can begin playback
 progressively before handing the same files to qBittorrent for permanent
-seeding. Its in-app setup guide covers the fail-closed PIA/Gluetun companion;
+seeding. Its in-app setup guide covers the fail-closed Gluetun VPN companion
+(works with any provider Gluetun supports);
 see [PRIVATE_TRACKERS.md](PRIVATE_TRACKERS.md) for the file-based version.
 
 The dashboard is **authenticated and local-only by default** — it answers to

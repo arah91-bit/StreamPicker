@@ -34,6 +34,12 @@ EXCLUDE = {
     "ANIME_KITSU_BASE": "Kitsu API base URL; advanced override",
     "ANIME_JIKAN_BASE": "Jikan API base URL; advanced override",
     "ANIME_NEG_TTL": "internal negative-cache window for anime lookups",
+    # Daily Picks (app/recs) deployment wiring. These name bind-mounted paths
+    # and the onboarding gate, so the settings store — which itself lives on a
+    # bind-mounted path — must not be able to move them out from under itself.
+    "DB_PATH": "Daily Picks database path; set via the volume mount",
+    "CATALOGS_DIR": "Daily Picks catalog packs; set via the volume mount",
+    "SETUP_SECRET": "the gate to Trakt onboarding — set it in .env only",
 }
 
 # Advanced groups render in this order. (id, title)

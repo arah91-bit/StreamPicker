@@ -29,9 +29,9 @@ except ValueError as exc:
 
 from app import (acquire, admin_auth, adminui, anime, connections, dashboard,  # noqa: E402
                  envref, library, meta, overview, picker, private_trackers,
-                 private_ui, probe, prowlarr, proxy, reputation, scrapers,
-                 settings_ui, sources, tbcache, telemetry, usenet,
-                 usenet_health, vprobe, wizard)
+                 picks_ui, private_ui, probe, prowlarr, proxy, recs_mount,
+                 reputation, scrapers, settings_ui, sources, tbcache,
+                 telemetry, usenet, usenet_health, vprobe, wizard)
 
 NOTICE_FILE = pathlib.Path(__file__).parent / "static" / "notice.mp4"
 NOTICE_THEATRICAL_FILE = (pathlib.Path(__file__).parent / "static"
@@ -61,6 +61,15 @@ async def _lifespan(_app: FastAPI):
         logger.info("admin: migrated explicit dashboard credentials to scrypt")
     proxy.load()
     await private_trackers.startup()
+    # Daily Picks runs in this process now. Its failure must not take the
+    # playback path down with it: a broken recommendation build should cost
+    # catalogs, never streams.
+    recs_tasks = []
+    try:
+        recs_tasks = await recs_mount.startup()
+    except Exception:
+        logger.exception("recs: startup failed; catalogs unavailable, "
+                         "streaming unaffected")
     _READY = True
     logger.info("startup complete; persistent data writable at %s", data_dir)
     try:
@@ -68,6 +77,10 @@ async def _lifespan(_app: FastAPI):
     finally:
         _READY = False
         logger.info("shutdown: draining background work and upstream clients")
+        try:
+            await recs_mount.shutdown(recs_tasks)
+        except Exception:
+            logger.exception("recs: shutdown cleanup failed")
         hooks = []
         names = []
         for name, module in (
@@ -235,6 +248,12 @@ async def notice_theatrical():
 
 @app.get("/{secret}/manifest.json")
 async def manifest(secret: str):
+    # One route shape, two addons. `/{token}/manifest.json` from app/recs
+    # compiles to this identical pattern, so the dispatch has to live here
+    # rather than in a second registration that would never be reached.
+    viewer = await recs_mount.viewer_for(secret, SECRET)
+    if viewer:
+        return await recs_mount.personal_manifest(secret)
     _check(secret)
     return MANIFEST
 
@@ -250,6 +269,8 @@ async def manifest_mobile(secret: str):
 
 @app.get("/{secret}/slow/manifest.json")
 async def manifest_slow(secret: str):
+    if await recs_mount.viewer_for(secret, SECRET):
+        return await recs_mount.personal_manifest(secret, "slow")
     _check(secret)
     return SLOW_MANIFEST
 
@@ -263,13 +284,18 @@ async def manifest_slow_mobile(secret: str):
                            "phones/tablets: 1080p max, modest file bitrates."}
 
 
-async def _streams(media: str, media_id: str, profile: str, slow: bool = False):
+async def _streams(media: str, media_id: str, profile: str, slow: bool = False,
+                   viewer: dict | None = None):
     if media not in ("movie", "series"):
         return JSONResponse({"streams": []})
     # Tag every probe this request spawns with what's being watched + which
     # picker, so the telemetry log can attribute a slow source to a title.
+    # `viewer` is the Daily Picks token when the request came through someone's
+    # personal addon — recorded as the token prefix only, which is enough to
+    # group a household's plays without writing an installable secret to a log.
     telemetry.request_ctx.set(
         {"media": media, "media_id": media_id,
+         "viewer": (viewer or {}).get("name") or "",
          "picker": ("slow" if slow else "fast") + ("/mob" if profile == "mobile" else "")})
     fn = picker.pick_slow if slow else picker.pick
     try:
@@ -280,12 +306,20 @@ async def _streams(media: str, media_id: str, profile: str, slow: bool = False):
     if streams and not streams[0].get("_private_action"):
         telemetry.record_served(streams[0])   # log real host/source before rewrite
     picker_label = ("slow" if slow else "fast") + ("/mob" if profile == "mobile" else "")
-    streams = proxy.wrap(streams, media, media_id, picker_label)  # → /proxy URLs
+    streams = proxy.wrap(streams, media, media_id, picker_label,
+                         viewer=(viewer or {}).get("name") or "",
+                         viewer_key=recs_mount.viewer_key(viewer))  # → /proxy URLs
     return JSONResponse({"streams": picker.clean_output(streams)})
 
 
 @app.get("/{secret}/stream/{media}/{media_id}.json")
 async def stream(secret: str, media: str, media_id: str):
+    # A personal addon's stream request carries that viewer's token, which is
+    # the whole reason catalogs and streams had to become one addon: it is the
+    # only point where a play can be tied to a person.
+    viewer = await recs_mount.viewer_for(secret, SECRET)
+    if viewer:
+        return await _streams(media, media_id, "full", viewer=viewer)
     _check(secret)
     return await _streams(media, media_id, "full")
 
@@ -298,6 +332,9 @@ async def stream_mobile(secret: str, media: str, media_id: str):
 
 @app.get("/{secret}/slow/stream/{media}/{media_id}.json")
 async def stream_slow(secret: str, media: str, media_id: str):
+    viewer = await recs_mount.viewer_for(secret, SECRET)
+    if viewer:
+        return await _streams(media, media_id, "full", slow=True, viewer=viewer)
     _check(secret)
     return await _streams(media, media_id, "full", slow=True)
 
@@ -416,6 +453,17 @@ async def private_trackers_page(request: Request):
     await _admin(request)
     metrics = telemetry.aggregate_private_trackers(telemetry.load())
     return HTMLResponse(private_ui.render(metrics))
+
+
+@app.get("/picks")
+async def picks_page(request: Request):
+    """Per-viewer home-row configuration for the Daily Picks catalogs."""
+    await _admin(request)
+    setup_secret = os.environ.get("SETUP_SECRET", "")
+    if not setup_secret:
+        raise HTTPException(503, "Daily Picks is not configured (SETUP_SECRET "
+                                 "is unset)")
+    return HTMLResponse(picks_ui.render(setup_secret))
 
 
 @app.get("/private-trackers/setup")
@@ -652,3 +700,12 @@ async def proxy_hls(token: str, request: Request):
     # by app.hlsproxy; each URL carries an HMAC binding it to this token, so
     # this cannot be used as an open proxy.
     return await proxy.serve_hls(token, request)
+
+
+# ── Daily Picks (app/recs) ───────────────────────────────────────────────
+# Registered last so every route stream-picker owns — including the two shapes
+# it dispatches, /{secret}/manifest.json and /{secret}/stream/… — is already in
+# the table and wins the match. Anything app/recs adds here is a path this
+# service does not otherwise serve.
+_RECS_ROUTES = recs_mount.attach(app)
+logger.info("recs: mounted %d Daily Picks routes", _RECS_ROUTES)

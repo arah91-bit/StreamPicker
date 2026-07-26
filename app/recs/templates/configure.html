@@ -1,0 +1,524 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Daily Picks — Admin</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; margin: 0; }
+  body {
+    font-family: system-ui, -apple-system, sans-serif;
+    background: #0d1117; color: #e6edf3;
+    min-height: 100vh; padding: 2rem 1rem;
+  }
+  .wrap { max-width: 760px; margin: 0 auto; }
+  h1 { font-size: 1.5rem; margin-bottom: .3rem; }
+  .sub { color: #9198a1; font-size: .9rem; margin-bottom: 1.5rem; }
+  .card {
+    background: #161b22; border: 1px solid #30363d; border-radius: 14px;
+    padding: 1.4rem; margin-bottom: 1.2rem;
+  }
+  h2 { font-size: 1.05rem; margin-bottom: .8rem; }
+  p { color: #9198a1; font-size: .9rem; line-height: 1.5; margin-bottom: .8rem; }
+  label { display: block; font-size: .85rem; margin-bottom: .3rem; color: #9198a1; }
+  input[type=text], select {
+    width: 100%; padding: .6rem .8rem; border-radius: 8px;
+    border: 1px solid #30363d; background: #0d1117; color: #e6edf3;
+    font-size: 1rem; margin-bottom: .9rem;
+  }
+  button {
+    padding: .55rem 1rem; border: 0; border-radius: 8px;
+    background: #ed1c24; color: #fff; font-size: .92rem; font-weight: 600;
+    cursor: pointer;
+  }
+  button.secondary { background: #21262d; border: 1px solid #30363d; color: #e6edf3; }
+  button.danger { background: #21262d; border: 1px solid #6e2222; color: #f85149; }
+  button:disabled { opacity: .5; cursor: default; }
+  .code {
+    font-family: ui-monospace, monospace; font-size: 1.8rem; letter-spacing: .3rem;
+    text-align: center; background: #0d1117; border: 1px dashed #30363d;
+    border-radius: 8px; padding: .9rem; margin: .9rem 0;
+  }
+  .hidden { display: none; }
+  a { color: #58a6ff; word-break: break-all; }
+  .user {
+    border: 1px solid #30363d; border-radius: 10px; padding: .9rem 1rem;
+    margin-bottom: .8rem; background: #0d1117;
+  }
+  .user-head { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap; }
+  .user-name { font-weight: 600; }
+  .badge {
+    font-size: .72rem; padding: .15rem .5rem; border-radius: 99px;
+    background: #1f6feb33; color: #58a6ff; border: 1px solid #1f6feb66;
+  }
+  .badge.kid { background: #23863633; color: #3fb950; border-color: #23863666; }
+  .badge.err { background: #f8514922; color: #f85149; border-color: #f8514966; }
+  .meta-line { color: #9198a1; font-size: .8rem; margin: .35rem 0 .55rem; }
+  .url {
+    font-family: ui-monospace, monospace; font-size: .74rem; color: #9198a1;
+    word-break: break-all; background: #161b22; padding: .5rem .6rem;
+    border-radius: 6px; margin-bottom: .55rem;
+  }
+  /* The addon URL is a link so it can be opened/verified, not just copied —
+     but it still has to read as the block of monospace it replaced. */
+  a.url { display: block; color: #58a6ff; text-decoration: none; }
+  a.url:hover { text-decoration: underline; }
+  .url-label { color: #e6edf3; font-size: .78rem; margin: .55rem 0 .3rem; }
+  .collection-note { color: #9198a1; font-size: .76rem; line-height: 1.4;
+    margin: -.1rem 0 .55rem; }
+  .row-btns { display: flex; gap: .5rem; flex-wrap: wrap; }
+  .row-btns button { font-size: .8rem; padding: .4rem .8rem; }
+  .kid-box {
+    border: 1px solid #30363d; border-radius: 8px; padding: .8rem .9rem;
+    margin-bottom: .9rem;
+  }
+  .kid-box .toggle { display: flex; align-items: center; gap: .55rem;
+    font-size: .92rem; color: #e6edf3; cursor: pointer; }
+  .slider-wrap { margin-top: .8rem; }
+  input[type=range] { width: 100%; accent-color: #ed1c24; }
+  .age-label { font-size: .85rem; color: #9198a1; }
+  .age-label b { color: #e6edf3; }
+  .status { font-size: .85rem; color: #9198a1; margin-top: .6rem; }
+  .ok { color: #3fb950; }
+  .tabs { display: flex; gap: .4rem; margin-bottom: 1.2rem;
+    border-bottom: 1px solid #30363d; }
+  .tab {
+    background: none; border: 0; border-bottom: 2px solid transparent;
+    color: #9198a1; font-size: .92rem; font-weight: 600; padding: .6rem .9rem;
+    border-radius: 0; cursor: pointer;
+  }
+  .tab.active { color: #e6edf3; border-bottom-color: #ed1c24; }
+  .rowspec {
+    display: flex; align-items: center; gap: .75rem; padding: .7rem .85rem;
+    border: 1px solid #30363d; border-radius: 8px; margin-bottom: .5rem;
+    background: #161b22;
+  }
+  .rowspec .pos {
+    font-family: ui-monospace, monospace; font-size: .78rem; color: #9198a1;
+    min-width: 1.4rem;
+  }
+  .rowspec .info { flex: 1; }
+  .rowspec .title { font-size: .9rem; }
+  .rowspec .desc { color: #9198a1; font-size: .78rem; margin-top: .15rem; }
+  .rowspec.locked { opacity: .65; }
+  .switch { font-size: .8rem; padding: .35rem .75rem; white-space: nowrap; }
+  .switch.on { background: #238636; color: #fff; border: 1px solid #2ea04366; }
+  .switch.off { background: #21262d; color: #9198a1; border: 1px solid #30363d; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Daily Picks</h1>
+  <div class="sub">Admin panel — every user gets a private addon URL, siloed to
+    their own Trakt account.</div>
+
+  <div class="tabs">
+    <button class="tab active" id="tab-users" data-panel="panel-users">Users</button>
+    <button class="tab" id="tab-builder" data-panel="panel-builder">Catalog builder</button>
+  </div>
+
+  <div id="panel-builder" class="hidden">
+    <div class="card">
+      <h2>Home rows</h2>
+      <p>Which rows each viewer gets, and in what order. Continue watching and
+        watch history are built fresh every time the home screen opens, so they
+        are never stale; everything below them is the nightly slate.</p>
+      <div id="builder"><p>Loading…</p></div>
+    </div>
+  </div>
+
+  <div id="panel-users">
+  <div class="card">
+    <h2>Users</h2>
+    <div id="users"><p>Loading…</p></div>
+  </div>
+
+  <div class="card" id="add-card">
+    <h2>Add a user</h2>
+    <div id="step1">
+      <label for="name">Name</label>
+      <input type="text" id="name" placeholder="e.g. Arah">
+      <div class="kid-box">
+        <label for="preferred-media">Viewing mix</label>
+        <select id="preferred-media">
+          <option value="balanced">Balanced movies and series</option>
+          <option value="movies">Lean toward movies</option>
+          <option value="series">Lean toward series</option>
+        </select>
+        <div class="age-label">Discovery: <b id="adventure-val">30</b>% — higher
+          values place more adjacent and surprising choices deeper in the home screen.</div>
+        <input type="range" id="adventurousness" min="0" max="100" value="30">
+      </div>
+      <div class="kid-box">
+        <label class="toggle">
+          <input type="checkbox" id="is-kid"> Kids profile
+        </label>
+        <div class="slider-wrap hidden" id="slider-wrap">
+          <div class="age-label">Age: <b id="age-val">8</b> — only shows content
+            appropriate for this age (G/PG/TV-Y…TV-PG, up to PG-13/TV-14 for teens)</div>
+          <input type="range" id="age" min="2" max="17" value="8">
+        </div>
+      </div>
+      <button id="connect">Connect Trakt</button>
+    </div>
+
+    <div id="step2" class="hidden">
+      <p>Have them go to <a id="verify-link" target="_blank" rel="noopener"></a>
+         and enter:</p>
+      <div class="code" id="user-code"></div>
+      <div class="status" id="poll-status">Waiting for approval on Trakt…</div>
+    </div>
+
+    <div id="step3" class="hidden">
+      <p><span class="ok">Connected ✓</span> <span id="who"></span></p>
+      <div class="status" id="gen-status">Building their first set of
+        recommendations… this takes a minute or two.</div>
+      <div id="install" class="hidden">
+        <div class="url-label">Private Daily Picks addon</div>
+        <a class="url" id="manifest-url" target="_blank" rel="noopener"></a>
+        <div class="row-btns">
+          <button id="copy">Copy addon URL</button>
+          <button class="secondary" id="add-another">Add another user</button>
+        </div>
+        <div id="streaming-install" class="hidden">
+          <div class="url-label">Streaming collection file</div>
+          <div class="collection-note">Download the JSON file to this computer, then
+            upload it under Nuvio Collections. It uses the same Daily Picks add-on;
+            no streaming helper add-on is needed.</div>
+          <div class="row-btns">
+            <button class="secondary" id="download-streaming">Download collection file</button>
+          </div>
+        </div>
+        <div class="status hidden" id="streaming-status"></div>
+      </div>
+    </div>
+  </div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const base = location.pathname.replace(/\/+$/, "");  // /setup/<secret>
+let deviceCode = null, newToken = null;
+let newStreamingConfigured = false;
+let newStreamingCollectionDownloadUrl = null;
+let newCollectionFilename = null;
+
+function downloadCollectionFile(url, filename) {
+  if (!url) return;
+  const link = document.createElement("a");
+  link.href = url;
+  // Named per viewer, so a household of six does not end up with six files
+  // called collections(3).json. The server sends the same name in
+  // Content-Disposition; this only matters for same-origin downloads, where
+  // the attribute wins.
+  if (filename) link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+}
+
+function fmtAgo(ts) {
+  if (!ts) return "never";
+  const h = (Date.now() / 1000 - ts) / 3600;
+  if (h < 1) return Math.round(h * 60) + "m ago";
+  if (h < 48) return Math.round(h) + "h ago";
+  return Math.round(h / 24) + "d ago";
+}
+
+for (const tab of document.querySelectorAll(".tab")) {
+  tab.onclick = () => {
+    for (const other of document.querySelectorAll(".tab")) {
+      other.classList.toggle("active", other === tab);
+      $(other.dataset.panel).classList.toggle("hidden", other !== tab);
+    }
+  };
+}
+
+// The rows every viewer gets, in the order the home screen renders them. The
+// two live rows are pinned above the nightly slate; the slate itself is one
+// generated block rather than a list of toggles, because its rows are chosen
+// per viewer per night and are not addressable here.
+const ROW_SPECS = [
+  {id: "nr-continue-watching", key: "continue_watching_row",
+   title: "Continue watching",
+   desc: "Resume a part-watched movie or episode, or start the next episode of a show you finished. Rebuilt on every visit."},
+  {id: "nr-watch-history", key: "watch_history_row",
+   title: "Watch history",
+   desc: "Everything recently watched, newest first, one card per title."},
+];
+
+function renderBuilder(users) {
+  const el = $("builder");
+  if (!users.length) { el.innerHTML = "<p>No users yet.</p>"; return; }
+  el.innerHTML = "";
+  for (const u of users) {
+    const div = document.createElement("div");
+    div.className = "user";
+    div.innerHTML = `
+      <div class="user-head">
+        <span class="user-name"></span>
+        ${u.is_kid ? `<span class="badge kid">Kid · age ${u.kid_age}</span>` : ""}
+      </div>
+      <div class="meta-line">${u.catalogs} nightly rows · refreshed ${fmtAgo(u.last_generated_at)}</div>
+      <div class="specs"></div>`;
+    div.querySelector(".user-name").textContent = u.name;
+    const specs = div.querySelector(".specs");
+    ROW_SPECS.forEach((spec, i) => {
+      const on = !!u[spec.key];
+      const row = document.createElement("div");
+      row.className = "rowspec";
+      row.innerHTML = `
+        <span class="pos">${i + 1}</span>
+        <span class="info">
+          <div class="title"></div>
+          <div class="desc"></div>
+        </span>
+        <button class="switch ${on ? "on" : "off"}">${on ? "On" : "Off"}</button>`;
+      row.querySelector(".title").textContent = spec.title;
+      row.querySelector(".desc").textContent = spec.desc;
+      row.querySelector(".switch").onclick = async e => {
+        e.target.disabled = true;
+        await fetch(base + "/api/watching/" + u.token, {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({row: spec.id, enabled: !on}),
+        });
+        loadUsers();
+      };
+      specs.appendChild(row);
+    });
+    const slate = document.createElement("div");
+    slate.className = "rowspec locked";
+    slate.innerHTML = `
+      <span class="pos">${ROW_SPECS.length + 1}+</span>
+      <span class="info">
+        <div class="title">Daily picks slate</div>
+        <div class="desc"></div>
+      </span>
+      <button class="switch off" disabled>Always on</button>`;
+    slate.querySelector(".desc").textContent =
+      `${u.catalogs} rows chosen for this viewer each night — top picks, ` +
+      "watchlist, because-you-watched, genres, people, decades.";
+    specs.appendChild(slate);
+    el.appendChild(div);
+  }
+}
+
+async function loadUsers() {
+  const r = await fetch(base + "/api/users");
+  const d = await r.json();
+  renderBuilder(d.users);
+  const el = $("users");
+  if (!d.users.length) { el.innerHTML = "<p>No users yet.</p>"; return; }
+  el.innerHTML = "";
+  for (const u of d.users) {
+    const div = document.createElement("div");
+    div.className = "user";
+    const m = u.measurement || {};
+    const measurementLine = m.sessions
+      ? ` · 30d: ${m.winning_sessions} assisted-pick session${m.winning_sessions === 1 ? "" : "s"} / ${m.sessions} (${Math.round((m.assisted_pick_rate || 0) * 100)}%)`
+      : " · 30d: no browsing sessions measured yet";
+    div.innerHTML = `
+      <div class="user-head">
+        <span class="user-name"></span>
+        <span class="badge trakt"></span>
+        ${u.is_kid ? `<span class="badge kid">Kid · age ${u.kid_age}</span>` : ""}
+        ${u.last_error ? `<span class="badge err" title=""></span>` : ""}
+      </div>
+      <div class="meta-line">${u.catalogs} home catalogs${u.streaming_catalogs ? ` · ${u.streaming_catalogs} collection-only streaming lists` : ""} · refreshed ${fmtAgo(u.last_generated_at)} · opened ${fmtAgo(u.last_served_at)}${u.refresh_queued ? " · refresh queued" : ""}${measurementLine}</div>
+      <div class="url-label">Private Daily Picks addon</div>
+      <a class="url" target="_blank" rel="noopener"></a>
+      ${u.streaming_collection_url ? `<div class="url-label">Streaming collection file</div><div class="collection-note">Download this JSON file, then upload it under Nuvio Collections. It uses the same Daily Picks add-on.</div>` : ""}
+      <div class="row-btns">
+        <button class="copy-btn">Copy addon URL</button>
+        ${u.streaming_collection_url ? `<button class="secondary collection-download-btn">Download collection file</button>` : ""}
+        <button class="secondary refresh-btn">Refresh now</button>
+        <button class="secondary preference-btn">Taste controls</button>
+        <button class="secondary kid-toggle-btn"></button>
+        ${u.is_kid ? `<button class="secondary kid-age-btn">Change age</button>` : ""}
+        <button class="danger delete-btn">Remove</button>
+      </div>`;
+    div.querySelector(".user-name").textContent = u.name;
+    div.querySelector(".badge.trakt").textContent = u.trakt_username || "trakt";
+    const urlLink = div.querySelector("a.url");
+    urlLink.textContent = u.manifest_url;
+    urlLink.href = u.manifest_url;
+    if (u.last_error) {
+      const err = div.querySelector(".badge.err");
+      err.textContent = "last run failed";
+      err.title = u.last_error;
+    }
+    div.querySelector(".copy-btn").onclick = e => {
+      navigator.clipboard.writeText(u.manifest_url);
+      e.target.textContent = "Copied ✓";
+      setTimeout(() => e.target.textContent = "Copy addon URL", 2000);
+    };
+    const collectionDownload = div.querySelector(".collection-download-btn");
+    if (collectionDownload) collectionDownload.onclick = () => {
+      downloadCollectionFile(u.streaming_collection_url, u.collection_filename);
+    };
+    div.querySelector(".refresh-btn").onclick = async e => {
+      e.target.disabled = true; e.target.textContent = "Refreshing…";
+      await fetch(base + "/api/refresh/" + u.token, {method: "POST"});
+      setTimeout(loadUsers, 4000);
+    };
+    div.querySelector(".preference-btn").onclick = async () => {
+      const mix = prompt(
+        `Viewing mix for ${u.name}? Enter balanced, movies, or series.`,
+        u.preferred_media || "balanced");
+      if (mix === null) return;
+      const adventure = prompt(
+        `Discovery level for ${u.name}? (0–100)`,
+        u.adventurousness ?? 30);
+      if (adventure === null) return;
+      const r = await fetch(base + "/api/preferences/" + u.token, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          preferred_media: mix.trim().toLowerCase(),
+          adventurousness: Math.max(0, Math.min(100, parseInt(adventure, 10) || 0)),
+        }),
+      });
+      if (!r.ok) {
+        const error = await r.json();
+        alert(error.detail || "Could not update taste controls.");
+        return;
+      }
+      loadUsers();
+    };
+    async function setKid(isKid, age) {
+      await fetch(base + "/api/kid/" + u.token, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({is_kid: isKid, kid_age: age}),
+      });
+      loadUsers();
+    }
+    const kt = div.querySelector(".kid-toggle-btn");
+    kt.textContent = u.is_kid ? "Kid mode: on" : "Kid mode: off";
+    kt.onclick = async () => {
+      if (u.is_kid) { setKid(false, null); return; }
+      const age = prompt(`Kid age for ${u.name}? (2–17 — grows automatically each year)`,
+                         u.kid_age || 8);
+      if (age === null) return;
+      setKid(true, parseInt(age, 10) || 8);
+    };
+    const ka = div.querySelector(".kid-age-btn");
+    if (ka) ka.onclick = async () => {
+      const age = prompt(`New age for ${u.name}? (2–17)`, u.kid_age || 8);
+      if (age === null) return;
+      setKid(true, parseInt(age, 10) || u.kid_age || 8);
+    };
+    div.querySelector(".delete-btn").onclick = async () => {
+      if (!confirm(`Remove ${u.name}? Their addon URL will stop working.`)) return;
+      await fetch(base + "/api/delete/" + u.token, {method: "POST"});
+      loadUsers();
+    };
+    el.appendChild(div);
+  }
+}
+loadUsers();
+
+$("is-kid").onchange = () => $("slider-wrap").classList.toggle("hidden", !$("is-kid").checked);
+$("age").oninput = () => $("age-val").textContent = $("age").value;
+$("adventurousness").oninput = () =>
+  $("adventure-val").textContent = $("adventurousness").value;
+
+$("connect").onclick = async () => {
+  $("connect").disabled = true;
+  const r = await fetch(base + "/api/device-code", {method: "POST"});
+  const d = await r.json();
+  deviceCode = d.device_code;
+  $("user-code").textContent = d.user_code;
+  const link = $("verify-link");
+  link.href = d.verification_url; link.textContent = d.verification_url;
+  $("step1").classList.add("hidden");
+  $("step2").classList.remove("hidden");
+  pollAuth(Math.max((d.interval || 5) * 1000, 3000));
+};
+
+async function pollAuth(interval) {
+  const r = await fetch(base + "/api/poll", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({
+      device_code: deviceCode,
+      name: $("name").value,
+      is_kid: $("is-kid").checked,
+      kid_age: parseInt($("age").value, 10),
+      preferred_media: $("preferred-media").value,
+      adventurousness: parseInt($("adventurousness").value, 10),
+    }),
+  });
+  const d = await r.json();
+  if (d.status === "ok") {
+    newToken = d.token;
+    newStreamingConfigured = !!d.streaming_profile_configured;
+    $("step2").classList.add("hidden");
+    $("step3").classList.remove("hidden");
+    $("who").textContent = "Trakt: " + (d.trakt_username || "connected");
+    $("manifest-url").textContent = d.manifest_url;
+    $("manifest-url").href = d.manifest_url;
+    newCollectionFilename = d.collection_filename || null;
+    loadUsers();
+    pollReady();
+  } else {
+    setTimeout(() => pollAuth(interval), interval);
+  }
+}
+
+async function pollReady() {
+  const r = await fetch("/api/status/" + newToken);
+  const d = await r.json();
+  if (d.ready) {
+    $("gen-status").innerHTML =
+      '<span class="ok">' + d.catalogs + ' catalogs ready.</span>' +
+      ' Paste the add-on URL below under Nuvio Add-ons.';
+    $("install").classList.remove("hidden");
+    if (d.streaming_collection_url) {
+      showStreamingCollection(d.streaming_collection_url, d.collection_filename);
+    } else if (d.streaming_profile_configured || newStreamingConfigured) {
+      const status = $("streaming-status");
+      status.textContent = "Building the streaming collection…";
+      status.classList.remove("hidden");
+      setTimeout(pollStreamingReady, 4000);
+    }
+    loadUsers();
+  } else {
+    setTimeout(pollReady, 4000);
+  }
+}
+
+function showStreamingCollection(url, filename) {
+  newStreamingCollectionDownloadUrl = url;
+  if (filename) newCollectionFilename = filename;
+  $("streaming-install").classList.remove("hidden");
+  $("streaming-status").classList.add("hidden");
+}
+
+async function pollStreamingReady() {
+  if (!newToken) return;
+  const r = await fetch("/api/status/" + newToken);
+  const d = await r.json();
+  if (d.streaming_collection_url) {
+    showStreamingCollection(d.streaming_collection_url);
+    loadUsers();
+  } else if (d.streaming_profile_configured) {
+    setTimeout(pollStreamingReady, 4000);
+  }
+}
+
+$("copy").onclick = () => {
+  navigator.clipboard.writeText($("manifest-url").textContent);
+  $("copy").textContent = "Copied ✓";
+  setTimeout(() => $("copy").textContent = "Copy addon URL", 2000);
+};
+$("download-streaming").onclick = () => {
+  downloadCollectionFile(newStreamingCollectionDownloadUrl, newCollectionFilename);
+};
+$("add-another").onclick = () => location.reload();
+</script>
+</body>
+</html>

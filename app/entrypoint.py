@@ -111,6 +111,18 @@ def main() -> None:
             nested = False
         if not nested:
             roots.append(buffer_dir)
+        # app/recs keeps its SQLite outside /data because that directory is
+        # still bind-mounted into the standalone picks service and read-only
+        # into asian-dramas. It arrives root-owned from those containers, so it
+        # needs the same ownership repair before we drop to UID 1000.
+        recs_db = os.environ.get("DB_PATH", "")
+        if recs_db:
+            roots.append(Path(recs_db).parent)
+        # Same story for the catalog packs: subdirectories written by the old
+        # root-running picks container are not writable by UID 1000.
+        recs_catalogs = os.environ.get("CATALOGS_DIR", "")
+        if recs_catalogs:
+            roots.append(Path(recs_catalogs))
         changed = sum(_prepare_tree(path) for path in roots)
         if changed:
             print(f"entrypoint: repaired ownership on {changed} data paths",

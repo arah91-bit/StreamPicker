@@ -283,6 +283,10 @@ def _base(stream: dict) -> dict:
         "picker": ctx.get("picker", ""),
         "media": ctx.get("media", ""),
         "id": ctx.get("media_id", ""),
+        # Which viewer's personal addon asked. Empty for the shared stream-only
+        # addon, which cannot know. This is the display name, not the token —
+        # a token in a log would be an installable addon URL.
+        "viewer": ctx.get("viewer", ""),
         "host": _host(stream.get("url")),
         **identity(stream),
     }
@@ -485,6 +489,17 @@ def aggregate(recs: list[dict], key: str, kind: str = "probe",
     return rows
 
 
+# Extra consumers of play records, registered at startup. app/recs uses this to
+# build its own watch history; telemetry stays unaware of who is listening so
+# the dependency only ever points one way.
+_play_sinks: list = []
+
+
+def add_play_sink(sink) -> None:
+    if sink not in _play_sinks:
+        _play_sinks.append(sink)
+
+
 def record_play(entry: dict, cand: dict, idx: int, *, served: int, dur: float,
                 ttfb: float, reconnects: int, reason: str, net: dict | None = None,
                 session: str = "", up_mbps: float | None = None,
@@ -494,11 +509,12 @@ def record_play(entry: dict, cand: dict, idx: int, *, served: int, dur: float,
     it ended, how much got watched, and the delivery node it came from."""
     size = cand.get("size")
     net = net or {}
-    _append({
+    rec = {
         "ts": round(time.time(), 1),
         "kind": "play",
         "session": session,
         "picker": entry.get("picker", ""),
+        "viewer": entry.get("viewer", ""),
         "id": entry.get("id", ""),
         "debrid": cand.get("dbr", ""),
         "cached": "+" in (cand.get("dbr", "") or ""),
@@ -522,7 +538,19 @@ def record_play(entry: dict, cand: dict, idx: int, *, served: int, dur: float,
         "reconnects": reconnects,
         "reason": reason,
         "watched": round(100 * served / size, 1) if size else None,
-    })
+        # Read head at the moment playback stopped: the offset of the last
+        # range request plus what was delivered against it. This is the resume
+        # point; "watched" above is total bytes shipped and is not.
+        "pos": int(entry.get("pos") or 0) + int(served or 0),
+        "total": entry.get("total") or size,
+    }
+    _append(rec)
+    for sink in _play_sinks:
+        try:
+            sink(rec, entry)
+        except Exception:
+            # A downstream consumer must never break playback telemetry.
+            logger.debug("play sink failed", exc_info=True)
 
 
 def record_buffer(event: str, *, sig: str = "", picker: str = "",

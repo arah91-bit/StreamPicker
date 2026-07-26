@@ -166,7 +166,8 @@ class AutoEligibilityPoolTests(unittest.TestCase):
         marked_b = self.stream("https://three.example/marked-b", auto=True)
         calls = []
 
-        def mint(cands, pool, media, media_id, picker, hls=False):
+        def mint(cands, pool, media, media_id, picker, hls=False,
+                 viewer="", viewer_key=""):
             calls.append((cands, pool, hls))
             return f"tok-{len(calls)}"
 
@@ -197,7 +198,8 @@ class AutoEligibilityPoolTests(unittest.TestCase):
             "https://three.example/marked-b", hls=True, auto=True)
         calls = []
 
-        def mint(cands, pool, media, media_id, picker, hls=False):
+        def mint(cands, pool, media, media_id, picker, hls=False,
+                 viewer="", viewer_key=""):
             calls.append((cands, pool, hls))
             return f"hls-{len(calls)}"
 

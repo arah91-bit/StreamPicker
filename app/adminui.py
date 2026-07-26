@@ -35,6 +35,7 @@ TABS = [
     ("settings", "/settings", "Settings"),
     ("stats", "/stats", "Source health"),
     ("private", "/private-trackers", "Private Trackers"),
+    ("picks", "/picks", "Catalog builder"),
 ]
 
 NAV_CSS = """

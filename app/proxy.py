@@ -268,7 +268,8 @@ def _lookup(token: str) -> dict | None:
 
 
 def _mint(cands: list[dict], pool: list[dict], media: str, media_id: str,
-          picker: str, hls: bool = False) -> str:
+          picker: str, hls: bool = False, viewer: str = "",
+          viewer_key: str = "") -> str:
     token = secrets.token_urlsafe(9)
     # Defense in depth: wrap() builds these pools, but _mint is the persistence
     # boundary and must never serialize a marked leader beside an unverified
@@ -286,7 +287,8 @@ def _mint(cands: list[dict], pool: list[dict], media: str, media_id: str,
     # the opening request and used to prove a twin is byte-identical before we
     # splice to it.
     entry = {"cands": cands, "pool": pool, "id": media_id, "picker": picker,
-             "pin": None, "total": None, "auto": auto}
+             "pin": None, "total": None, "auto": auto, "viewer": viewer,
+             "viewer_key": viewer_key}
     if hls:
         entry["hls"] = True
     _sessions[token] = (time.time(), entry)
@@ -392,7 +394,8 @@ def _cand(s: dict) -> dict:
             "auto": bool(auto)}
 
 
-def wrap(streams: list[dict], media: str, media_id: str, picker: str) -> list[dict]:
+def wrap(streams: list[dict], media: str, media_id: str, picker: str,
+         viewer: str = "", viewer_key: str = "") -> list[dict]:
     """Return a copy of the list with online stream URLs replaced by proxy URLs
     whose token carries the identity-eligible failover tail from each position.
     Unmarked entries receive an isolated one-candidate token. Library and notice
@@ -432,7 +435,8 @@ def wrap(streams: list[dict], media: str, media_id: str, picker: str) -> list[di
                     pool = marked_hls_pool
                 else:
                     cands = pool = [_cand(s)]
-                token = _mint(cands, pool, media, media_id, picker, hls=True)
+                token = _mint(cands, pool, media, media_id, picker, hls=True,
+                              viewer=viewer, viewer_key=viewer_key)
                 ns = dict(s)
                 ns["url"] = f"{PUBLIC}/proxy/{token}"
                 bh = dict(ns.get("behaviorHints") or {})
@@ -456,7 +460,8 @@ def wrap(streams: list[dict], media: str, media_id: str, picker: str) -> list[di
                 pool = marked_pool
             else:
                 cands = pool = [_cand(s)]
-            token = _mint(cands, pool, media, media_id, picker)
+            token = _mint(cands, pool, media, media_id, picker, viewer=viewer,
+                          viewer_key=viewer_key)
             ns = dict(s)
             ns["url"] = f"{PUBLIC}/proxy/{token}"
             out.append(ns)
@@ -1922,7 +1927,17 @@ async def _consume(e: _Entry, offset: int, end: int | None, token: str):
         async with e.cond:
             e.cond.notify_all()                         # let the producer re-evaluate
         try:
-            telemetry.record_play({"picker": e.picker, "id": e.media_id},
+            # Attribute from the session, not from `e`. A buffered entry is
+            # keyed by cache id and deliberately shared between viewers, so the
+            # viewer on it is whoever opened the file first — crediting them
+            # for someone else's play would quietly corrupt watch history. The
+            # token is the per-viewer capability.
+            _sess = _lookup(token) or {}
+            telemetry.record_play({"picker": e.picker, "id": e.media_id,
+                                   "viewer": _sess.get("viewer", ""),
+                                   "viewer_key": _sess.get("viewer_key", ""),
+                                   "pos": _sess.get("pos", 0),
+                                   "total": _sess.get("total") or e.total},
                                   e.source or {}, 0, served=served,
                                   dur=time.monotonic() - t0, ttfb=0.0, reconnects=0,
                                   reason=reason, session=token,
@@ -2111,6 +2126,11 @@ async def serve(token: str, request) -> Response:
         return await _head(entry)
     range_header = request.headers.get("range")
     offset, end, had_range = _parse_range(range_header)
+    # Where this player is reading. Every byte-range request for this token
+    # passes through here, so the last offset plus what we then deliver against
+    # it is the read head — the basis for a real resume point rather than a
+    # count of bytes shipped.
+    entry["pos"] = offset
     cands = entry["cands"]
 
     if range_header and not had_range:
