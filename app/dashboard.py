@@ -318,7 +318,7 @@ def render(recs: list[dict], blocklist: list[dict],
         ("probe fail rate", f"{fail_pct}%"),
         ("streams played", len(plays)),
         ("auto-switched", f"{switch_pct}%"),
-        ("blocked sources", n_blocked),
+        ("blocked releases", n_blocked),
     ]
     cache_tiles = [
         ("E+1 ready", cache["prewarm_ready"]),

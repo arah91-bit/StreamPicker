@@ -12,7 +12,8 @@ restart — so the page never drifts from config.json / .env parity.
 
 import os
 
-from app import adminui, config, overview, proxy, settings_ui, uitheme
+from app import (adminui, config, overview, proxy, settings_ui, telemetry,
+                 uitheme, usenet_health)
 
 ADDON_NAME = os.environ.get("ADDON_NAME", "Auto Stream")
 
@@ -67,12 +68,55 @@ details.ngroup[open]>summary .chev{transform:rotate(90deg)}
 """
 
 
+# Probes are cheap and plentiful, so a source has to fail a real run of them
+# before we call it dead rather than unlucky.
+_DEAD_SOURCE_PROBES = 8
+
+
+def _broken_services(recs: list[dict]) -> list[str]:
+    """Services that are genuinely down — *not* releases the picker screened out.
+
+    Blocked releases are the product, not a problem: finding the bad ones and
+    routing around them is the entire job, and a healthy instance accumulates
+    them forever. Surfacing that pile as an alert trains you to ignore the
+    hero. What does want a human is a service that never works at all — a
+    usenet indexer whose NZB downloads are all rejected (expired plan, stale
+    API key), or a source whose probes fail every single time. Only those.
+
+    Both bars are the ones the engines already use to give up on an endpoint,
+    so the hero can't disagree with Health about what is actually broken.
+    """
+    names: list[str] = []
+    try:
+        names += [r["name"] for r in usenet_health.indexer_listing()
+                  if not r.get("fetch_allowed", True)]
+    except Exception:                                # health db absent/locked
+        pass
+    probes = [r for r in recs if r.get("kind") == "probe"]
+    names += [r["key"] for r in
+              telemetry.aggregate(probes, "src", min_n=_DEAD_SOURCE_PROBES)
+              if r["fail_pct"] >= 100.0 and r["key"] != "(none)"]
+    return sorted(dict.fromkeys(names))
+
+
+def _screened(blocks: list[dict]) -> str:
+    """Blocked releases as evidence the picker is working, not as an alarm."""
+    n = sum(1 for b in blocks if b.get("blocked"))
+    if not n:
+        return ""
+    return (f" {overview._num(n)} bad release{'s' if n != 1 else ''} screened "
+            "out along the way.")
+
+
 def _hero(recs: list[dict], blocks: list[dict], names: dict[str, str]) -> str:
-    """The one-glance answer. Priority: restart > now playing > attention >
+    """The one-glance answer. Priority: restart > now playing > broken service >
     streaming history > fresh-and-ready."""
     restart = config.restart_pending()
     playing = proxy.active_stream_details()
     plays = [r for r in recs if r.get("kind") == "play"]
+    # only when it can reach the screen — scanning probes costs a pass over
+    # the whole telemetry window
+    broken = [] if restart or playing else _broken_services(recs)
 
     if restart:
         state, dot, sub, act = (
@@ -90,12 +134,15 @@ def _hero(recs: list[dict], blocks: list[dict], names: dict[str, str]) -> str:
             f"Serving <b>{_esc(title)}</b>{more} through the proxy — "
             "failover and read-ahead are live.",
             "")
-    elif blocks:
+    elif broken:
+        shown = ", ".join(broken[:3])
+        more = f" +{len(broken) - 3} more" if len(broken) > 3 else ""
         state, dot, sub, act = (
-            f"{len(blocks)} source{'s' if len(blocks) != 1 else ''} need"
-            " attention", "warn",
-            "Some sources are erroring or blocked. Health has the details and "
-            "the one-click unblock.",
+            f"{len(broken)} source{'s' if len(broken) != 1 else ''} failing "
+            "every time", "warn",
+            f"<b>{_esc(shown)}</b>{more} never returned a working result — "
+            "usually an expired plan or a stale API key. Everything else is "
+            "picking normally.",
             f"<a class='btn ghost' href='/health/sources'>"
             f"{uitheme.icon('activity')}Open Health</a>")
     elif plays:
@@ -105,7 +152,7 @@ def _hero(recs: list[dict], blocks: list[dict], names: dict[str, str]) -> str:
             "All systems go", "ok",
             f"{overview._num(len(plays))} stream"
             f"{'s' if len(plays) != 1 else ''} served — {dv} {du} through the "
-            "proxy since telemetry reset.",
+            f"proxy since telemetry reset.{_screened(blocks)}",
             "")
     else:
         state, dot, sub, act = (
