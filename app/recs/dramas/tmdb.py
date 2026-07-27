@@ -14,6 +14,7 @@ from typing import Any
 
 import httpx
 
+from app.recs import config as recs_config
 from app.recs.dramas import config
 
 logger = logging.getLogger("asian-dramas")
@@ -24,7 +25,6 @@ CACHE_PATH = Path(config.DATA_DIR) / "meta_cache.json"
 _client = httpx.AsyncClient(
     base_url="https://api.themoviedb.org/3",
     timeout=30,
-    params={"api_key": config.TMDB_API_KEY},
 )
 _sem = asyncio.Semaphore(8)
 
@@ -46,8 +46,12 @@ def save_cache() -> None:
 
 
 async def _get(path: str, params: dict | None = None) -> Any:
+    # Same account as Daily Picks, and resolved per request for the same
+    # reason: see app.recs.config.require.
+    params = {**(params or {}),
+              "api_key": recs_config.require("TMDB_API_KEY")}
     async with _sem:
-        r = await _client.get(path, params=params or {})
+        r = await _client.get(path, params=params)
     r.raise_for_status()
     return r.json()
 

@@ -1,4 +1,3 @@
-import os
 import datetime
 import sqlite3
 import tempfile
@@ -8,12 +7,6 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import httpx
-
-
-os.environ.setdefault("TMDB_API_KEY", "test")
-os.environ.setdefault("TRAKT_CLIENT_ID", "test")
-os.environ.setdefault("TRAKT_CLIENT_SECRET", "test")
-os.environ.setdefault("SETUP_SECRET", "test")
 
 from app.recs import config, db, tmdb
 

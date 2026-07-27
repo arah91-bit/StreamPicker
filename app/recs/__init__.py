@@ -1,4 +1,4 @@
-"""Daily Picks — per-viewer Trakt/TMDB recommendation catalogs.
+"""Daily Picks — per-viewer TMDB recommendation catalogs.
 
 Vendored from the standalone nuvio-recs service so one addon per viewer can
 serve both catalogs and streams. Kept as a self-contained subpackage rather

@@ -75,7 +75,7 @@ class ToggleEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.client = httpx.AsyncClient(
             transport=httpx.ASGITransport(app=main.app),
             base_url="http://testserver")
-        self.secret = main.config.SETUP_SECRET
+        self.secret = main.config.require("SETUP_SECRET")
 
     async def asyncTearDown(self):
         await self.client.aclose()

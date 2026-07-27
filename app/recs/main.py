@@ -15,7 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from app.recs import (config, db, dramas, kids_catalogs, playhistory,
-                      profile_streaming, trakt, trakt_import, watching)
+                      profile_streaming, watching)
 from app.recs.catalogs import generate_for_user
 from app.recs.kids import birthdate_from_age, clamp_age, effective_kid_age
 from app.recs import scheduler
@@ -53,7 +53,7 @@ font:16px/1.55 system-ui,sans-serif;display:grid;min-height:100vh;place-items:ce
 main{max-width:620px;padding:32px}h1{margin:0 0 8px}p{color:#a8b0ba}
 .ok{color:#3fb950}code{background:#161b22;padding:2px 6px;border-radius:5px}
 </style></head><body><main><h1>Daily Picks</h1>
-<p>Personal viewing catalogs built from each viewer's Trakt history and refreshed
+<p>Personal viewing catalogs built from what each viewer actually watches, refreshed
 daily. Daily Picks is installed in Nuvio through a private per-profile addon URL.</p>
 <p class="ok">Service online</p></main></body></html>"""
 
@@ -101,10 +101,13 @@ async def shutdown() -> None:
     await db.close()
 
 
-# ── configure page + Trakt device auth (gated behind SETUP_SECRET) ──────
+# ── configure page + viewer management (gated behind SETUP_SECRET) ──────
 
 def _check_setup_secret(secret: str) -> None:
-    if not secrets.compare_digest(secret, config.SETUP_SECRET):
+    # require(), not a constant defaulting to "": an install that never set
+    # SETUP_SECRET must not end up comparing the caller's secret against the
+    # empty string, which an empty guess would match.
+    if not secrets.compare_digest(secret, config.require("SETUP_SECRET")):
         raise HTTPException(404)
 
 
@@ -164,44 +167,34 @@ async def configure(secret: str):
     return CONFIGURE_HTML
 
 
-class PollBody(BaseModel):
-    device_code: str
-    name: str = ""
+class NewViewerBody(BaseModel):
+    name: str
     is_kid: bool = False
     kid_age: int | None = None
     preferred_media: str = "balanced"
     adventurousness: int = 30
 
 
-@app.post("/setup/{secret}/api/device-code")
-async def device_code(secret: str):
+@app.post("/setup/{secret}/api/users")
+async def create_viewer(secret: str, body: NewViewerBody):
+    """Add a viewer. A name is all it takes.
+
+    This used to be a Trakt OAuth device flow, which existed to borrow an
+    account's watch history. Taste is built from what this service actually
+    plays for someone, so there is no account to connect — and a new viewer
+    starts with an empty profile that fills in as they watch, rather than
+    with someone else's idea of what they like.
+    """
     _check_setup_secret(secret)
-    data = await trakt.create_device_code()
-    return {
-        "device_code": data["device_code"],
-        "user_code": data["user_code"],
-        "verification_url": data["verification_url"],
-        "interval": data.get("interval", 5),
-        "expires_in": data.get("expires_in", 600),
-    }
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(400, "a viewer needs a name")
 
-
-@app.post("/setup/{secret}/api/poll")
-async def poll(secret: str, body: PollBody):
-    _check_setup_secret(secret)
-    tokens = await trakt.poll_device_token(body.device_code)
-    if tokens is None:
-        return {"status": "pending"}
-
-    username = await trakt.get_username(tokens["access_token"])
     token = secrets.token_urlsafe(16)
-    expires_at = int(time.time()) + int(tokens.get("expires_in", 7776000))
     kid_age = clamp_age(body.kid_age) if body.is_kid else None
-    await db.create_user(token, body.name.strip() or (username or "user"),
-                         username, tokens["access_token"],
-                         tokens["refresh_token"], expires_at,
-                         is_kid=body.is_kid, kid_age=kid_age,
-                         kid_birthdate=birthdate_from_age(kid_age) if kid_age else None)
+    await db.create_user(
+        token, name, is_kid=body.is_kid, kid_age=kid_age,
+        kid_birthdate=birthdate_from_age(kid_age) if kid_age else None)
     preferred_media = body.preferred_media \
         if body.preferred_media in {"balanced", "movies", "series"} else "balanced"
     await db.update_preferences(
@@ -209,11 +202,10 @@ async def poll(secret: str, body: PollBody):
     user = await db.get_user(token)
     asyncio.create_task(generate_for_user(user, trigger="signup"))
     _queue_profile_streaming_build(user)
-    logger.info(f"new user '{username}' -> token {token[:8]}…")
+    logger.info(f"new viewer '{name}' -> token {token[:8]}…")
     return {
         "status": "ok",
         "token": token,
-        "trakt_username": username,
         "manifest_url": _manifest_url(token),
         "streaming_collection_url": _streaming_collection_url(user),
         "collection_filename": collection_filename(user),
@@ -234,7 +226,6 @@ async def list_users(secret: str):
             u["token"], window_days=30)
         out.append({
             "name": u["name"],
-            "trakt_username": u["trakt_username"],
             "is_kid": bool(u["is_kid"]),
             # Always the live age computed from the internal anchor. The
             # anchor date itself is deliberately not exposed: nobody is asked
@@ -354,22 +345,6 @@ async def admin_update_preferences(secret: str, token: str, body: PreferenceBody
         "preferred_media": user["preferred_media"],
         "adventurousness": user["adventurousness"],
     }
-
-
-@app.post("/setup/{secret}/api/trakt-import")
-async def admin_trakt_import(secret: str):
-    """Copy every viewer's Trakt history into play_history.
-
-    Time-limited by circumstance rather than by design: it only works while the
-    OAuth grants are live, and they end when the one free Trakt app slot moves
-    elsewhere. Safe to run repeatedly — inserts are idempotent on
-    (viewer, content, timestamp).
-    """
-    _check_setup_secret(secret)
-    from app import recs_mount
-    reports = await trakt_import.import_all(recs_mount.viewer_key)
-    return {"status": "ok", "users": reports,
-            "stored": sum(r.get("stored", 0) for r in reports)}
 
 
 @app.post("/setup/{secret}/api/refresh/{token}")
@@ -535,7 +510,7 @@ def collection_filename(user: dict) -> str:
     whose. The display name is what the admin panel shows, so it is the name
     that makes the file identifiable on disk.
     """
-    raw = (user.get("name") or user.get("trakt_username") or "daily-picks").strip()
+    raw = (user.get("name") or "daily-picks").strip()
     # Anything that would break a Content-Disposition header, a shell, or a
     # filesystem path. Spaces are kept — this is a human-facing filename.
     safe = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "", raw).strip() or "daily-picks"
@@ -602,7 +577,7 @@ async def manifest(token: str):
         "version": profile_streaming.PRIVATE_MANIFEST_VERSION,
         "name": config.ADDON_NAME,
         "description": "Personal daily recommendations plus private, "
-                       "collection-only streaming catalogs from your Trakt taste.",
+                       "collection-only streaming catalogs from your taste profile.",
         "resources": ["catalog"],
         "types": types,
         "idPrefixes": ["tt"],

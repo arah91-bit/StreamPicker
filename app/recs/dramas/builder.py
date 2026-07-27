@@ -4,7 +4,7 @@ Country rows: TMDB discover per (country, genre), popularity-sorted so each
 day's ordering follows what's currently hot; "New" sorts by air date instead.
 
 Actor rows: ranked by what Tonya and Toya actually watch — every Asian drama
-in their Trakt history votes for its top-billed cast, weighted by how recently
+in their watch history votes for its top-billed cast, weighted by how recently
 it was watched — blended with the casts of currently-trending dramas so the
 lineup moves with the times. Pinned actors (Bai Lu) always come first.
 
@@ -20,7 +20,7 @@ import random
 import time
 from pathlib import Path
 
-from app.recs.dramas import config, tmdb, trakt
+from app.recs.dramas import config, taste, tmdb
 
 logger = logging.getLogger("asian-dramas")
 
@@ -280,7 +280,7 @@ def _is_asian_show(show: dict) -> bool:
 async def _watched_asian_shows() -> dict[int, float]:
     """{tmdb show id: recency weight (summed across users)}"""
     weights: dict[int, float] = {}
-    by_viewer = await trakt.watched_shows_by_viewer()
+    by_viewer = await taste.watched_shows_by_viewer()
     for name, items in by_viewer.items():
         n = 0
         for it in items:

@@ -1,10 +1,9 @@
 """Catalog builder — the admin page for each viewer's Daily Picks home rows.
 
 Lives in stream-picker's admin chrome rather than app/recs' own standalone
-configure page, so there is one place to administer the whole service. The
-Trakt device-code onboarding flow stays on the public /setup/<secret> page:
-that one has to be reachable by people who are not on this LAN, and this
-dashboard is LAN-only.
+configure page, so there is one place to administer the whole service. That
+public /setup/<secret> page still exists and still adds viewers; it has to be
+reachable by people who are not on this LAN, and this dashboard is LAN-only.
 
 The page is a thin client over app/recs' existing admin API, so nothing here
 duplicates row logic — it only decides what is switchable.
@@ -198,14 +197,8 @@ def render(setup_secret: str) -> str:
       <div class="note">Set this once — the age advances on its own from
         here, so a 13-year-old today is 14 next year.</div>
     </div>
-    <div class="acts"><button id="connect">Connect Trakt</button></div>
-  </div>
-  <div id="add-step2" class="hidden">
-    <p class="mut">Have them open <a id="vlink" target="_blank" rel="noopener"></a>
-      and enter this code:</p>
-    <div class="code" id="ucode"></div>
-    <div class="mut" id="pstat">Waiting for approval on Trakt…</div>
-    <div class="acts"><button id="cancel">Cancel</button></div>
+    <div class="acts"><button id="connect">Add viewer</button></div>
+    <div class="mut" id="pstat"></div>
   </div>
 </div>"""
 
@@ -329,7 +322,6 @@ async function load() {{
     card.className = "card";
     card.innerHTML = `
       <div class="who"><span class="nm"></span>
-        <span class="pill trakt"></span>
         ${{u.is_kid && u.kid_age != null
             ? '<span class="pill">Kid · ' + u.kid_age + ' · '
               + bandFor(u.kid_age).label + '</span>' : ""}}
@@ -349,7 +341,6 @@ async function load() {{
         <button class="rm danger">Remove</button>
       </div>`;
     card.querySelector(".nm").textContent = u.name;
-    card.querySelector(".pill.trakt").textContent = u.trakt_username || "trakt";
     const err = card.querySelector(".pill.err");
     if (err) err.title = u.last_error;
     card.querySelector(".meta").textContent =
@@ -419,9 +410,7 @@ async function load() {{
   }}
 }}
 
-// ── add a viewer (Trakt device code) ────────────────────────────────────
-let deviceCode = null, polling = false;
-
+// ── add a viewer ────────────────────────────────────────────────────────
 $("kid").onchange = () => $("agewrap").classList.toggle("hidden", !$("kid").checked);
 
 function paintAddAge() {{
@@ -434,50 +423,29 @@ $("age").oninput = paintAddAge;
 paintAddAge();
 
 $("connect").onclick = async () => {{
+  const name = $("nm").value.trim();
+  if (!name) {{ $("pstat").textContent = "Give them a name first."; return; }}
   $("connect").disabled = true;
-  const d = await (await fetch(api("/device-code"), {{method: "POST"}})).json();
-  deviceCode = d.device_code;
-  $("ucode").textContent = d.user_code;
-  const l = $("vlink");
-  l.href = d.verification_url; l.textContent = d.verification_url;
-  $("add-step1").classList.add("hidden");
-  $("add-step2").classList.remove("hidden");
-  polling = true;
-  poll(Math.max((d.interval || 5) * 1000, 3000));
-}};
-
-$("cancel").onclick = () => {{ polling = false; resetAdd(); }};
-
-function resetAdd() {{
-  deviceCode = null;
-  $("add-step2").classList.add("hidden");
-  $("add-step1").classList.remove("hidden");
-  $("connect").disabled = false;
-  $("nm").value = "";
-  $("pstat").textContent = "Waiting for approval on Trakt…";
-}}
-
-async function poll(interval) {{
-  if (!polling) return;
+  $("pstat").textContent = "Adding…";
   const body = {{
-    device_code: deviceCode,
-    name: $("nm").value,
+    name: name,
     is_kid: $("kid").checked,
     kid_age: parseInt($("age").value, 10) || AGE.fallback,
   }};
-  const d = await (await fetch(api("/poll"), {{
+  const r = await fetch(api("/users"), {{
     method: "POST", headers: {{"Content-Type": "application/json"}},
     body: JSON.stringify(body),
-  }})).json();
-  if (d.status === "ok") {{
-    polling = false;
-    $("pstat").textContent = "Connected — building their first catalogs…";
-    resetAdd();
+  }});
+  const d = await r.json();
+  if (r.ok && d.status === "ok") {{
+    $("pstat").textContent = "Added — building their first catalogs…";
+    $("nm").value = "";
     load();
   }} else {{
-    setTimeout(() => poll(interval), interval);
+    $("pstat").textContent = d.detail || "Could not add that viewer.";
   }}
-}}
+  $("connect").disabled = false;
+}};
 
 load();
 </script>"""

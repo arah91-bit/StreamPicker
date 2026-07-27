@@ -236,10 +236,9 @@ class CollectionFilenameTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(main.collection_filename({"name": "Phil"}),
                          "Phil collections.json")
 
-    def test_falls_back_to_the_trakt_username(self):
-        self.assertEqual(
-            main.collection_filename({"name": "", "trakt_username": "arah91"}),
-            "arah91 collections.json")
+    def test_a_nameless_viewer_still_gets_a_usable_filename(self):
+        self.assertEqual(main.collection_filename({"name": ""}),
+                         "daily-picks collections.json")
 
     def test_characters_that_would_break_a_header_or_path_are_dropped(self):
         self.assertEqual(

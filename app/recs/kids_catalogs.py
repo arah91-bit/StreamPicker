@@ -209,9 +209,6 @@ async def _taste_user(target_name: str) -> dict | None:
     for user in users:
         if (user.get("name") or "").strip().casefold() == target:
             return user
-    for user in users:
-        if (user.get("trakt_username") or "").strip().casefold() == target:
-            return user
     return None
 
 
@@ -308,7 +305,7 @@ async def taste_model_for_user(target_name: str,
 
     model = _taste_model(profile, user, source, activity)
     model["real_watches"] = real_watches
-    logger.info("%s: %s profile from %s (%d Trakt watches)",
+    logger.info("%s: %s profile from %s (%d watches)",
                 log_prefix, model["user"], model["source"], real_watches)
     return model
 

@@ -64,14 +64,12 @@ class ProfileStreamingFoldInTests(unittest.IsolatedAsyncioTestCase):
         self.alice = {
             "token": "alice-secret-token",
             "name": "Alice",
-            "trakt_username": "alpha-viewer",
             "is_kid": 0,
             "streaming_catalogs_row": 1,
         }
         self.bob = {
             "token": "bob-secret-token",
             "name": "Bob",
-            "trakt_username": "Beta",
             "is_kid": 1,
             "kid_age": 12,
             "kid_birthdate": None,
@@ -96,31 +94,23 @@ class ProfileStreamingFoldInTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(profile_streaming.profile_id_for_user(self.alice), "alpha")
         self.assertEqual(profile_streaming.profile_id_for_user(self.bob), "beta")
         self.assertIsNone(profile_streaming.profile_id_for_user({
-            "name": "Unknown",
-            "trakt_username": "my-alpha-viewer",
+            "name": "my-alpha-viewer",
         }))
 
         profile_streaming.state["profiles"]["beta"]["taste_profile"]["user"] = "Alice"
         self.assertIsNone(profile_streaming.profile_id_for_user(self.alice))
 
-    async def test_builder_identity_lookup_does_not_use_username_substrings(self):
+    async def test_builder_identity_lookup_does_not_use_name_substrings(self):
         users = [
-            {"name": "First", "trakt_username": "alpha-household"},
-            {"name": "Second", "trakt_username": "Alpha"},
+            {"name": "alpha-household"},
+            {"name": "Alpha"},
         ]
         with patch.object(kids_catalogs.db, "all_users", AsyncMock(return_value=users)):
             exact = await kids_catalogs._taste_user("alpha")
             missing = await kids_catalogs._taste_user("house")
 
-        self.assertEqual(exact["name"], "Second")
+        self.assertEqual(exact["name"], "Alpha")
         self.assertIsNone(missing)
-
-    async def test_phil_maps_to_arah91_by_exact_trakt_username(self):
-        with patch.object(profile_streaming, "_targets", ["arah91"]):
-            self.assertEqual(profile_streaming.profile_id_for_user({
-                "name": "Phil",
-                "trakt_username": "arah91",
-            }), "arah91")
 
     async def test_private_defs_are_generic_collection_only_and_legacy_is_hidden(self):
         defs = profile_streaming.catalog_defs_for_user(self.alice)
@@ -331,7 +321,7 @@ class ProfileStreamingFoldInTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(alice_defs[0]["id"], bob_defs[0]["id"])
 
     async def test_private_namespace_is_stable_opaque_and_requires_a_token(self):
-        renamed = {**self.alice, "name": "Renamed", "trakt_username": "other"}
+        renamed = {**self.alice, "name": "Renamed"}
 
         self.assertEqual(
             profile_streaming.private_namespace_for_user(self.alice),
@@ -451,7 +441,6 @@ class ProfileStreamingFoldInTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("ps_alpha_", serialized)
             for user in (self.alice, alice_clone, self.bob):
                 self.assertNotIn(user["token"], serialized)
-                self.assertNotIn(user["trakt_username"], serialized)
             readme = (collection_dir / "README.md").read_text()
             self.assertIn("do not install a streaming helper", readme.casefold())
 
