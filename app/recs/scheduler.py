@@ -20,7 +20,7 @@ async def _refresh_reason(user: dict) -> str | None:
 
     Kept as a small policy function for the admin status/tests.  At the nightly
     boundary every healthy profile is eligible because release, popularity,
-    theme, and rotation signals change even when Trakt history did not.
+    theme, and rotation signals change even when watch history did not.
     """
     if not user["last_generated_at"] or user["last_error"]:
         return "missing catalogs" if not user["last_generated_at"] else "retry after error"

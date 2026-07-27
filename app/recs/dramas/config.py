@@ -5,9 +5,8 @@ import os
 # spellings all belong to one of those: ADDON_NAME is the stream addon's,
 # REFRESH_HOUR is Daily Picks' 04:30 nightly build, DATA_DIR/STATIC_DIR are
 # deployment wiring. Reading them bare would silently retune the wrong service.
-# TMDB_API_KEY and TRAKT_CLIENT_ID are deliberately shared — same accounts.
-TMDB_API_KEY = os.environ["TMDB_API_KEY"]
-TRAKT_CLIENT_ID = os.environ["TRAKT_CLIENT_ID"]
+# The TMDB account is deliberately shared with Daily Picks, so the key is not
+# redeclared here: tmdb.py asks app.recs.config.require for it per request.
 
 ADDON_ID = os.environ.get("DRAMAS_ADDON_ID", "org.arahub.asiandramas")
 ADDON_NAME = os.environ.get("DRAMAS_ADDON_NAME", "Asian Dramas")

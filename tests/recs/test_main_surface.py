@@ -6,6 +6,8 @@ import httpx
 
 from app.recs import config, main, profile_streaming
 
+SETUP_SECRET = config.require("SETUP_SECRET")
+
 
 class MainSurfaceTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -24,11 +26,11 @@ class MainSurfaceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(response.headers["content-type"].startswith("text/html"))
         self.assertIn("Daily Picks", response.text)
         self.assertIn("Service online", response.text)
-        self.assertNotIn(config.SETUP_SECRET, response.text)
+        self.assertNotIn(SETUP_SECRET, response.text)
 
     async def test_setup_page_stays_hidden_behind_the_exact_secret(self):
         wrong = await self.client.get("/setup/not-the-secret")
-        correct = await self.client.get(f"/setup/{config.SETUP_SECRET}")
+        correct = await self.client.get(f"/setup/{SETUP_SECRET}")
 
         self.assertEqual(wrong.status_code, 404)
         self.assertEqual(correct.status_code, 200)
@@ -45,7 +47,7 @@ class MainSurfaceTests(unittest.IsolatedAsyncioTestCase):
             patch.object(main.profile_streaming, "write_import_files", write_imports),
         ):
             response = await self.client.post(
-                f"/setup/{config.SETUP_SECRET}/api/delete/viewer")
+                f"/setup/{SETUP_SECRET}/api/delete/viewer")
 
         self.assertEqual(response.status_code, 200)
         delete_user.assert_awaited_once_with("viewer")
@@ -72,7 +74,7 @@ class MainSurfaceTests(unittest.IsolatedAsyncioTestCase):
                          AsyncMock(return_value=summary)),
         ):
             response = await self.client.get(
-                f"/setup/{config.SETUP_SECRET}/api/users")
+                f"/setup/{SETUP_SECRET}/api/users")
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["users"][0]["measurement"], summary)
@@ -176,7 +178,7 @@ class MainSurfaceTests(unittest.IsolatedAsyncioTestCase):
             patch.object(main, "generate_for_user", generate),
         ):
             response = await self.client.post(
-                f"/setup/{config.SETUP_SECRET}/api/preferences/viewer",
+                f"/setup/{SETUP_SECRET}/api/preferences/viewer",
                 json={"preferred_media": "series", "adventurousness": 72},
             )
             # The endpoint deliberately schedules regeneration in the
@@ -202,7 +204,7 @@ class MainSurfaceTests(unittest.IsolatedAsyncioTestCase):
             patch.object(main, "generate_for_user", generate),
         ):
             response = await self.client.post(
-                f"/setup/{config.SETUP_SECRET}/api/preferences/viewer",
+                f"/setup/{SETUP_SECRET}/api/preferences/viewer",
                 json={"preferred_media": "invalid", "adventurousness": 72},
             )
 

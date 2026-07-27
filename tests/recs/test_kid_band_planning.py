@@ -89,11 +89,14 @@ class RowOrderingTests(unittest.TestCase):
         self.assertNotIn("kid_band_fit", gen.rows[0][1]["measurement"])
 
     def test_band_fit_can_never_lift_a_discovery_row_over_an_intent_row(self):
-        # Watchlist and Top Picks are what the viewer asked for; no amount of
-        # developmental fit should outrank that.
+        # Rows built from what this viewer actually watched are the intent
+        # signal; no amount of developmental fit should outrank them. The
+        # watchlist row used to be the anchor here — it went with Trakt, and
+        # because-you-watched is now the lowest-scored intent row. (Top Picks
+        # is pinned rather than scored, so nothing can outrank it at all.)
         best_depth = (catalogs.SCORE_DEPTH + 3 + catalogs.BAND_FIT_LIMIT + 4)
 
-        self.assertLess(best_depth, catalogs.SCORE_WATCHLIST - 4)
+        self.assertLess(best_depth, catalogs.SCORE_BYW - 4)
 
 
 class ColdStartPlanTests(unittest.TestCase):

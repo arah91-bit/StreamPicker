@@ -1,4 +1,4 @@
-"""Builds a per-user taste profile from that user's Trakt data only."""
+"""Builds a per-user taste profile from that viewer's own watch history."""
 
 import time
 from datetime import datetime, timezone
@@ -29,12 +29,12 @@ def build_profile(watched_movies: list[dict], watched_shows: list[dict],
     ratings = {}
     for r in movie_ratings:
         ids = (r.get("movie") or {}).get("ids") or {}
-        if ids.get("trakt"):
-            ratings[("movie", ids["trakt"])] = r.get("rating", 0)
+        if ids.get("imdb"):
+            ratings[("movie", ids["imdb"])] = r.get("rating", 0)
     for r in show_ratings:
         ids = (r.get("show") or {}).get("ids") or {}
-        if ids.get("trakt"):
-            ratings[("show", ids["trakt"])] = r.get("rating", 0)
+        if ids.get("imdb"):
+            ratings[("show", ids["imdb"])] = r.get("rating", 0)
 
     genre_w: dict[str, dict[str, float]] = {"movie": {}, "show": {}}
     decade_w: dict[int, float] = {}
@@ -55,7 +55,7 @@ def build_profile(watched_movies: list[dict], watched_shows: list[dict],
             plays = min(entry.get("plays", 1), 3)
             last = _parse_ts(entry.get("last_watched_at"))
             recency = 2.0 if now - last < 90 * 86400 else (1.3 if now - last < 365 * 86400 else 1.0)
-            rating = ratings.get((kind, ids.get("trakt")), 0)
+            rating = ratings.get((kind, ids.get("imdb")), 0)
             rating_boost = 1.5 if rating >= 8 else (0.5 if 0 < rating <= 4 else 1.0)
             weight = plays * recency * rating_boost
 

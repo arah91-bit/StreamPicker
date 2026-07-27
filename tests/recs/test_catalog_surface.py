@@ -230,7 +230,7 @@ class OutcomePollingIntegrationTests(unittest.IsolatedAsyncioTestCase):
         upsert = AsyncMock(return_value=[])
         attribute = AsyncMock(return_value=0)
         no_row_methods = (
-            "_watchlist_row", "_because_you_watched", "_more_like_loved",
+            "_because_you_watched", "_more_like_loved",
             "_new_releases", "_trending_row", "_genre_rows", "_person_rows",
             "_acclaimed_row", "_hidden_gems", "_decade_rows", "_language_row",
             "_popular_row", "_ensure_catalog_depth",
@@ -239,7 +239,7 @@ class OutcomePollingIntegrationTests(unittest.IsolatedAsyncioTestCase):
         with ExitStack() as stack:
             stack.enter_context(patch("app.recs.catalogs.db.get_recently_shown",
                                       AsyncMock(return_value={})))
-            stack.enter_context(patch("app.recs.catalogs.db.upsert_trakt_state_and_record_outcomes",
+            stack.enter_context(patch("app.recs.catalogs.db.upsert_title_state_and_record_outcomes",
                                       upsert))
             stack.enter_context(patch("app.recs.catalogs.db.attribute_outcomes", attribute))
             stack.enter_context(patch("app.recs.catalogs.db.replace_catalogs", replace))
@@ -263,18 +263,16 @@ class OutcomePollingIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     patch.object(generator, method, AsyncMock()))
             await generator.run()
 
-        # A watchlist is a Trakt concept with no local equivalent, so the
-        # ledger is told there is none rather than being fed a guess.
+        # A watchlist was Trakt's alone and has no local equivalent, so no
+        # snapshot is supplied at all — the ledger keeps whatever intent it
+        # already knows rather than being handed a guess.
         upsert.assert_awaited_once_with(
             "ledger-viewer", watched_movies, watched_shows,
-            watchlist_movies=None,
-            watchlist_shows=None,
         )
         attribute.assert_awaited_once_with(
             "ledger-viewer",
             lookback_seconds=config.OUTCOME_ATTRIBUTION_HOURS * 3600,
         )
-        row_mocks["_watchlist_row"].assert_awaited_once_with(None, None)
         _, catalogs = replace.await_args.args
         self.assertEqual(catalogs, [])
         self.assertEqual(

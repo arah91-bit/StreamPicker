@@ -1,8 +1,8 @@
 """Per-user catalog generation. Runs once a day per user (staggered) so every
 catalog is precomputed and serving is a pure SQLite read.
 
-Everything here operates on ONE user's data, fetched with that user's Trakt
-token, and is written back keyed by that user's addon token.
+Everything here operates on ONE user's data, drawn from what this service
+played for them, and is written back keyed by that user's addon token.
 
 Rows are scored by how likely the user is to pick from them (explicit intent >
 recent loved seeds > strong genres > trending > broad rows) and stored in that
@@ -16,7 +16,7 @@ import random
 import time
 from itertools import combinations
 
-from app.recs import config, db, preseed, tmdb, trakt
+from app.recs import config, db, preseed, tmdb
 from app.recs.holidays import active_holiday
 from app.recs.kids import band_for_age, effective_kid_age
 from app.recs.profile import build_profile
@@ -42,7 +42,6 @@ OPENING_ROW_COUNT = config.CATALOG_TOP_ZONE_ROWS
 MIDDLE_ROW_COUNT = config.CATALOG_MIDDLE_ZONE_ROWS
 
 # Base affinity scores per row kind (daily jitter of ±4 is added on top).
-SCORE_WATCHLIST = 78
 SCORE_BYW = 62          # + recency/rating bonus up to ~15
 SCORE_RELATED = 60
 SCORE_NEW_RELEASES = 55
@@ -317,10 +316,10 @@ class Generator:
     def _candidate_source(cat_id: str) -> str:
         if cat_id.startswith("nr-holiday"):
             return "tmdb-keyword"
-        if cat_id in {TOP_PICKS_ID, "nr-watchlist", "nr-trending", "nr-popular"}:
-            return "trakt"
+        if cat_id in {TOP_PICKS_ID, "nr-trending", "nr-popular"}:
+            return "tmdb-feed"
         if cat_id.startswith("nr-byw") or cat_id == "nr-related":
-            return "trakt-related+tmdb-recommendations"
+            return "tmdb-recommendations"
         return "tmdb-discover"
 
     def _movie_share(self) -> float:
@@ -389,20 +388,32 @@ class Generator:
                 s += 1
         return out
 
-    async def _resolve_trakt(self, items: list[dict], kind: str, limit: int) -> list[dict]:
-        """items: raw Trakt objects like {'movie': {...}} or bare title objects."""
-        tmdb_ids = []
-        for it in items:
-            obj = it.get(kind, it) or {}
-            released = str(obj.get("released") or obj.get("first_aired") or "")
-            if released and released[:10] > self.today.isoformat():
-                continue
-            if not released and (obj.get("year") or self.today.year) > self.today.year:
-                continue
-            ids = obj.get("ids") or {}
-            if ids.get("tmdb"):
-                tmdb_ids.append(ids["tmdb"])
-        return await self._resolve_ids(_kind_to_tmdb(kind), tmdb_ids, limit)
+    def _released_by_taste(self, results: list[dict], media: str) -> list[int]:
+        """TMDB ids from a raw feed: out-of-date-range dropped, taste first.
+
+        The feed endpoints (/trending, /popular) take no date or genre filter
+        the way /discover does, so both have to happen here — otherwise an
+        announced-but-unreleased title reaches a surface that promises things
+        a viewer can choose now.
+        """
+        table = tmdb.MOVIE_GENRES if media == "movie" else tmdb.TV_GENRES
+        kind = "movie" if media == "movie" else "show"
+        top = {table[g] for g, _ in self.profile["genres"][kind][:6] if g in table}
+        date_key = "release_date" if media == "movie" else "first_air_date"
+
+        released = [r for r in results
+                    if not (str(r.get(date_key) or "")[:10] > self.today.isoformat())]
+        # Stable, so within an equal number of matching genres the feed's own
+        # ordering — which is the trending/popularity signal — still decides.
+        ranked = sorted(released,
+                        key=lambda r: len(set(r.get("genre_ids") or []) & top),
+                        reverse=True)
+        return [r["id"] for r in ranked if r.get("id")]
+
+    async def _resolve_feed(self, media: str, results: list[dict],
+                            limit: int) -> list[dict]:
+        return await self._resolve_ids(media, self._released_by_taste(results, media),
+                                       limit)
 
     async def _resolve_discover(self, media: str, params: dict, limit: int,
                                 pages: int = DISCOVER_PAGES) -> list[dict]:
@@ -732,13 +743,12 @@ class Generator:
         # account allows one connected application, and that slot belongs to
         # the client's own progress sync.
         wm, ws, rm, rs = await local_history.watched_lists(self.viewer_key)
-        # No watchlist without Trakt. The row is skipped rather than faked.
-        wl_m = wl_s = None
 
         try:
-            outcomes = await db.upsert_trakt_state_and_record_outcomes(
+            # Watchlists were Trakt's alone, so the optional watchlist
+            # snapshots are simply never supplied any more.
+            outcomes = await db.upsert_title_state_and_record_outcomes(
                 self.token, wm, ws,
-                watchlist_movies=wl_m, watchlist_shows=wl_s,
             )
             attributed = await db.attribute_outcomes(
                 self.token,
@@ -777,7 +787,6 @@ class Generator:
         top_picks = await self._top_picks()
         if top_picks:
             self.pinned_rows += 1
-        await self._watchlist_row(wl_m, wl_s)
         await self._because_you_watched()
         await self._more_like_loved()
         await self._new_releases()
@@ -914,23 +923,16 @@ class Generator:
                              exc_info=True)
                 continue
             (movie_ids if seed["type"] == "movie" else series_ids).extend(metas)
-        movies = self._rank_by_taste(movie_ids, "movie")[:ROW_TARGET_ITEMS]
-        series = self._rank_by_taste(series_ids, "show")[:ROW_TARGET_ITEMS]
+        # Seed order already carries the taste ranking: seeds arrive strongest
+        # first, and each one's similars are appended behind it.
+        movies = movie_ids[:ROW_TARGET_ITEMS]
+        series = series_ids[:ROW_TARGET_ITEMS]
         combined = self._mix_media(movies, series)
         if len(combined) < 5:
             return None
         self.used_imdb.update(m["id"] for m in combined)
         return {"id": TOP_PICKS_ID, "type": config.COMBINED_TYPE,
                 "name": "Top Picks", "metas": combined}
-
-    async def _watchlist_row(self, wl_m: list[dict] | None,
-                             wl_s: list[dict] | None) -> None:
-        if wl_m is None and wl_s is None:
-            return
-        movies = await self._resolve_trakt(wl_m or [], "movie", ROW_TARGET_ITEMS)
-        series = await self._resolve_trakt(wl_s or [], "show", ROW_TARGET_ITEMS)
-        self._add(SCORE_WATCHLIST, "nr-watchlist", config.COMBINED_TYPE,
-                  "From Your Watchlist", self._mix_media(movies, series))
 
     async def _because_you_watched(self) -> None:
         seeds = [s for s in self.profile["seeds"] if s.get("tmdb")]
@@ -958,30 +960,14 @@ class Generator:
                       f"Because You {verb} {seed['title']}", metas)
 
     async def _seed_similar(self, seed: dict, limit: int) -> list[dict]:
-        """Titles actually similar to a seed. Trakt 'related' first (content-
-        aware), then TMDB recommendations — but every candidate must share a
-        genre with the seed, so a nature documentary can't pull in horror
-        just because both are popular."""
+        """Titles actually similar to a seed, from TMDB recommendations — but
+        every candidate must share a genre with the seed, so a nature
+        documentary can't pull in horror just because both are popular."""
         media = _kind_to_tmdb(seed["type"])
         seed_genres = set(seed.get("genres") or [])
         table = tmdb.MOVIE_GENRES if media == "movie" else tmdb.TV_GENRES
         seed_tmdb_genres = {table[g] for g in seed_genres if g in table}
         candidates: list[int] = []
-
-        if seed.get("imdb"):
-            try:
-                rel = await trakt.related(
-                    "movies" if seed["type"] == "movie" else "shows", seed["imdb"])
-            except Exception:
-                rel = []
-            for obj in rel:
-                released = obj.get("released") or obj.get("first_aired") or ""
-                if released and released[:10] > self.today.isoformat():
-                    continue
-                ids = obj.get("ids") or {}
-                genres = set(obj.get("genres") or [])
-                if ids.get("tmdb") and (not seed_genres or genres & seed_genres):
-                    candidates.append(ids["tmdb"])
 
         try:
             recs = await tmdb.tmdb_recommendations(media, seed["tmdb"])
@@ -1103,24 +1089,14 @@ class Generator:
         self._add(SCORE_NEW_RELEASES, "nr-new", config.COMBINED_TYPE,
                   "New Releases", self._mix_media(movies, series))
 
-    def _rank_by_taste(self, items: list[dict], kind: str) -> list[dict]:
-        top = {g for g, _ in self.profile["genres"][kind][:6]}
-
-        def score(it):
-            genres = set((it.get(kind) or {}).get("genres") or [])
-            return len(genres & top)
-        return sorted(items, key=score, reverse=True)
-
     async def _trending_row(self) -> None:
         try:
             trend_m, trend_s = await asyncio.gather(
-                trakt.trending("movies"), trakt.trending("shows"))
+                tmdb.trending("movie"), tmdb.trending("tv"))
         except Exception:
             return
-        movies = await self._resolve_trakt(self._rank_by_taste(trend_m, "movie"),
-                                           "movie", ROW_TARGET_ITEMS)
-        series = await self._resolve_trakt(self._rank_by_taste(trend_s, "show"),
-                                           "show", ROW_TARGET_ITEMS)
+        movies = await self._resolve_feed("movie", trend_m, ROW_TARGET_ITEMS)
+        series = await self._resolve_feed("tv", trend_s, ROW_TARGET_ITEMS)
         self._add(SCORE_TRENDING, "nr-trending", config.COMBINED_TYPE,
                   "Trending Now", self._mix_media(movies, series))
 
@@ -1194,13 +1170,11 @@ class Generator:
     async def _popular_row(self) -> None:
         try:
             pop_m, pop_s = await asyncio.gather(
-                trakt.popular("movies"), trakt.popular("shows"))
+                tmdb.popular("movie"), tmdb.popular("tv"))
         except Exception:
             return
-        movies = await self._resolve_trakt(self._rank_by_taste(pop_m, "movie"),
-                                           "movie", ROW_TARGET_ITEMS)
-        series = await self._resolve_trakt(self._rank_by_taste(pop_s, "show"),
-                                           "show", ROW_TARGET_ITEMS)
+        movies = await self._resolve_feed("movie", pop_m, ROW_TARGET_ITEMS)
+        series = await self._resolve_feed("tv", pop_s, ROW_TARGET_ITEMS)
         self._add(SCORE_POPULAR, "nr-popular", config.COMBINED_TYPE,
                   "Popular Now", self._mix_media(movies, series))
 

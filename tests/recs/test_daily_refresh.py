@@ -72,8 +72,7 @@ class OpenTrackingTests(unittest.IsolatedAsyncioTestCase):
         config.DB_PATH = str(Path(self.tmp.name) / "test.db")
         await db.init()
         with patch("app.recs.db.time.time", return_value=1_000):
-            await db.create_user(
-                "token", "Viewer", None, "access", "refresh", 99_999)
+            await db.create_user("token", "Viewer")
             await db.mark_generated("token", last_activity="", last_holiday="")
 
     async def asyncTearDown(self):

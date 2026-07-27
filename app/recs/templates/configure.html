@@ -110,8 +110,8 @@
 <body>
 <div class="wrap">
   <h1>Daily Picks</h1>
-  <div class="sub">Admin panel — every user gets a private addon URL, siloed to
-    their own Trakt account.</div>
+  <div class="sub">Admin panel — every viewer gets a private addon URL, and a
+    taste profile built from what they actually watch through it.</div>
 
   <div class="tabs">
     <button class="tab active" id="tab-users" data-panel="panel-users">Users</button>
@@ -160,18 +160,12 @@
           <input type="range" id="age" min="2" max="17" value="8">
         </div>
       </div>
-      <button id="connect">Connect Trakt</button>
-    </div>
-
-    <div id="step2" class="hidden">
-      <p>Have them go to <a id="verify-link" target="_blank" rel="noopener"></a>
-         and enter:</p>
-      <div class="code" id="user-code"></div>
-      <div class="status" id="poll-status">Waiting for approval on Trakt…</div>
+      <button id="add-viewer">Add viewer</button>
+      <div class="status" id="add-error"></div>
     </div>
 
     <div id="step3" class="hidden">
-      <p><span class="ok">Connected ✓</span> <span id="who"></span></p>
+      <p><span class="ok">Added ✓</span> <span id="who"></span></p>
       <div class="status" id="gen-status">Building their first set of
         recommendations… this takes a minute or two.</div>
       <div id="install" class="hidden">
@@ -200,7 +194,7 @@
 <script>
 const $ = id => document.getElementById(id);
 const base = location.pathname.replace(/\/+$/, "");  // /setup/<secret>
-let deviceCode = null, newToken = null;
+let newToken = null;
 let newStreamingConfigured = false;
 let newStreamingCollectionDownloadUrl = null;
 let newCollectionFilename = null;
@@ -323,7 +317,6 @@ async function loadUsers() {
     div.innerHTML = `
       <div class="user-head">
         <span class="user-name"></span>
-        <span class="badge trakt"></span>
         ${u.is_kid ? `<span class="badge kid">Kid · age ${u.kid_age}</span>` : ""}
         ${u.last_error ? `<span class="badge err" title=""></span>` : ""}
       </div>
@@ -341,7 +334,6 @@ async function loadUsers() {
         <button class="danger delete-btn">Remove</button>
       </div>`;
     div.querySelector(".user-name").textContent = u.name;
-    div.querySelector(".badge.trakt").textContent = u.trakt_username || "trakt";
     const urlLink = div.querySelector("a.url");
     urlLink.textContent = u.manifest_url;
     urlLink.href = u.manifest_url;
@@ -426,26 +418,16 @@ $("age").oninput = () => $("age-val").textContent = $("age").value;
 $("adventurousness").oninput = () =>
   $("adventure-val").textContent = $("adventurousness").value;
 
-$("connect").onclick = async () => {
-  $("connect").disabled = true;
-  const r = await fetch(base + "/api/device-code", {method: "POST"});
-  const d = await r.json();
-  deviceCode = d.device_code;
-  $("user-code").textContent = d.user_code;
-  const link = $("verify-link");
-  link.href = d.verification_url; link.textContent = d.verification_url;
-  $("step1").classList.add("hidden");
-  $("step2").classList.remove("hidden");
-  pollAuth(Math.max((d.interval || 5) * 1000, 3000));
-};
-
-async function pollAuth(interval) {
-  const r = await fetch(base + "/api/poll", {
+$("add-viewer").onclick = async () => {
+  const name = $("name").value.trim();
+  if (!name) { $("add-error").textContent = "Give them a name first."; return; }
+  $("add-error").textContent = "";
+  $("add-viewer").disabled = true;
+  const r = await fetch(base + "/api/users", {
     method: "POST",
     headers: {"Content-Type": "application/json"},
     body: JSON.stringify({
-      device_code: deviceCode,
-      name: $("name").value,
+      name: name,
       is_kid: $("is-kid").checked,
       kid_age: parseInt($("age").value, 10),
       preferred_media: $("preferred-media").value,
@@ -453,21 +435,22 @@ async function pollAuth(interval) {
     }),
   });
   const d = await r.json();
-  if (d.status === "ok") {
-    newToken = d.token;
-    newStreamingConfigured = !!d.streaming_profile_configured;
-    $("step2").classList.add("hidden");
-    $("step3").classList.remove("hidden");
-    $("who").textContent = "Trakt: " + (d.trakt_username || "connected");
-    $("manifest-url").textContent = d.manifest_url;
-    $("manifest-url").href = d.manifest_url;
-    newCollectionFilename = d.collection_filename || null;
-    loadUsers();
-    pollReady();
-  } else {
-    setTimeout(() => pollAuth(interval), interval);
+  if (!r.ok || d.status !== "ok") {
+    $("add-error").textContent = d.detail || "Could not add that viewer.";
+    $("add-viewer").disabled = false;
+    return;
   }
-}
+  newToken = d.token;
+  newStreamingConfigured = !!d.streaming_profile_configured;
+  $("step1").classList.add("hidden");
+  $("step3").classList.remove("hidden");
+  $("who").textContent = name;
+  $("manifest-url").textContent = d.manifest_url;
+  $("manifest-url").href = d.manifest_url;
+  newCollectionFilename = d.collection_filename || null;
+  loadUsers();
+  pollReady();
+};
 
 async function pollReady() {
   const r = await fetch("/api/status/" + newToken);

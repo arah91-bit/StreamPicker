@@ -1,9 +1,29 @@
 import os
 from pathlib import Path
 
-TMDB_API_KEY = os.environ["TMDB_API_KEY"]
-TRAKT_CLIENT_ID = os.environ["TRAKT_CLIENT_ID"]
-TRAKT_CLIENT_SECRET = os.environ["TRAKT_CLIENT_SECRET"]
+
+# Credentials with no sensible default: TMDB_API_KEY and SETUP_SECRET (the
+# secret path segment gating the setup/configure flow — without one, anyone
+# who finds the public URL could add viewers). They are deliberately *not*
+# module constants: reading them here with os.environ[...] made every module
+# under app.recs — and so the whole test suite, which never calls TMDB —
+# unimportable without a real deployment's secrets. require() keeps the check
+# just as hard, one step later.
+def require(name: str) -> str:
+    """The named credential, or a hard error saying which one is missing.
+
+    Call this where the value is about to be used for real: sent to TMDB,
+    or compared against a caller's secret. A deployment that forgot one then
+    fails on the request that needed it, with a message naming it, instead of
+    at some unrelated import.
+    """
+    value = os.environ.get(name, "")
+    if not value:
+        raise RuntimeError(
+            f"{name} is not set, and Daily Picks cannot serve this without "
+            "it. Set it in the environment and restart.")
+    return value
+
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
@@ -12,9 +32,6 @@ GEMINI_ENABLED = (
 )
 
 HOST_NAME = os.environ.get("HOST_NAME", "http://localhost:8010").rstrip("/")
-# Secret path segment that gates the setup/configure flow. Required: without
-# it, anyone who finds the public URL could connect accounts.
-SETUP_SECRET = os.environ["SETUP_SECRET"]
 DB_PATH = os.environ.get("DB_PATH", "/data/nuvio-recs.db")
 
 ADDON_ID = os.environ.get("RECS_ADDON_ID",
@@ -53,11 +70,11 @@ CONTINUE_WATCHING_ROW_ITEMS = int(os.environ.get(
 WATCH_HISTORY_ROW_ITEMS = int(os.environ.get("WATCH_HISTORY_ROW_ITEMS", "150"))
 # Seconds a built pair of rows is reused. Nuvio fires every row of the home
 # screen at once and paginates on scroll, so without this one home-screen open
-# would repeat the same Trakt calls many times over. Short enough that
+# would repeat the same work many times over. Short enough that
 # finishing an episode is reflected on the next visit.
 WATCHING_CACHE_SECONDS = int(os.environ.get("WATCHING_CACHE_SECONDS", "90"))
 # Ceiling on per-show `next_episode` lookups in one build. This is the only
-# fan-out in the row (one Trakt call per show), so it bounds worst-case latency
+# fan-out in the row (one lookup per show), so it bounds worst-case latency
 # for a viewer with a very large shelf of part-watched series.
 WATCHING_PROGRESS_LOOKUPS = int(os.environ.get("WATCHING_PROGRESS_LOOKUPS", "40"))
 # Address series entries at the episode (tt1234:3:7) instead of the show
@@ -83,7 +100,7 @@ HOME_RELEASE_FALLBACK_DAYS = int(os.environ.get(
 HOME_RELEASE_RECHECK_HOURS = int(os.environ.get(
     "HOME_RELEASE_RECHECK_HOURS", "24"))
 
-# Later Trakt activity is matched back to delivered recommendation snapshots
+# Later viewing activity is matched back to delivered recommendation snapshots
 # inside this window.  It is an assisted-discovery signal, not a claim of
 # causal attribution.
 OUTCOME_ATTRIBUTION_HOURS = int(os.environ.get("OUTCOME_ATTRIBUTION_HOURS", "72"))

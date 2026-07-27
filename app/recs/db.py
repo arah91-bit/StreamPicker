@@ -18,10 +18,6 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     token TEXT PRIMARY KEY,
     name TEXT NOT NULL,
-    trakt_username TEXT,
-    access_token TEXT NOT NULL,
-    refresh_token TEXT NOT NULL,
-    expires_at INTEGER NOT NULL,
     created_at INTEGER NOT NULL,
     last_generated_at INTEGER,
     last_error TEXT
@@ -173,41 +169,36 @@ CREATE INDEX IF NOT EXISTS idx_recommendation_deliveries_generation_catalog
     ON recommendation_deliveries
        (generation_id, catalog_type, catalog_id, requested_at);
 
--- Current Trakt title state makes polling a stateful diff. This lets us tell
--- a first movie watch from a rewatch and a first series episode from a later
--- continuation without persisting any additional credentials or raw payloads.
-CREATE TABLE IF NOT EXISTS trakt_title_state (
+-- Current title state makes polling a stateful diff. This lets us tell a
+-- first movie watch from a rewatch and a first series episode from a later
+-- continuation without persisting any raw payloads.
+CREATE TABLE IF NOT EXISTS title_state (
     user_token TEXT NOT NULL,
     content_id TEXT NOT NULL,
     media_type TEXT NOT NULL,
-    trakt_id INTEGER,
     play_count INTEGER NOT NULL DEFAULT 0,
     episode_count INTEGER NOT NULL DEFAULT 0,
     last_watched_at INTEGER,
-    in_watchlist INTEGER,
     rating INTEGER,
     observed_at INTEGER NOT NULL,
     PRIMARY KEY (user_token, content_id, media_type)
 );
-CREATE TABLE IF NOT EXISTS trakt_state_syncs (
+CREATE TABLE IF NOT EXISTS title_state_syncs (
     user_token TEXT PRIMARY KEY,
     first_observed_at INTEGER NOT NULL,
     last_observed_at INTEGER NOT NULL,
-    sync_count INTEGER NOT NULL DEFAULT 1,
-    movie_watchlist_initialized INTEGER NOT NULL DEFAULT 0,
-    series_watchlist_initialized INTEGER NOT NULL DEFAULT 0
+    sync_count INTEGER NOT NULL DEFAULT 1
 );
 
 -- Outcome events are append-only and idempotent by event_key. Attribution is
 -- kept separately so observing an outcome never rewrites history.
-CREATE TABLE IF NOT EXISTS trakt_outcome_events (
+CREATE TABLE IF NOT EXISTS outcome_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_token TEXT NOT NULL,
     event_key TEXT NOT NULL,
     event_type TEXT NOT NULL,
     content_id TEXT,
     media_type TEXT,
-    trakt_id INTEGER,
     season INTEGER,
     episode INTEGER,
     previous_value INTEGER,
@@ -216,10 +207,10 @@ CREATE TABLE IF NOT EXISTS trakt_outcome_events (
     observed_at INTEGER NOT NULL,
     UNIQUE (user_token, event_key)
 );
-CREATE INDEX IF NOT EXISTS idx_trakt_outcomes_user_time
-    ON trakt_outcome_events (user_token, occurred_at);
-CREATE INDEX IF NOT EXISTS idx_trakt_outcomes_content
-    ON trakt_outcome_events (user_token, content_id, media_type);
+CREATE INDEX IF NOT EXISTS idx_outcomes_user_time
+    ON outcome_events (user_token, occurred_at);
+CREATE INDEX IF NOT EXISTS idx_outcomes_content
+    ON outcome_events (user_token, content_id, media_type);
 
 CREATE TABLE IF NOT EXISTS recommendation_attributions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -264,12 +255,6 @@ MIGRATIONS = [
     "ALTER TABLE users ADD COLUMN adventurousness INTEGER NOT NULL DEFAULT 30",
     # Link each replaceable serving row to its immutable build snapshot.
     "ALTER TABLE catalogs ADD COLUMN generation_id INTEGER",
-    # Watch history and watchlists can fail independently. These flags prevent
-    # a delayed first successful watchlist fetch from becoming a false add.
-    "ALTER TABLE trakt_state_syncs ADD COLUMN movie_watchlist_initialized"
-    " INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE trakt_state_syncs ADD COLUMN series_watchlist_initialized"
-    " INTEGER NOT NULL DEFAULT 0",
     # Opt-in for the live Continue Watching / Watch History rows. Off by
     # default: they pin above every recommendation row and put the viewer's own
     # backlog on top of the surface, which is not what every profile wants.
@@ -288,6 +273,28 @@ MIGRATIONS = [
     "ALTER TABLE play_history ADD COLUMN position_bytes INTEGER",
     "ALTER TABLE play_history ADD COLUMN total_bytes INTEGER",
     "ALTER TABLE play_history ADD COLUMN position_pct REAL",
+    # Trakt is gone: no account to connect, so no grant to store, and the
+    # watchlist it was the only source of no longer exists either. Dropped
+    # rather than left NULL-able so nothing can quietly start writing to a
+    # credential column again.
+    "ALTER TABLE users DROP COLUMN trakt_username",
+    "ALTER TABLE users DROP COLUMN access_token",
+    "ALTER TABLE users DROP COLUMN refresh_token",
+    "ALTER TABLE users DROP COLUMN expires_at",
+    "ALTER TABLE title_state DROP COLUMN trakt_id",
+    "ALTER TABLE title_state DROP COLUMN in_watchlist",
+    "ALTER TABLE title_state_syncs DROP COLUMN movie_watchlist_initialized",
+    "ALTER TABLE title_state_syncs DROP COLUMN series_watchlist_initialized",
+    "ALTER TABLE outcome_events DROP COLUMN trakt_id",
+]
+
+# Applied before SCHEMA, unlike MIGRATIONS. `CREATE TABLE IF NOT EXISTS` would
+# otherwise create an empty table under the new name, leaving every existing
+# row stranded in the old one and the rename permanently failing.
+RENAMES = [
+    ("trakt_title_state", "title_state"),
+    ("trakt_state_syncs", "title_state_syncs"),
+    ("trakt_outcome_events", "outcome_events"),
 ]
 
 
@@ -301,7 +308,6 @@ _ledger_lock = asyncio.Lock()
 PICK_OUTCOME_TYPES = (
     "first_movie_watch",
     "first_series_episode",
-    "watchlist_add",
 )
 
 
@@ -310,6 +316,11 @@ async def init() -> None:
     _conn = await aiosqlite.connect(config.DB_PATH)
     _conn.row_factory = aiosqlite.Row
     await _conn.execute("PRAGMA journal_mode=WAL")
+    for old_name, new_name in RENAMES:
+        try:
+            await _conn.execute(f"ALTER TABLE {old_name} RENAME TO {new_name}")
+        except aiosqlite.OperationalError:
+            pass  # fresh database, or already renamed
     await _conn.executescript(SCHEMA)
     for stmt in MIGRATIONS:
         try:
@@ -333,9 +344,8 @@ async def init() -> None:
         placeholders = ",".join("?" * len(names))
         await _conn.execute(
             "UPDATE users SET streaming_catalogs_row = 1 WHERE"
-            f" lower(trim(name)) IN ({placeholders})"
-            f" OR lower(trim(coalesce(trakt_username,''))) IN ({placeholders})",
-            names + names)
+            f" lower(trim(name)) IN ({placeholders})",
+            names)
     # Every pre-ledger exposure was created at generation time, so none can be
     # defended as a delivered row. Clear that phantom history exactly once;
     # the marker preserves real delivery exposure across later restarts.
@@ -361,16 +371,13 @@ def conn() -> aiosqlite.Connection:
 
 # ── users ────────────────────────────────────────────────────────────────
 
-async def create_user(token: str, name: str, trakt_username: str | None,
-                      access_token: str, refresh_token: str, expires_at: int,
-                      is_kid: bool = False, kid_age: int | None = None,
+async def create_user(token: str, name: str, is_kid: bool = False,
+                      kid_age: int | None = None,
                       kid_birthdate: str | None = None) -> None:
     await conn().execute(
-        "INSERT INTO users (token, name, trakt_username, access_token, refresh_token,"
-        " expires_at, created_at, is_kid, kid_age, kid_birthdate)"
-        " VALUES (?,?,?,?,?,?,?,?,?,?)",
-        (token, name, trakt_username, access_token, refresh_token, expires_at,
-         int(time.time()), int(is_kid), kid_age, kid_birthdate),
+        "INSERT INTO users (token, name, created_at, is_kid, kid_age,"
+        " kid_birthdate) VALUES (?,?,?,?,?,?)",
+        (token, name, int(time.time()), int(is_kid), kid_age, kid_birthdate),
     )
     await conn().commit()
 
@@ -502,14 +509,14 @@ async def delete_user(token: str) -> None:
         "recommendation_sessions",
         "recommendation_generation_items",
         "recommendation_generations",
-        "trakt_outcome_events",
-        "trakt_title_state",
-        "trakt_state_syncs",
+        "outcome_events",
+        "title_state",
+        "title_state_syncs",
     ):
         if table == "recommendation_attributions":
             await conn().execute(
                 "DELETE FROM recommendation_attributions WHERE outcome_event_id IN"
-                " (SELECT id FROM trakt_outcome_events WHERE user_token=?)",
+                " (SELECT id FROM outcome_events WHERE user_token=?)",
                 (token,),
             )
         else:
@@ -922,14 +929,13 @@ def _epoch(value: int | float | str | datetime | None,
 
 
 def _outcome_key(event: dict) -> str:
-    explicit = event.get("event_key") or event.get("trakt_event_id")
+    explicit = event.get("event_key") or event.get("event_id")
     if explicit is not None:
         return f"{event['event_type']}:{explicit}"
     identity = {
         "event_type": event["event_type"],
         "content_id": event.get("content_id") or event.get("imdb_id"),
         "media_type": _normal_media_type(event.get("media_type")),
-        "trakt_id": event.get("trakt_id"),
         "season": event.get("season"),
         "episode": event.get("episode"),
         "previous_value": event.get("previous_value"),
@@ -943,25 +949,25 @@ def _outcome_key(event: dict) -> str:
 async def _insert_outcome_no_commit(user_token: str, event: dict,
                                     observed_at: int) -> int:
     content_id = event.get("content_id") or event.get("imdb_id")
-    if not content_id and not event.get("trakt_id"):
-        raise ValueError("an outcome needs content_id/imdb_id or trakt_id")
+    if not content_id:
+        raise ValueError("an outcome needs content_id/imdb_id")
     if not event.get("event_type"):
         raise ValueError("an outcome needs event_type")
     occurred_at = _epoch(event.get("occurred_at"), observed_at)
     event_key = _outcome_key({**event, "occurred_at": occurred_at})
     await conn().execute(
-        "INSERT INTO trakt_outcome_events"
-        " (user_token, event_key, event_type, content_id, media_type, trakt_id,"
+        "INSERT INTO outcome_events"
+        " (user_token, event_key, event_type, content_id, media_type,"
         " season, episode, previous_value, current_value, occurred_at, observed_at)"
-        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?)"
         " ON CONFLICT(user_token, event_key) DO NOTHING",
         (user_token, event_key, event["event_type"], content_id,
-         _normal_media_type(event.get("media_type")), event.get("trakt_id"),
+         _normal_media_type(event.get("media_type")),
          event.get("season"), event.get("episode"), event.get("previous_value"),
          event.get("current_value"), occurred_at, observed_at),
     )
     async with conn().execute(
-        "SELECT id FROM trakt_outcome_events WHERE user_token=? AND event_key=?",
+        "SELECT id FROM outcome_events WHERE user_token=? AND event_key=?",
         (user_token, event_key),
     ) as cur:
         row = await cur.fetchone()
@@ -969,7 +975,7 @@ async def _insert_outcome_no_commit(user_token: str, event: dict,
     return int(row["id"])
 
 
-async def record_trakt_outcome(
+async def record_outcome(
     user_token: str,
     event_type: str,
     content_id: str | None,
@@ -977,33 +983,31 @@ async def record_trakt_outcome(
     occurred_at: int | float | str | datetime,
     *,
     event_key: str | None = None,
-    trakt_event_id: str | int | None = None,
-    trakt_id: int | None = None,
+    event_id: str | int | None = None,
     season: int | None = None,
     episode: int | None = None,
     previous_value: int | None = None,
     current_value: int | None = None,
     observed_at: int | None = None,
 ) -> int:
-    """Append one idempotent, payload-free Trakt outcome event."""
+    """Append one idempotent, payload-free outcome event."""
     event = {
         "event_type": event_type,
         "content_id": content_id,
         "media_type": media_type,
         "occurred_at": occurred_at,
         "event_key": event_key,
-        "trakt_event_id": trakt_event_id,
-        "trakt_id": trakt_id,
+        "event_id": event_id,
         "season": season,
         "episode": episode,
         "previous_value": previous_value,
         "current_value": current_value,
     }
-    return (await record_trakt_outcomes(
+    return (await record_outcomes(
         user_token, [event], observed_at=observed_at))[0]
 
 
-async def record_trakt_outcomes(
+async def record_outcomes(
     user_token: str,
     events: list[dict],
     *,
@@ -1022,34 +1026,28 @@ async def record_trakt_outcomes(
             raise
 
 
-def _trakt_identity(item: dict) -> tuple[str | None, int | None]:
-    ids = item.get("ids") or {}
-    trakt_id = ids.get("trakt")
-    content_id = ids.get("imdb")
-    if not content_id and trakt_id is not None:
-        content_id = f"trakt:{trakt_id}"
-    return content_id, trakt_id
+def _content_id(item: dict) -> str | None:
+    """The IMDb id, which is what every surface here addresses titles by."""
+    return (item.get("ids") or {}).get("imdb")
 
 
 def _watched_states(watched_movies: list[dict], watched_shows: list[dict]) -> dict:
     states: dict[tuple[str, str], dict] = {}
     for entry in watched_movies:
         item = entry.get("movie") or {}
-        content_id, trakt_id = _trakt_identity(item)
+        content_id = _content_id(item)
         if not content_id:
             continue
         states[(content_id, "movie")] = {
             "content_id": content_id,
             "media_type": "movie",
-            "trakt_id": trakt_id,
             "play_count": max(0, int(entry.get("plays") or 0)),
             "episode_count": 0,
             "last_watched_at": _epoch(entry.get("last_watched_at"), 0) or None,
-            "in_watchlist": None,
         }
     for entry in watched_shows:
         item = entry.get("show") or {}
-        content_id, trakt_id = _trakt_identity(item)
+        content_id = _content_id(item)
         if not content_id:
             continue
         episode_count = 0
@@ -1068,109 +1066,49 @@ def _watched_states(watched_movies: list[dict], watched_shows: list[dict]) -> di
         states[(content_id, "series")] = {
             "content_id": content_id,
             "media_type": "series",
-            "trakt_id": trakt_id,
             "play_count": episode_plays,
             "episode_count": episode_count,
             "last_watched_at": last_watched or None,
-            "in_watchlist": None,
         }
     return states
 
 
-def _merge_watchlist(states: dict, entries: list[dict], kind: str) -> None:
-    media_type = "movie" if kind == "movie" else "series"
-    for entry in entries:
-        item = entry.get(kind) or {}
-        content_id, trakt_id = _trakt_identity(item)
-        if not content_id:
-            continue
-        state = states.setdefault((content_id, media_type), {
-            "content_id": content_id,
-            "media_type": media_type,
-            "trakt_id": trakt_id,
-            "play_count": 0,
-            "episode_count": 0,
-            "last_watched_at": None,
-            "in_watchlist": False,
-        })
-        state["in_watchlist"] = True
-        state["listed_at"] = _epoch(entry.get("listed_at"), 0) or None
-
-
-async def upsert_trakt_state_and_record_outcomes(
+async def upsert_title_state_and_record_outcomes(
     user_token: str,
     watched_movies: list[dict],
     watched_shows: list[dict],
     *,
-    watchlist_movies: list[dict] | None = None,
-    watchlist_shows: list[dict] | None = None,
     observed_at: int | None = None,
 ) -> list[dict]:
-    """Diff raw Trakt snapshots, persist state, and append semantic outcomes.
+    """Diff watch snapshots, persist state, and append semantic outcomes.
 
     The first call establishes a baseline and emits no outcomes. Later calls
     distinguish ``first_movie_watch``, ``movie_rewatch``,
-    ``first_series_episode``, ``series_continuation``, and ``watchlist_add``.
-    Watchlist arguments are optional so a failed watchlist fetch cannot clear
-    previously known intent.
+    ``first_series_episode`` and ``series_continuation``.
     """
     observed = int(time.time()) if observed_at is None else int(observed_at)
     states = _watched_states(watched_movies, watched_shows)
-    if watchlist_movies is not None:
-        _merge_watchlist(states, watchlist_movies, "movie")
-    if watchlist_shows is not None:
-        _merge_watchlist(states, watchlist_shows, "show")
 
     async with _ledger_lock:
         try:
             async with conn().execute(
-                "SELECT * FROM trakt_title_state WHERE user_token=?", (user_token,)
+                "SELECT * FROM title_state WHERE user_token=?", (user_token,)
             ) as cur:
                 prior_rows = await cur.fetchall()
             prior = {(row["content_id"], row["media_type"]): dict(row)
                      for row in prior_rows}
             async with conn().execute(
-                "SELECT * FROM trakt_state_syncs WHERE user_token=?",
+                "SELECT * FROM title_state_syncs WHERE user_token=?",
                 (user_token,),
             ) as cur:
                 sync_row = await cur.fetchone()
             is_baseline = sync_row is None
-            movie_watchlist_baseline = (
-                watchlist_movies is not None
-                and (sync_row is None or not sync_row["movie_watchlist_initialized"])
-            )
-            series_watchlist_baseline = (
-                watchlist_shows is not None
-                and (sync_row is None or not sync_row["series_watchlist_initialized"])
-            )
-
-            # A supplied watchlist is a complete snapshot for its media type.
-            # Mark removals before upserting the titles that remain listed.
-            if watchlist_movies is not None:
-                await conn().execute(
-                    "UPDATE trakt_title_state SET in_watchlist=0, observed_at=?"
-                    " WHERE user_token=? AND media_type='movie'",
-                    (observed, user_token),
-                )
-                for state in states.values():
-                    if state["media_type"] == "movie" and state["in_watchlist"] is None:
-                        state["in_watchlist"] = False
-            if watchlist_shows is not None:
-                await conn().execute(
-                    "UPDATE trakt_title_state SET in_watchlist=0, observed_at=?"
-                    " WHERE user_token=? AND media_type='series'",
-                    (observed, user_token),
-                )
-                for state in states.values():
-                    if state["media_type"] == "series" and state["in_watchlist"] is None:
-                        state["in_watchlist"] = False
 
             emitted: list[dict] = []
             for key, state in states.items():
                 old = prior.get(key)
                 old_plays = int(old["play_count"]) if old else 0
                 old_episodes = int(old["episode_count"]) if old else 0
-                old_watchlist = bool(old["in_watchlist"]) if old else False
                 occurred = state["last_watched_at"] or observed
                 event: dict | None = None
                 if not is_baseline and state["media_type"] == "movie" \
@@ -1193,7 +1131,6 @@ async def upsert_trakt_state_and_record_outcomes(
                     event.update({
                         "content_id": state["content_id"],
                         "media_type": state["media_type"],
-                        "trakt_id": state["trakt_id"],
                         "occurred_at": occurred,
                         "event_key": (
                             f"state:{state['media_type']}:{state['content_id']}:"
@@ -1204,64 +1141,30 @@ async def upsert_trakt_state_and_record_outcomes(
                         user_token, event, observed)
                     emitted.append({"id": event_id, **event})
 
-                watchlist_is_baseline = (
-                    movie_watchlist_baseline if state["media_type"] == "movie"
-                    else series_watchlist_baseline
-                )
-                if not is_baseline and not watchlist_is_baseline \
-                        and state.get("in_watchlist") is True and not old_watchlist:
-                    watchlist_event = {
-                        "event_type": "watchlist_add",
-                        "content_id": state["content_id"],
-                        "media_type": state["media_type"],
-                        "trakt_id": state["trakt_id"],
-                        "previous_value": 0,
-                        "current_value": 1,
-                        "occurred_at": state.get("listed_at") or observed,
-                        "event_key": (
-                            f"state:{state['media_type']}:{state['content_id']}:"
-                            f"watchlist_add:{state.get('listed_at') or observed}"
-                        ),
-                    }
-                    event_id = await _insert_outcome_no_commit(
-                        user_token, watchlist_event, observed)
-                    emitted.append({"id": event_id, **watchlist_event})
-
                 await conn().execute(
-                    "INSERT INTO trakt_title_state"
-                    " (user_token, content_id, media_type, trakt_id, play_count,"
-                    " episode_count, last_watched_at, in_watchlist, rating, observed_at)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?)"
+                    "INSERT INTO title_state"
+                    " (user_token, content_id, media_type, play_count,"
+                    " episode_count, last_watched_at, rating, observed_at)"
+                    " VALUES (?,?,?,?,?,?,?,?)"
                     " ON CONFLICT(user_token, content_id, media_type) DO UPDATE SET"
-                    " trakt_id=COALESCE(excluded.trakt_id, trakt_title_state.trakt_id),"
                     " play_count=excluded.play_count,"
                     " episode_count=excluded.episode_count,"
                     " last_watched_at=COALESCE(excluded.last_watched_at,"
-                    " trakt_title_state.last_watched_at),"
-                    " in_watchlist=COALESCE(excluded.in_watchlist,"
-                    " trakt_title_state.in_watchlist),"
-                    " rating=COALESCE(excluded.rating, trakt_title_state.rating),"
+                    " title_state.last_watched_at),"
+                    " rating=COALESCE(excluded.rating, title_state.rating),"
                     " observed_at=excluded.observed_at",
                     (user_token, state["content_id"], state["media_type"],
-                     state["trakt_id"], state["play_count"], state["episode_count"],
-                     state["last_watched_at"], state.get("in_watchlist"), None, observed),
+                     state["play_count"], state["episode_count"],
+                     state["last_watched_at"], None, observed),
                 )
 
             await conn().execute(
-                "INSERT INTO trakt_state_syncs"
-                " (user_token, first_observed_at, last_observed_at, sync_count,"
-                " movie_watchlist_initialized, series_watchlist_initialized)"
-                " VALUES (?,?,?,1,?,?) ON CONFLICT(user_token) DO UPDATE SET"
+                "INSERT INTO title_state_syncs"
+                " (user_token, first_observed_at, last_observed_at, sync_count)"
+                " VALUES (?,?,?,1) ON CONFLICT(user_token) DO UPDATE SET"
                 " last_observed_at=excluded.last_observed_at,"
-                " sync_count=trakt_state_syncs.sync_count + 1,"
-                " movie_watchlist_initialized=MAX("
-                " trakt_state_syncs.movie_watchlist_initialized,"
-                " excluded.movie_watchlist_initialized),"
-                " series_watchlist_initialized=MAX("
-                " trakt_state_syncs.series_watchlist_initialized,"
-                " excluded.series_watchlist_initialized)",
-                (user_token, observed, observed,
-                 int(watchlist_movies is not None), int(watchlist_shows is not None)),
+                " sync_count=title_state_syncs.sync_count + 1",
+                (user_token, observed, observed),
             )
             await conn().commit()
             return emitted
@@ -1296,7 +1199,7 @@ async def attribute_outcomes(
     query = (
         "SELECT o.id AS outcome_event_id, gi.id AS generation_item_id,"
         " gi.generation_id, d.session_id, d.id AS delivery_id, d.requested_at"
-        " FROM trakt_outcome_events o"
+        " FROM outcome_events o"
         " JOIN recommendation_generation_items gi"
         "   ON gi.user_token=o.user_token AND gi.content_id=o.content_id"
         "  AND (gi.media_type=o.media_type OR gi.media_type IS NULL"
@@ -1339,7 +1242,7 @@ async def get_outcomes(user_token: str, *,
         " a.session_id AS attributed_session_id,"
         " a.delivery_id AS attributed_delivery_id,"
         " a.attribution_model, a.lookback_seconds, a.attributed_at"
-        " FROM trakt_outcome_events o LEFT JOIN recommendation_attributions a"
+        " FROM outcome_events o LEFT JOIN recommendation_attributions a"
         " ON a.outcome_event_id=o.id WHERE o.user_token=?" + where +
         " ORDER BY o.occurred_at, o.id",
         (user_token,),
@@ -1389,7 +1292,7 @@ async def get_recommendation_summary(
         "   WHERE d.user_token=? AND d.requested_at>=? AND d.requested_at<=?"
         " ),"
         " window_outcomes AS ("
-        "   SELECT id, event_type FROM trakt_outcome_events"
+        "   SELECT id, event_type FROM outcome_events"
         "   WHERE user_token=? AND occurred_at>=? AND occurred_at<=?"
         " ),"
         " window_attributions AS ("

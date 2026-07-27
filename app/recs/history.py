@@ -88,10 +88,7 @@ async def watched_lists(viewer_key: str) -> tuple[list[dict], list[dict],
         meta = await _meta_for(imdb_id, row["media_type"])
         if not meta:
             continue
-        # `trakt` is the id build_profile keys ratings on. There is no Trakt id
-        # any more, so the IMDb id serves as the join key — it only has to be
-        # stable and unique within this profile build.
-        ids = {"imdb": imdb_id, "tmdb": meta["tmdb"], "trakt": imdb_id}
+        ids = {"imdb": imdb_id, "tmdb": meta["tmdb"]}
         item = {
             "ids": ids,
             "title": meta["title"],

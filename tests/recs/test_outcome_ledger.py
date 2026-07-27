@@ -19,14 +19,14 @@ def movie(content_id: str, plays: int, watched_at: str) -> dict:
     return {
         "plays": plays,
         "last_watched_at": watched_at,
-        "movie": {"ids": {"imdb": content_id, "trakt": int(content_id[-2:])}},
+        "movie": {"ids": {"imdb": content_id}},
     }
 
 
 def show(content_id: str, episode_numbers: list[int], watched_at: str) -> dict:
     return {
         "last_watched_at": watched_at,
-        "show": {"ids": {"imdb": content_id, "trakt": int(content_id[-2:])}},
+        "show": {"ids": {"imdb": content_id}},
         "seasons": [{
             "number": 1,
             "episodes": [
@@ -37,12 +37,6 @@ def show(content_id: str, episode_numbers: list[int], watched_at: str) -> dict:
     }
 
 
-def watchlist(content_id: str, kind: str, listed_at: str) -> dict:
-    return {
-        "listed_at": listed_at,
-        kind: {"ids": {"imdb": content_id, "trakt": int(content_id[-2:])}},
-    }
-
 
 class OutcomeLedgerTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -51,8 +45,7 @@ class OutcomeLedgerTests(unittest.IsolatedAsyncioTestCase):
         config.DB_PATH = str(Path(self.tmp.name) / "test.db")
         await db.init()
         with patch("app.recs.db.time.time", return_value=900):
-            await db.create_user(
-                "viewer", "Viewer", None, "access", "refresh", 99_999)
+            await db.create_user("viewer", "Viewer")
 
     async def asyncTearDown(self):
         await db.close()
@@ -71,7 +64,7 @@ class OutcomeLedgerTests(unittest.IsolatedAsyncioTestCase):
                 "metas": [meta(
                     "tt000001",
                     measurement={
-                        "candidate_source": "trakt",
+                        "candidate_source": "tmdb-feed",
                         "seed_content_id": "ttseed",
                         "rank_score": 8.5,
                         "score_components": {"taste": 0.9},
@@ -101,7 +94,7 @@ class OutcomeLedgerTests(unittest.IsolatedAsyncioTestCase):
         item = (await db.get_generation_items(first))[0]
         self.assertEqual(item["content_id"], "tt000001")
         self.assertEqual(item["strategy"], "best_bets")
-        self.assertEqual(item["candidate_source"], "trakt")
+        self.assertEqual(item["candidate_source"], "tmdb-feed")
         self.assertEqual(item["seed_content_id"], "ttseed")
         self.assertEqual(item["rank_score"], 8.5)
         self.assertEqual(item["score_components"], {"taste": 0.9})
@@ -178,17 +171,17 @@ class OutcomeLedgerTests(unittest.IsolatedAsyncioTestCase):
         )
         delivery = await db.record_catalog_delivery(
             "viewer", "movie", "served", requested_at=1_000)
-        first = await db.record_trakt_outcome(
+        first = await db.record_outcome(
             "viewer", "first_movie_watch", "tt000011", "movie", 1_200,
             event_key="watch-11", observed_at=1_300)
-        duplicate = await db.record_trakt_outcome(
+        duplicate = await db.record_outcome(
             "viewer", "first_movie_watch", "tt000011", "movie", 1_200,
             event_key="watch-11", observed_at=1_400)
         self.assertEqual(first, duplicate)
-        await db.record_trakt_outcome(
+        await db.record_outcome(
             "viewer", "first_movie_watch", "tt000022", "movie", 1_250,
             event_key="watch-22", observed_at=1_300)
-        await db.record_trakt_outcome(
+        await db.record_outcome(
             "viewer", "first_movie_watch", "tt000011", "movie",
             1_000 + 73 * 3600, event_key="too-late", observed_at=300_000)
 
@@ -204,19 +197,16 @@ class OutcomeLedgerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(await db.get_outcomes(
             "viewer", unattributed_only=True)), 2)
 
-    async def test_trakt_state_baselines_then_distinguishes_watch_outcomes(self):
-        baseline = await db.upsert_trakt_state_and_record_outcomes(
+    async def test_title_state_baselines_then_distinguishes_watch_outcomes(self):
+        baseline = await db.upsert_title_state_and_record_outcomes(
             "viewer",
             [movie("tt000001", 1, "2026-07-01T00:00:00Z")],
             [show("tt000002", [1], "2026-07-01T01:00:00Z")],
-            watchlist_movies=[watchlist(
-                "tt000003", "movie", "2026-07-01T02:00:00Z")],
-            watchlist_shows=[],
             observed_at=100,
         )
         self.assertEqual(baseline, [])
 
-        changed = await db.upsert_trakt_state_and_record_outcomes(
+        changed = await db.upsert_title_state_and_record_outcomes(
             "viewer",
             [
                 movie("tt000001", 1, "2026-07-01T00:00:00Z"),
@@ -226,20 +216,15 @@ class OutcomeLedgerTests(unittest.IsolatedAsyncioTestCase):
                 show("tt000002", [1, 2], "2026-07-02T01:00:00Z"),
                 show("tt000005", [1], "2026-07-02T02:00:00Z"),
             ],
-            watchlist_movies=[
-                watchlist("tt000003", "movie", "2026-07-01T02:00:00Z"),
-                watchlist("tt000006", "movie", "2026-07-02T03:00:00Z"),
-            ],
-            watchlist_shows=[],
             observed_at=200,
         )
         self.assertEqual(
             {event["event_type"] for event in changed},
             {"first_movie_watch", "series_continuation",
-             "first_series_episode", "watchlist_add"},
+             "first_series_episode"},
         )
 
-        repeated = await db.upsert_trakt_state_and_record_outcomes(
+        repeated = await db.upsert_title_state_and_record_outcomes(
             "viewer",
             [
                 movie("tt000001", 1, "2026-07-01T00:00:00Z"),
@@ -249,16 +234,11 @@ class OutcomeLedgerTests(unittest.IsolatedAsyncioTestCase):
                 show("tt000002", [1, 2], "2026-07-02T01:00:00Z"),
                 show("tt000005", [1], "2026-07-02T02:00:00Z"),
             ],
-            watchlist_movies=[
-                watchlist("tt000003", "movie", "2026-07-01T02:00:00Z"),
-                watchlist("tt000006", "movie", "2026-07-02T03:00:00Z"),
-            ],
-            watchlist_shows=[],
             observed_at=300,
         )
         self.assertEqual(repeated, [])
 
-        rewatch = await db.upsert_trakt_state_and_record_outcomes(
+        rewatch = await db.upsert_title_state_and_record_outcomes(
             "viewer",
             [movie("tt000001", 2, "2026-07-03T00:00:00Z")],
             [show("tt000002", [1, 2], "2026-07-02T01:00:00Z")],
@@ -277,30 +257,6 @@ class OutcomeLedgerTests(unittest.IsolatedAsyncioTestCase):
                          ("series", 75))
         with self.assertRaises(ValueError):
             await db.update_preferences("viewer", "anything", 30)
-
-    async def test_delayed_first_watchlist_snapshot_is_a_baseline(self):
-        with patch("app.recs.db.time.time", return_value=901):
-            await db.create_user(
-                "delayed", "Delayed", None, "access", "refresh", 99_999)
-        await db.upsert_trakt_state_and_record_outcomes(
-            "delayed", [], [], observed_at=100)
-        first_watchlist = await db.upsert_trakt_state_and_record_outcomes(
-            "delayed", [], [],
-            watchlist_movies=[watchlist(
-                "tt000031", "movie", "2026-07-01T00:00:00Z")],
-            observed_at=200,
-        )
-        self.assertEqual(first_watchlist, [])
-        addition = await db.upsert_trakt_state_and_record_outcomes(
-            "delayed", [], [],
-            watchlist_movies=[
-                watchlist("tt000031", "movie", "2026-07-01T00:00:00Z"),
-                watchlist("tt000032", "movie", "2026-07-02T00:00:00Z"),
-            ],
-            observed_at=300,
-        )
-        self.assertEqual([event["event_type"] for event in addition],
-                         ["watchlist_add"])
 
     async def test_recommendation_summary_is_empty_and_rate_is_nullable(self):
         summary = await db.get_recommendation_summary(
@@ -331,7 +287,7 @@ class OutcomeLedgerTests(unittest.IsolatedAsyncioTestCase):
         )
         await db.record_catalog_delivery(
             "viewer", "movie", "old", requested_at=2_000)
-        await db.record_trakt_outcome(
+        await db.record_outcome(
             "viewer", "first_movie_watch", "tt000041", "movie", 3_000,
             event_key="old-win", observed_at=3_100)
         self.assertEqual(await db.attribute_outcomes(
@@ -351,13 +307,13 @@ class OutcomeLedgerTests(unittest.IsolatedAsyncioTestCase):
             "viewer", "movie", "top", requested_at=21_000)
         await db.record_catalog_delivery(
             "viewer", "movie", "more", requested_at=21_001)
-        await db.record_trakt_outcome(
+        await db.record_outcome(
             "viewer", "first_movie_watch", "tt000042", "movie", 22_000,
             event_key="current-win", observed_at=22_100)
-        await db.record_trakt_outcome(
+        await db.record_outcome(
             "viewer", "movie_rewatch", "tt000042", "movie", 22_001,
             event_key="current-rewatch", observed_at=22_100)
-        await db.record_trakt_outcome(
+        await db.record_outcome(
             "viewer", "first_movie_watch", "tt999999", "movie", 22_002,
             event_key="current-unmatched", observed_at=22_100)
         self.assertEqual(await db.attribute_outcomes(

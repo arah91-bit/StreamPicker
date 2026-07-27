@@ -23,7 +23,6 @@ IMG = "https://image.tmdb.org/t/p"
 _client = httpx.AsyncClient(
     base_url="https://api.themoviedb.org/3",
     timeout=30,
-    params={"api_key": config.TMDB_API_KEY},
 )
 _sem = asyncio.Semaphore(8)
 
@@ -464,8 +463,12 @@ def _cached_home_release_state(cached: dict, as_of: datetime.date,
 
 
 async def _get(path: str, params: dict | None = None) -> Any:
+    # The key rides on each request rather than on the client's default
+    # params, so that an install without one fails here — where a row is
+    # actually being built — and not on `import app.recs.tmdb`.
+    params = {**(params or {}), "api_key": config.require("TMDB_API_KEY")}
     async with _sem:
-        r = await _client.get(path, params=params or {})
+        r = await _client.get(path, params=params)
     r.raise_for_status()
     return r.json()
 
@@ -478,6 +481,24 @@ async def discover(media_type: str, params: dict) -> list[dict]:
 
 async def tmdb_recommendations(media_type: str, tmdb_id: int) -> list[dict]:
     data = await _get(f"/{media_type}/{tmdb_id}/recommendations")
+    return data.get("results", [])
+
+
+async def trending(media_type: str, window: str = "week") -> list[dict]:
+    """What is being watched right now. media_type: 'movie' | 'tv'.
+
+    A velocity signal rather than a popularity one — /movie/popular ranks by a
+    slow-moving score, so without this a "Trending Now" row would be nearly
+    the same slate as "Popular Now" every day. Weekly rather than daily
+    because a day's window is noisy enough to swing the row on one release.
+    """
+    data = await _get(f"/trending/{media_type}/{window}")
+    return data.get("results", [])
+
+
+async def popular(media_type: str) -> list[dict]:
+    """Broadly popular titles. media_type: 'movie' | 'tv'."""
+    data = await _get(f"/{media_type}/popular")
     return data.get("results", [])
 
 

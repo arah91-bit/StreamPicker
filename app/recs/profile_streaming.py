@@ -198,16 +198,14 @@ def profile_id_for_user(user: dict) -> str | None:
     """Resolve one DB user to one prebuilt streaming profile exactly.
 
     Profile generation historically accepted a substring username match.  That
-    is unsafe on a request path because several household Trakt usernames can
-    share a prefix.  Private serving therefore uses exact display-name/Trakt
-    matches, plus the exact user identity persisted with the built taste model.
+    is unsafe on a request path because several household display names can
+    share a prefix.  Private serving therefore uses an exact display-name
+    match, plus the exact user identity persisted with the built taste model.
     Ambiguous or absent matches fail closed.
     """
     identities = {
-        str(user.get(field) or "").strip().casefold()
-        for field in ("name", "trakt_username")
-        if str(user.get(field) or "").strip()
-    }
+        str(user.get("name") or "").strip().casefold()
+    } - {""}
     if not identities:
         return None
 

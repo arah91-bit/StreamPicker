@@ -39,7 +39,7 @@ EXCLUDE = {
     # bind-mounted path — must not be able to move them out from under itself.
     "DB_PATH": "Daily Picks database path; set via the volume mount",
     "CATALOGS_DIR": "Daily Picks catalog packs; set via the volume mount",
-    "SETUP_SECRET": "the gate to Trakt onboarding — set it in .env only",
+    "SETUP_SECRET": "the gate to viewer onboarding — set it in .env only",
 }
 
 # Advanced groups render in this order. (id, title)
