@@ -51,7 +51,7 @@ import httpx
 
 from app import (acquire, anime, candidate_health, content_identity,
                  decode_health, library, meta, private_trackers, probe,
-                 reputation, sources, tbcache, telemetry,
+                 reputation, source_health, sources, tbcache, telemetry,
                  usenet as nzb_lane, vprobe)
 
 logger = logging.getLogger("stream-picker")
@@ -1433,6 +1433,12 @@ def _usable(s: dict, profile: dict, runtime: float) -> bool:
     if not _audio_ok(s):
         return False
     text = _stream_text(s)
+    # A provider the operator blocked from the dashboard after watching it
+    # fail. The reputation check above is evidence about one release and is
+    # allowed to decay; this is a standing decision about a whole source, so
+    # it holds until it is cleared there.
+    if source_health.is_blocked(telemetry.source_of(text)):
+        return False
     if _12BIT_RE.search(text):
         return False
     # Bare Dolby Vision (no HDR10 base) shows a purple/green tint on the
@@ -2991,6 +2997,17 @@ async def pick_slow(media: str, media_id: str,
                 f" -> {len(ok)} usable ({distinct} distinct releases),"
                 f" {len(verified)} verified (+{len(fast_verified)} fast),"
                 f" {len(lib)} library in {time.monotonic() - t0:.1f}s")
+
+    # A thin public result is worth a private look — see
+    # private_trackers.MIN_PUBLIC_SOURCES for the policy. Deliberately not
+    # awaited: candidates() dedupes and caches the search, so kicking it here
+    # costs this pick nothing and the rows are ready for the re-open. Blocking
+    # a viewer's request on a tracker round-trip is what the fast/slow split
+    # exists to avoid.
+    if ok and private_trackers.should_search(distinct):
+        asyncio.create_task(private_trackers.candidates(media, media_id))
+        logger.info("%s: %d distinct public release(s) — also searching "
+                    "private trackers in the background", cache_key, distinct)
 
     # Slow picker earns its name here: for the top few candidates, measure the
     # true *video* bitrate (ignoring audio-track bloat) and re-rank on it, so the

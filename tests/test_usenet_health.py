@@ -8,6 +8,7 @@ its schema and maintenance strategy.
 from __future__ import annotations
 
 import tempfile
+import time
 import unittest
 from collections.abc import Mapping
 from pathlib import Path
@@ -366,6 +367,96 @@ class MetadataSafetyRegressionTests(unittest.TestCase):
         self.assertFalse(any(k.startswith("_nzb_") for k in cleaned))
         self.assertNotIn("_qbps", cleaned)
         self.assertIn("_nzb_release_key", stream)  # input/cache is not mutated
+
+
+class TransportWatchdogTests(unittest.TestCase):
+    """Telling "this release is bad" apart from "the pipe is dead".
+
+    The distinction is not academic. A wedged provider connection pool makes
+    every release look bad at once, so per-release policy answers an outage by
+    cooling a shelf of perfectly good releases and reporting nothing an
+    operator can act on. The watchdog's whole job is to notice that the
+    failures have stopped being about content.
+    """
+
+    def setUp(self):
+        usenet_health._transport_dead.clear()
+        usenet_health._transport_ok_at = 0.0
+
+    tearDown = setUp
+
+    @staticmethod
+    def _dead(n: int, reason: str = "transport") -> None:
+        for i in range(n):
+            usenet_health._note_transport(f"nzb:{i:064x}", False, reason)
+
+    def test_one_dead_release_is_just_a_dead_release(self):
+        self._dead(1)
+        self.assertEqual({}, usenet_health.transport_stalled())
+
+    def test_enough_dead_releases_at_once_is_the_transport(self):
+        self._dead(usenet_health.TRANSPORT_MIN_RELEASES)
+
+        stalled = usenet_health.transport_stalled()
+
+        self.assertEqual(usenet_health.TRANSPORT_MIN_RELEASES,
+                         stalled["releases"])
+        self.assertGreater(stalled["since"], 0)
+
+    def test_the_same_release_failing_repeatedly_is_not_an_outage(self):
+        """Otherwise one release retried in a loop manufactures its own alarm."""
+        for _ in range(10):
+            usenet_health._note_transport("nzb:" + "a" * 64, False, "timeout")
+
+        self.assertEqual({}, usenet_health.transport_stalled())
+
+    def test_content_failures_never_count(self):
+        """Three releases with missing articles are three bad posts. Saying the
+        provider is down would send the operator to fix the wrong thing."""
+        self._dead(usenet_health.TRANSPORT_MIN_RELEASES,
+                   reason="missing-articles")
+
+        self.assertEqual({}, usenet_health.transport_stalled())
+
+    def test_anything_succeeding_clears_the_alarm(self):
+        """The claim is about the present tense. One good read disproves it."""
+        self._dead(usenet_health.TRANSPORT_MIN_RELEASES)
+        self.assertTrue(usenet_health.transport_stalled())
+
+        usenet_health._note_transport("nzb:" + "f" * 64, True, "")
+
+        self.assertEqual({}, usenet_health.transport_stalled())
+
+    def test_failures_spread_thin_do_not_accumulate_into_an_outage(self):
+        """Stale evidence ages out, so a slow drip of unrelated bad releases
+        over an evening never adds up to a stall that isn't happening."""
+        stale = time.time() - usenet_health.TRANSPORT_WINDOW - 1
+        for i in range(usenet_health.TRANSPORT_MIN_RELEASES):
+            usenet_health._transport_dead[f"nzb:{i:064x}"] = stale
+
+        self.assertEqual({}, usenet_health.transport_stalled())
+
+    def test_both_halves_of_a_real_outage_reach_the_watchdog(self):
+        """An outage arrives by two routes — the proxy's start gate giving up
+        on a source, and nzbdav failing to import at all — and the watchdog
+        only sees the whole of it if both normalise into a counted reason.
+        These are the verbatim strings each side emits."""
+        for raw in ("dead",                              # proxy start gate
+                    "Could not login to usenet host.",   # nzbdav import
+                    "first byte timeout"):               # probe
+            kind = usenet_health.classify_reason(raw)
+            self.assertEqual("transient", kind, raw)
+            self.assertIn(usenet_health._safe_reason(raw, kind),
+                          usenet_health._TRANSPORT_REASONS, raw)
+
+    def test_a_missing_article_release_is_still_content(self):
+        """The counterpart guard: the commonest genuine content failure must
+        stay out of the transport bucket however often it happens."""
+        raw = "missing articles"
+        kind = usenet_health.classify_reason(raw)
+        self.assertEqual("hard", kind)
+        self.assertNotIn(usenet_health._safe_reason(raw, kind),
+                         usenet_health._TRANSPORT_REASONS)
 
 
 if __name__ == "__main__":

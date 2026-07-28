@@ -1,0 +1,415 @@
+# Diagnosing playback buffering
+
+Field notes from a live investigation into "streams take ~20s to start and then
+buffer". Written for whoever picks this up next with no memory of it — the goal
+is that you can skip the two hours of wrong guesses.
+
+Companion docs: [DESIGN.md](DESIGN.md) for why the picker is shaped the way it
+is, [AGENTS.md](AGENTS.md) for how to change settings.
+
+---
+
+## The delivery path
+
+Buffering can come from any layer, and the layers fail in ways that look
+identical from the sofa. Know which one you are in before changing anything.
+
+```
+player (Stremio/Nuvio/Jellyfin)
+  └── stream-picker proxy            app/proxy.py
+        ├── start gate               _select_start   — picks a live candidate
+        ├── byte cache + producer    _produce        — sequential read-ahead to disk
+        └── source
+              ├── debrid / HTTP      one hop, usually fine
+              └── usenet             WebDAV mount (nzbdav) → NNTP providers
+```
+
+The usenet lane is the deep one: a single HTTP range request against the mount
+fans out into dozens of NNTP article fetches across multiple providers. Nearly
+all the pain lives there, and almost none of it is visible in HTTP status codes
+— a wedged NNTP pool returns a perfectly valid `206` that takes 41 seconds.
+
+---
+
+## The five failure modes, in the order they cost us time
+
+### 1. nzbdav leaks NNTP sockets until its connection pool is all corpses
+
+**The big one.** Everything else was a rounding error next to this.
+
+*Symptom.* Playback is fine after a restart and degrades over hours. Reads that
+took 0.3 s take 40 s. It looks random, affects every release at once, and the
+releases are all fine when tested later.
+
+*Confirm it.* Count sockets to the NNTP port by state, per remote host, inside
+the nzbdav container. A healthy provider cycles through `ESTABLISHED` →
+`FIN_WAIT1` → gone. A leaking one accumulates `CLOSE_WAIT` — the remote closed
+and nzbdav never closed its side:
+
+```bash
+pid=$(docker inspect -f '{{.State.Pid}}' nzbdav)
+python3 - "$pid" <<'PY'
+import collections, socket, sys
+STATE = {"01":"EST","02":"SYN_SENT","04":"FIN_WAIT1","06":"TIME_WAIT","08":"CLOSE_WAIT"}
+cnt = collections.Counter()
+for fam in ("tcp", "tcp6"):
+    for ln in open(f"/proc/{sys.argv[1]}/net/{fam}").read().splitlines()[1:]:
+        p = ln.split(); ip_hex, port_hex = p[2].rsplit(":", 1)
+        if int(port_hex, 16) != 563:          # NNTP over TLS
+            continue
+        if fam == "tcp":
+            ip = socket.inet_ntoa(bytes.fromhex(ip_hex)[::-1])
+        else:
+            b = bytes.fromhex(ip_hex)
+            ip = socket.inet_ntop(socket.AF_INET6, b"".join(
+                b[i:i+4][::-1] for i in range(0, 16, 4))).replace("::ffff:", "")
+        cnt[(ip, STATE.get(p[3].upper(), p[3]))] += 1
+for k, v in sorted(cnt.items()):
+    print(f"{v:4d}  {k[1]:11s} {k[0]}")
+PY
+```
+
+Cross-check against the log, which fills with the downstream consequence:
+
+```bash
+docker logs nzbdav --since 24h 2>&1 | grep -c "Error getting connection-lock"
+docker logs nzbdav --since 24h -t 2>&1 | grep "Error getting connection-lock" \
+  | awk '{print substr($1,1,13)}' | uniq -c        # errors per hour — watch it climb
+```
+
+Live reading during the investigation: **1547 errors in 24 h**, rising
+663 → 823 per hour until a restart dropped it to 61. Forty minutes after a
+fresh start, every socket nzbdav held was a leaked `CLOSE_WAIT` against one
+backup provider, against a configured cap of 8 for that provider. Its sub-pool
+was over 100 % occupied by dead sockets.
+
+*Mechanism.* nzbdav's pool picks "the provider with the most free connections".
+Leaked sockets are counted as live, so that provider's pool never frees; any
+article routed there waits out the NNTP login timeout, surfacing as
+`CouldNotLoginToUsenetException: Timeout reading from NNTP stream`. It
+compounds with uptime. Upstream: nzbdav issue #148 ("limited to one active
+connection… recreating the container resolves it immediately").
+
+*Fixes.*
+- Remove the leaking provider from nzbdav's config, or restart nzbdav.
+- In this repo: the transport watchdog in `app/usenet_health.py`
+  (`_note_transport` / `transport_stalled`) infers the condition from our own
+  traffic and raises it on the home page via `app/home_ui.py`.
+
+*The trap this exists to avoid.* Per-release health policy answers an outage by
+striking every release that fails during it. An hour of wedged transport
+quietly retires a shelf of perfectly good releases and reports "everything is
+broken". Several **different** releases failing the same transport-shaped way
+inside a few minutes, with nothing succeeding in between, is the pipe — say
+that instead. The watchdog is deliberately in-memory only and clears the
+instant anything reads successfully; it must never become a stored strike.
+
+### 2. Every file open pays a cold fetch for the file tail
+
+*Symptom.* Slow start on every open, including healthy sources. Seeks are
+expensive too.
+
+*Confirm it.* Time a range GET at EOF against one at offset 0 on a file nothing
+has touched yet. Cold tail measured **7.68 s TTFB**; the same read warm was
+0.26 s.
+
+*Mechanism.* Players read the container index before anything else — MKV cues
+and MP4 `moov` live at the end of the file. The sequential producer starts at
+byte 0 and will never have those bytes. Observed live: a reader at offset
+368,449,152 of a 368,477,225-byte file while the cache held only the front.
+
+*Fix.* `_fetch_tail` pulls the last `BUFFER_TAIL_MB` (default 8) into memory
+when a producer starts; `_tail_response` serves any range inside it from
+memory, both for suffix ranges in `serve()` and absolute tail offsets in
+`_serve_buffered`. Best-effort — on failure those ranges fall through to the
+direct path exactly as before.
+
+### 3. A source that sends nothing was scored "slow" instead of dead
+
+*Symptom.* ~40 s of "Starting stream" across two 502 rounds, then it works on
+the player's own third try.
+
+*Mechanism.* Two bugs compounding:
+- The start gate had no per-chunk timeout, so a source that connected and then
+  said nothing blocked on the HTTP client's 60 s read timeout rather than the
+  8 s TTFB budget it would be judged against anyway.
+- Zero bytes was recorded as `slow`, and reputation needs two bad sessions to
+  cool a release — so the same corpse was served again on the retry.
+
+*Fix.* `_select_start` wraps the first-byte read in
+`asyncio.wait_for(..., START_TTFB + 0.5)`, and a candidate that connects and
+delivers zero bytes gets the verdict `dead` with `extreme=True`, which cools it
+on the first offence. Covered by `DeadStartTests` in `tests/test_proxy_safety.py`.
+
+### 4. The producer parked while the viewer was still watching
+
+*Mechanism.* Backpressure waited on `e.consumers > 0`. But players fetch in
+discrete ranges — request a chunk, disconnect, come back a minute later — so
+`consumers` is legitimately 0 between requests, and a range past the write head
+is served directly without ever taking a consumer ref. The fill froze for the
+rest of the film and every later range became a cold upstream fetch.
+
+*Fix.* `_reader_interested` also counts a touch within `BUFFER_IDLE_GRACE`
+(180 s). `_watch_fill` now emits a `stalled` telemetry event when a buffer
+stops growing with a reader waiting — previously the only way to establish this
+was `stat()`-ing the cache file twice by hand.
+
+### 5. decode_health was being taught that starvation is a codec problem
+
+*Symptom.* Universally-supported codecs (AAC, H.264) sitting at ~17 % "failure"
+in the learned store, demoting releases for no reason.
+
+*Mechanism.* When a player gave up, the proxy struck the file's codecs — even
+when the player had never received enough bytes to make a codec decision. It
+also fired while the viewer was actively watching, because the silence detector
+looked only at `consumers`, which a player streaming from its own buffer drops
+to 0 between range reads.
+
+*Fix.* Two gates. `_spawn_learn` only runs when `e.avail >=
+DECODE_LEARN_MIN_BYTES` (8 MB) or the file is complete — otherwise the release
+is still cooled but the verdict is logged as starvation. And the silence timer
+bails if `e.last` was touched inside the window. The poisoned store was deleted
+so it could start collecting honest data.
+
+---
+
+## What did not work
+
+Time spent on these so you do not repeat it:
+
+- **Blaming the picker for offering an unready NZB mount.** The original theory
+  was a race between mount-readiness probing and serving. The mount was ready;
+  the NNTP transport under it was wedged. Gating on mount readiness would have
+  caught nothing.
+- **Testing providers one connection at a time.** Every provider authenticated
+  in 0.16–0.66 s when probed individually, which proves nothing about a pool
+  that has wedged itself. Only the socket-state census showed the problem.
+- **Suspecting provider account connection caps.** Worth checking (multiple
+  apps sharing one account will exceed it), but here the account limits were
+  far above the configured demand.
+- **Suspecting IPv6.** The container had no global IPv6; all traffic was
+  IPv4-mapped. Not it.
+- **Reverse-proxy overhead.** Reaching the WebDAV host by public hostname
+  through a reverse proxy instead of the container network is real waste — a
+  container-network hop measured 4 ms — but it is single-digit milliseconds
+  against 41-second article fetches. Fix it for tidiness, not for buffering.
+- **Aggregate telemetry alone.** Failure rates and probe tables never showed
+  this. What showed it was per-range TTFB timing and socket states.
+
+---
+
+## Measuring it yourself
+
+The decisive experiment is a cold range read with the head and the tail timed
+separately, issued from inside the app container so it uses the same
+credentials and network path the proxy does:
+
+```bash
+docker exec -i stream-picker python3 - <<'PY'
+import os, time, httpx
+auth = httpx.BasicAuth(os.environ["NZBDAV_USER"], os.environ["NZBDAV_PASS"])
+base, path, size = "http://nzbdav:8080", "/content/tv/<dir>/<file>.mkv", 0
+for label, rng in [("head", "bytes=0-1048575"),
+                   ("tail", f"bytes={size-1048576}-{size-1}")]:
+    t0 = time.monotonic(); first = None; got = 0
+    with httpx.Client(auth=auth, timeout=60.0) as c:
+        with c.stream("GET", base + path, headers={"Range": rng}) as r:
+            for ch in r.iter_raw():
+                if first is None: first = time.monotonic() - t0
+                got += len(ch)
+    print(f"{label} HTTP {r.status_code} ttfb {first:.2f}s "
+          f"{got/1e6:.2f}MB in {time.monotonic()-t0:.2f}s")
+PY
+```
+
+What healthy looks like, measured end-to-end through the proxy on a direct
+usenet source with the transport in good shape:
+
+```
+first byte            0.3 – 0.8 s
+tail / index read     0.01 s          (served from the warmed tail, not upstream)
+re-open of byte 0     0.01 s          (served from the byte cache)
+sustained throughput  ~34 MB/s        on a 6 GB 4K file needing ~3–6 MB/s
+nzbdav CLOSE_WAIT     0
+connection-lock errs  0
+```
+
+Log line that proves tail warming ran: `bufcache <sig>: tail warmed (8192 KB @
+<offset>)`, roughly 0.8 s after `bufcache <sig>: start`.
+
+Interpretation:
+- both fast → the transport is healthy; look at the player or the start gate
+- tail slow, head fast → tail warming is off or failed
+- wildly variable run to run → NNTP pool problem; go to failure mode 1
+- resolve paths from nzbdav's SQLite `DavItems` table by walking `ParentId`
+
+Watch the fill telemetry (`fill` / `stalled` events from `_watch_fill`) rather
+than inferring from file sizes.
+
+---
+
+## How nzbdav actually serves bytes
+
+Read from the source at 0.6.4. These are the facts that decide what an
+integration should look like.
+
+**Byte 0 is free; every other offset costs NNTP round-trips.**
+`NzbFileStream.GetFileStream` short-circuits `rangeStart == 0` straight into a
+segment stream. Any other offset runs an *interpolation search* over the
+segment list (`InterpolationSearch.Find`), and each probe calls
+`GetYencHeadersAsync` — a real article-header fetch through the connection
+pool. There is **no cross-request article or header cache in the streaming
+path**: `ArticleCachingNntpClient` is documented as short-lived and is only
+constructed by `QueueManager` during import. So every seek, on every open, pays
+the search again. This is the mechanism behind the cold-tail cost in failure
+mode 2, and the reason warming the tail once is worth so much.
+
+**Reads are forward-only with bounded prefetch.** `MultiSegmentStream` pulls
+segments into a bounded channel of `usenet.article-buffer-size` (**default 40**)
+and serves them in order. WebDAV stream reads run at `SemaphorePriority.High`
+(`BaseStoreStreamFile`), so streaming already outranks background work.
+
+**Settings are mostly already right at defaults.** Community advice to "set
+article buffer to 200, streaming priority to 80" is aimed at people who set
+them low. The shipped defaults are `article-buffer-size = 40`,
+`streaming-priority = 80`, `max-download-connections = min(total pooled, 15)`.
+An article buffer larger than the connection count buys little.
+
+**There are two ways in, and the obvious one is the worse one.**
+
+| | WebDAV `/content/<dir>/<file>` | `/view/.ids/<a>/<b>/<c>/<d>/<e>/<guid>` |
+|---|---|---|
+| Addressing | by directory + file name | by immutable `DavItem` id, first 5 hex chars sharded |
+| Survives re-import | **no** — the release directory carries an attempt suffix that changes | yes |
+| Discovery | PROPFIND per candidate path | none, id comes from the mount result |
+| Auth | Basic, per connection | `?downloadKey=sha256(f"{path}_{strm_key}")`, no challenge |
+| Ranges | yes | yes — 206, `Content-Range`, `Accept-Ranges`, `Content-Encoding: identity` |
+
+**…but the id route is unreachable from here — do not spend time on it again.**
+The `/view/.ids/…` endpoint works (verified: `206`, correct `Content-Range`,
+keyless request `401`s). The problem is *learning the id*. It is not exposed
+anywhere we can reach:
+
+- `BaseStoreItemPropertyManager` defines displayname, getcontentlength,
+  getcontenttype, getlastmodified, Win32FileAttributes, resourcetype and
+  iscollection — **no `getetag`, no custom id property**. Confirmed against a
+  live PROPFIND: the guid appears nowhere in the response.
+- No `ETag` or other id-bearing response header on GET/HEAD. Confirmed live.
+- `api/list-webdav-directory` and the other `/api/*` controllers authenticate
+  against `FRONTEND_BACKEND_API_KEY`, an internal frontend↔backend secret.
+- The SAB-compatible history API returns a filesystem `DownloadPath`, not the
+  `/view` URL. `.ids` URLs are only written into `.strm` *files on disk* by
+  `CreateStrmFilesPostProcessor`, and only under `importStrategy == "strm"` —
+  a completed-downloads workflow this lane does not use.
+
+So path-name addressing is forced. Its two costs, measured rather than assumed:
+the `PROPFIND … 404` volume is real but each one costs 2–6 ms and is not worth
+optimising; the stale-URL failure mode is real and would need *re-resolution on
+failure* rather than id addressing.
+
+Other caveats if this ever becomes reachable: `/view` copies with
+`bufferSize: 1024`, and its download key is a static SHA-256 with no expiry, so
+it must stay server-side. An A/B of 32 MB reads was inconclusive on throughput
+because article-fetch speed varied **13.7 → 1.6 MB/s between consecutive runs
+of the same request**; NNTP variance swamps everything else.
+
+### Suffix ranges (`bytes=-N`) are answered with the head of the file
+
+The single highest-value thing found by reading the source. `GetWebdavItemRequest`
+parses the Range header with `rangeHeader[6..].Split("-", RemoveEmptyEntries)`,
+which throws away the leading empty part, and the WebDAV path is no better.
+Live proof against a 6,108,448,173-byte file:
+
+```
+suffix   bytes=-8388608    ->  Content-Range: bytes 0-8388608/6108448173      WRONG
+absolute bytes=6100059565- ->  Content-Range: bytes 6100059565-.../...        OK
+```
+
+`_range_response_ok` correctly refuses the wrong answer — which meant
+`_fetch_tail` **silently never warmed a tail on any direct-usenet source**, the
+exact lane it was written for, and a player's opening index read against an
+uncached file became a 502.
+
+Both now send absolute ranges: `_fetch_tail` always (it derives its size from
+`total`, so the total is known by construction), and `_serve_direct` rewrites a
+player's suffix range whenever `expected_total` is known, leaving it untouched
+when it isn't. Covered by `SuffixRangeTests`.
+
+**Rule of thumb: never send `bytes=-N` upstream when the total is known.** Both
+forms are legal; agreement on the second one is universal.
+
+**The upstream fix for failure mode 1 exists but is unreleased.** Commit
+`c5fa860 fix(nntp): Skip failing usenet providers with circuit breaker` adds
+`ProviderCircuitBreaker` (3 consecutive failures → 60 s cooldown, doubling to
+5 min, single probe to recover), and `794948b` tags the provider name into
+connection-lock errors so a grep replaces the socket census. Both are on `main`
+only — `latest`, `v0.6.x`, `v0.x` and `v0.6.4` all point at the 0.6.4 release
+commit, and no `main`/`edge` image is published. Getting them means building
+from source or waiting for the next release.
+
+Why the leak happens, from `ConnectionPool`: `Return()` pushes a connection
+back onto the idle stack without any liveness check, and borrowing only tests
+*age*, never whether the socket is still open. The 30 s idle sweeper would
+still reap a dead socket sitting idle — so sockets that persist in `CLOSE_WAIT`
+are ones whose `ConnectionLock` was never disposed. That never releases the
+semaphore permit either, so the provider's effective capacity shrinks toward
+zero with uptime. Matches the reported symptom "limited to one active
+connection, fixed by recreating the container" exactly.
+
+---
+
+## Invariants worth not breaking
+
+- **Never advance `e.head` from a tail probe.** It is the backpressure anchor.
+  A player reads the index from EOF on every open; pinning `head` at EOF makes
+  `avail - head` permanently negative, so the producer never pauses and fetches
+  the whole file however little of it gets watched.
+- **The transport watchdog stays in memory.** It answers "is the pipe wedged
+  *now*". A stored version would be the exact mistake it exists to correct.
+- **Failure reasons must normalise into `_TRANSPORT_REASONS`.** Both halves of
+  an outage — the proxy's `dead` verdict and nzbdav's login failure — have to
+  land there or the watchdog sees half of it. Guarded by
+  `TransportWatchdogTests`.
+- **Codec learning requires evidence the player was fed.** See failure mode 5.
+- **Content failures must stay content failures.** `missing-articles` is a bad
+  post, not a bad pipe, however many of them arrive at once.
+
+---
+
+## Settings introduced by this work
+
+| Setting | Default | What it does |
+|---|---|---|
+| `BUFFER_TAIL_MB` | 8 | File tail warmed into memory per stream; 0 disables |
+| `BUFFER_IDLE_GRACE` | 180 | Seconds the fill continues after the last reader touch |
+| `DECODE_LEARN_MIN_MB` | 8 | Bytes a player must have had before a rejection may strike codecs |
+| `NZB_START_RETRY_SECS` | 2 | One extra start attempt for a usenet source, after this pause |
+| `NZB_TRANSPORT_MIN_RELEASES` | 3 | Distinct releases that must die before calling it a transport stall |
+| `NZB_TRANSPORT_WINDOW_MINUTES` | 10 | Window those failures must land inside |
+| `PRIVATE_TRACKER_MIN_SOURCES` | 0 | Below this many public releases, also search private trackers |
+
+The last one is not a bug fix but it is the only real answer to one class of
+buffering: when a title has exactly one working copy, no amount of failover
+logic helps. More candidates is the fix.
+
+---
+
+## Running the tests
+
+The suite is environment-sensitive — the production env leaking in causes false
+failures that look like regressions. Use `docker run` with a **fresh empty
+`/data`**, never `docker compose run`:
+
+```bash
+D=$(mktemp -d)
+docker run --rm -v "$PWD":/srv:ro -v "$D":/data -e CONFIG_FILE=/tmp/t.json \
+  --entrypoint python docker-stream-picker -m unittest discover -s /srv/tests -t /srv
+```
+
+After changing `app/knobs.py`, regenerate the reference file or a parity test
+fails:
+
+```bash
+docker run --rm -v "$PWD":/srv -w /srv --entrypoint python \
+  docker-stream-picker -m tools.gen_env_reference
+```

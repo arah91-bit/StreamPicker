@@ -11,9 +11,11 @@ restart — so the page never drifts from config.json / .env parity.
 """
 
 import os
+import time
+from urllib.parse import quote
 
-from app import (adminui, config, overview, proxy, settings_ui, telemetry,
-                 uitheme, usenet_health)
+from app import (adminui, config, overview, proxy, settings_ui, source_health,
+                 telemetry, uitheme, usenet_health)
 
 ADDON_NAME = os.environ.get("ADDON_NAME", "Auto Stream")
 
@@ -71,20 +73,29 @@ details.ngroup[open]>summary .chev{transform:rotate(90deg)}
 # Probes are cheap and plentiful, so a source has to fail a real run of them
 # before we call it dead rather than unlucky.
 _DEAD_SOURCE_PROBES = 8
+# ...and it has to have failed them *lately*. Telemetry is retained for weeks,
+# so without this a source that was removed or repaired days ago keeps raising
+# the alarm until its records age out — the same permanent warning this hero
+# exists to get rid of, arriving by a different route. Worse, a dead source
+# with zero successes can never dilute its own 100% failure rate, so it would
+# sit there until retention expired.
+_RECENT_HOURS = 48.0
 
 
 def _broken_services(recs: list[dict]) -> list[str]:
-    """Services that are genuinely down — *not* releases the picker screened out.
+    """Services that are genuinely down *now* — not releases we screened out.
 
     Blocked releases are the product, not a problem: finding the bad ones and
     routing around them is the entire job, and a healthy instance accumulates
     them forever. Surfacing that pile as an alert trains you to ignore the
     hero. What does want a human is a service that never works at all — a
     usenet indexer whose NZB downloads are all rejected (expired plan, stale
-    API key), or a source whose probes fail every single time. Only those.
+    API key), or a source whose recent probes fail every single time.
 
     Both bars are the ones the engines already use to give up on an endpoint,
     so the hero can't disagree with Health about what is actually broken.
+    Sources the operator has already answered for — dismissed, or blocked
+    outright — are not raised again; that decision lives in source_health.
     """
     names: list[str] = []
     try:
@@ -92,11 +103,13 @@ def _broken_services(recs: list[dict]) -> list[str]:
                   if not r.get("fetch_allowed", True)]
     except Exception:                                # health db absent/locked
         pass
-    probes = [r for r in recs if r.get("kind") == "probe"]
+    cutoff = time.time() - _RECENT_HOURS * 3600
+    probes = [r for r in recs if r.get("kind") == "probe"
+              and (r.get("ts") or 0) >= cutoff]
     names += [r["key"] for r in
               telemetry.aggregate(probes, "src", min_n=_DEAD_SOURCE_PROBES)
               if r["fail_pct"] >= 100.0 and r["key"] != "(none)"]
-    return sorted(dict.fromkeys(names))
+    return sorted({n for n in names if not source_health.state(n)})
 
 
 def _screened(blocks: list[dict]) -> str:
@@ -114,9 +127,10 @@ def _hero(recs: list[dict], blocks: list[dict], names: dict[str, str]) -> str:
     restart = config.restart_pending()
     playing = proxy.active_stream_details()
     plays = [r for r in recs if r.get("kind") == "play"]
+    stalled = usenet_health.transport_stalled()
     # only when it can reach the screen — scanning probes costs a pass over
     # the whole telemetry window
-    broken = [] if restart or playing else _broken_services(recs)
+    broken = [] if restart or playing or stalled else _broken_services(recs)
 
     if restart:
         state, dot, sub, act = (
@@ -124,6 +138,24 @@ def _hero(recs: list[dict], blocks: list[dict], names: dict[str, str]) -> str:
             "Saved settings only take effect on the way back up. The save bar "
             "below has the restart button.",
             "")
+    elif stalled:
+        # Outranks "Streaming now" deliberately. When the usenet pipe wedges,
+        # whatever is still on screen is playing out of the read-ahead buffer
+        # and is about to stop — so the person looking at this page is looking
+        # at a spinner, and "all good, streaming" is the least useful sentence
+        # we could show them. It also outranks the per-source alarm, because
+        # naming three innocent releases sends them hunting the wrong thing.
+        mins = max(1, stalled["for_secs"] // 60)
+        state, dot, sub, act = (
+            "Usenet delivery has stalled", "warn",
+            f"{stalled['releases']} different releases have failed to deliver "
+            f"a byte in the last {mins} minute{'s' if mins != 1 else ''}, and "
+            "nothing has succeeded in between — that is the connection to your "
+            "news provider, not the releases. Restarting nzbdav clears it; its "
+            "connection pool fills with dead sockets over a long uptime. "
+            "Torrent and debrid sources are unaffected.",
+            f"<a class='btn ghost' href='/health/sources'>"
+            f"{uitheme.icon('activity')}See the failures</a>")
     elif playing:
         first = playing[0]
         title = names.get(first.get("media_id", ""),
@@ -135,16 +167,22 @@ def _hero(recs: list[dict], blocks: list[dict], names: dict[str, str]) -> str:
             "failover and read-ahead are live.",
             "")
     elif broken:
-        shown = ", ".join(broken[:3])
+        # Each name is its own link: the answer to "what do I do about this"
+        # is per source — its errors, whose addon it is, and the buttons that
+        # end the warning — so the click has to land there, not on the dump.
+        shown = ", ".join(
+            f"<a href='/health/source/{quote(n)}'>{_esc(n)}</a>"
+            for n in broken[:3])
         more = f" +{len(broken) - 3} more" if len(broken) > 3 else ""
+        first = quote(broken[0])
         state, dot, sub, act = (
             f"{len(broken)} source{'s' if len(broken) != 1 else ''} failing "
             "every time", "warn",
-            f"<b>{_esc(shown)}</b>{more} never returned a working result — "
-            "usually an expired plan or a stale API key. Everything else is "
-            "picking normally.",
-            f"<a class='btn ghost' href='/health/sources'>"
-            f"{uitheme.icon('activity')}Open Health</a>")
+            f"<b>{shown}</b>{more} returned nothing usable in the last "
+            f"{int(_RECENT_HOURS)}h — usually an expired plan or a stale API "
+            "key. Everything else is picking normally.",
+            f"<a class='btn ghost' href='/health/source/{first}'>"
+            f"{uitheme.icon('activity')}Open {_esc(broken[0])}</a>")
     elif plays:
         total_mb = sum(r.get("mb") or 0 for r in plays)
         dv, du = overview._data(total_mb)

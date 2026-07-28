@@ -24,6 +24,45 @@ def _request(method="GET", range_header=""):
                     "scheme": "http"})
 
 
+class ThinResultPolicyTests(unittest.TestCase):
+    """When a public search comes back thin, private trackers get a look.
+
+    The threshold used to be zero and hard-coded: private was reachable only
+    once the ordinary path found nothing at all.
+    """
+
+    def setUp(self):
+        self.enabled = mock.patch.object(private_trackers, "enabled",
+                                         return_value=True)
+        self.enabled.start()
+        self.addCleanup(self.enabled.stop)
+
+    def _with_threshold(self, value):
+        return mock.patch.object(private_trackers, "MIN_PUBLIC_SOURCES", value)
+
+    def test_zero_keeps_private_a_last_resort(self):
+        with self._with_threshold(0):
+            self.assertFalse(private_trackers.should_search(0))
+            self.assertFalse(private_trackers.should_search(9))
+
+    def test_a_threshold_fires_only_on_thin_results(self):
+        with self._with_threshold(5):
+            self.assertTrue(private_trackers.should_search(4))
+            self.assertFalse(private_trackers.should_search(5))
+            self.assertFalse(private_trackers.should_search(12))
+
+    def test_minus_one_always_searches(self):
+        with self._with_threshold(-1):
+            self.assertTrue(private_trackers.should_search(0))
+            self.assertTrue(private_trackers.should_search(500))
+
+    def test_unconfigured_trackers_are_never_searched(self):
+        with self._with_threshold(-1), \
+                mock.patch.object(private_trackers, "enabled",
+                                  return_value=False):
+            self.assertFalse(private_trackers.should_search(0))
+
+
 class ReleasePolicyTests(unittest.TestCase):
     def test_foreign_series_searches_canonical_and_native_titles(self):
         queries = private_trackers._query_strings(

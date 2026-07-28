@@ -100,6 +100,13 @@ _client = httpx.AsyncClient(
 _sessions: dict[str, tuple[float, dict]] = {}
 _sess_compact_after = SESS_MAX_BYTES
 _start_locks: dict[str, asyncio.Lock] = {}
+# In-flight direct (unbuffered) reads, keyed by an id unique to the response.
+# A buffered stream is discoverable through _entries; a direct one exists only
+# for the life of its generator, so it has to announce itself to be visible on
+# Home. Entries are removed in the generator's finally, including on cancel —
+# a closed player must not leave a card behind.
+_direct: dict[int, dict] = {}
+_direct_seq = 0
 
 # Keep only current full-length release identities for reputation. Byte-cache
 # reuse uses the separate candidate ``cid`` created by _cand(), never this
@@ -765,7 +772,27 @@ async def _select_start(cands: list[dict], range_header: str | None,
         it = resp.aiter_raw()
         prebuf, got, t_first = [], 0, None
         try:
-            async for chunk in it:
+            while True:
+                try:
+                    if t_first is None:
+                        # Waiting past the TTFB budget for a *first* byte is
+                        # pointless — the candidate is rejected at START_TTFB
+                        # regardless. Without this cap a dead source blocks
+                        # here until the client's 60s read timeout (observed
+                        # live: 17.6s of "Starting stream" before a 502).
+                        chunk = await asyncio.wait_for(
+                            it.__anext__(), START_TTFB + 0.5)
+                    else:
+                        chunk = await it.__anext__()
+                except StopAsyncIteration:
+                    break
+                except asyncio.TimeoutError:
+                    logger.info(f"proxy start: cand {idx} dead "
+                                f"(no first byte in {START_TTFB:.0f}s)")
+                    await resp.aclose()
+                    _bad(c, "dead", node=node, extreme=True,
+                         detail=f"dead:no-first-byte-{START_TTFB:.0f}s")
+                    return None
                 now = time.monotonic()
                 if t_first is None:
                     t_first = now
@@ -778,6 +805,14 @@ async def _select_start(cands: list[dict], range_header: str | None,
             await resp.aclose()
             _bad(c, "read-fail", node=node,
                  detail=f"read-fail:{type(e).__name__}")
+            return None
+        if got == 0:
+            # Connected, replied, delivered nothing. That is a corpse, not a
+            # slow link — labelling it "slow" let it burn a second session's
+            # patience before reputation caught up.
+            logger.info(f"proxy start: cand {idx} dead (connected, zero bytes)")
+            await resp.aclose()
+            _bad(c, "dead", node=node, extreme=True, detail="dead:zero-bytes")
             return None
         # A 200/206 that isn't actually a media container = an error page / wrong
         # file from an expired or uncached debrid link. Serving it gives the player
@@ -834,6 +869,21 @@ async def _select_start(cands: list[dict], range_header: str | None,
                         f"transport-stream cand {idx} ({res[-1]}) as last resort")
             _good(c)
             return res[:-1]
+    # Pass 3: one short second chance for NZB sources. nzbdav mount readiness
+    # flaps while an import settles — observed live: probe OK at 5 MB/s, dead
+    # 11s later, playing fine on the player's own third retry. Two seconds of
+    # patience here turns that whole 502 loop into one slightly slower start.
+    retry = [(idx, c) for idx, c in enumerate(cands)
+             if (c.get("sig") or "").startswith("nzb:")]
+    if retry and NZB_START_RETRY_SECS > 0:
+        await asyncio.sleep(NZB_START_RETRY_SECS)
+        for idx, c in retry:
+            res = await _attempt(idx, c)
+            if res is not None:
+                logger.info(f"proxy start: nzb cand {idx} recovered on retry "
+                            f"after {NZB_START_RETRY_SECS:.0f}s")
+                _good(c)
+                return res[:-1]
     return None
 
 
@@ -1006,14 +1056,34 @@ def _arm_reject_timer(e: "_Entry", token: str) -> None:
         try:
             await asyncio.sleep(_REJECT_SILENCE_SECS)
             if (state.get("rejected") or state.get("real_play")
-                    or e.consumers > 0):
-                return                 # reattached or resolved meanwhile
+                    or e.consumers > 0
+                    or time.time() - (e.last or 0.0) < _REJECT_SILENCE_SECS):
+                # Reattached or resolved meanwhile. `consumers` alone was too
+                # strict twice over: a range past the write head is served
+                # directly with no consumer ref, and a player streaming from
+                # its own buffer holds no connection between cache reads —
+                # observed live as a release cooled *while the viewer was
+                # watching it*. Any request that touched this entry inside the
+                # silence window (e.last) means the player is still here.
+                return
             _mark_rejected(state, sig=_release_sig(e),
                            label=(e.source or {}).get("lbl", ""), node=e.node,
                            token=token, picker=e.picker, media_id=e.media_id,
                            detail=f"{state.get('false_starts', 0)} false starts"
                                   f" then {_REJECT_SILENCE_SECS:.0f}s silence")
-            _spawn_learn(e, played=False)
+            if e.avail >= DECODE_LEARN_MIN_BYTES or e.complete:
+                _spawn_learn(e, played=False)
+            else:
+                # The producer never delivered enough for the player to make a
+                # codec decision — this is starvation wearing a rejection's
+                # clothes. Cooling the release above is still right; blaming
+                # its codecs is not (that is how AAC and H.264 earned ~17%
+                # "failure" rates here).
+                logger.info(
+                    f"decode-health: not striking codecs for "
+                    f"{(e.source or {}).get('lbl', '')!r} — only "
+                    f"{e.avail // 1024 // 1024} MB was ever available "
+                    f"(starved, not undecodable)")
         finally:
             state["timer_armed"] = False
 
@@ -1271,6 +1341,33 @@ BUFFER_READ_CHUNK = int(os.environ.get("BUFFER_READ_CHUNK", str(4 * 1024 * 1024)
 # while a reader is waiting at the write head, jump to a byte-identical twin node.
 BUFFER_SLOW_WINDOW = float(os.environ.get("BUFFER_SLOW_WINDOW", "8"))
 BUFFER_SLOW_MARGIN = float(os.environ.get("BUFFER_SLOW_MARGIN", "0.9"))
+# How long after the last reader touch the producer keeps filling with no reader
+# attached. Players that fetch in discrete ranges — request a chunk, disconnect,
+# come back a minute later — drop `consumers` to zero between requests, and a
+# request landing past the write head is served directly and takes no consumer
+# ref at all. Pausing strictly on `consumers > 0` therefore parked the producer
+# permanently: the buffer froze and every later range was fetched cold from
+# upstream, which is what a viewer experiences as endless buffering. Keeping the
+# fill alive across the gap costs at most this much read-ahead on a stream that
+# really was abandoned, and the reaper still evicts it afterwards.
+BUFFER_IDLE_GRACE = float(os.environ.get("BUFFER_IDLE_GRACE", "180"))
+# The tail of the file, fetched eagerly when a producer starts. Players read
+# the container index (MKV cues / MP4 moov-at-end) from EOF the moment they
+# open a stream — observed live: a reader at offset 368,449,152 of a
+# 368,477,225-byte file while the sequential cache held only the front. Without
+# this, every open and every seek pays a cold upstream fetch for those bytes.
+BUFFER_TAIL_BYTES = int(float(os.environ.get("BUFFER_TAIL_MB", "8")) * 1024 * 1024)
+# One quick second chance for an NZB source that failed to start: nzbdav mount
+# readiness flaps while an import settles (observed: probe OK at 5 MB/s, dead
+# 11s later, playing fine 26s after that). Public debrid links don't flap this
+# way, so the retry is nzb-scoped. 0 disables.
+NZB_START_RETRY_SECS = float(os.environ.get("NZB_START_RETRY_SECS", "2.0"))
+# A rejection may only strike the file's codecs when the player provably had
+# enough of the file to make a codec decision. Below this, the verdict is
+# "starved", and blaming codecs would poison decode-health — which is exactly
+# how AAC and H.264 ended up with ~17% "failure" rates in the live store.
+DECODE_LEARN_MIN_BYTES = int(float(os.environ.get(
+    "DECODE_LEARN_MIN_MB", "8")) * 1024 * 1024)
 # Next-episode prefetch: the moment a series episode starts playing, run the
 # search+pick for episode E+1 and cache the *result list* — no stream bytes are
 # downloaded — so opening the next episode is an instant cache hit.
@@ -1280,7 +1377,8 @@ PREFETCH_NEXT = os.environ.get("PREFETCH_NEXT", "1") not in ("0", "false", "")
 class _Entry:
     __slots__ = ("sig", "path", "total", "avail", "complete", "failed", "source",
                  "cands", "producer", "consumers", "head", "last", "cond",
-                 "content_type", "picker", "media_id", "node", "playfail")
+                 "content_type", "picker", "media_id", "node", "playfail",
+                 "tail", "tail_off")
 
     def __init__(self, sig, path, cands, source, content_type, total, picker, media_id):
         self.sig = sig                    # exact cache id (not reputation signature)
@@ -1293,6 +1391,8 @@ class _Entry:
         self.source = source          # cand dict currently feeding the file
         self.cands = cands            # all byte-identical sources for this release
         self.producer = None
+        self.tail = None                  # last BUFFER_TAIL_BYTES of the file
+        self.tail_off = 0                 # absolute offset of tail[0]
         self.consumers = 0
         self.head = 0                 # furthest reader position (backpressure anchor)
         self.last = time.time()
@@ -1326,7 +1426,14 @@ def active_streams() -> int:
 
 def active_stream_details() -> list[dict]:
     """Return rich metadata for every stream with an active reader — used by
-    the overview dashboard's "Now Playing" section.  Pure in-memory read."""
+    the overview dashboard's "Now Playing" section.  Pure in-memory read.
+
+    Both delivery paths, because both reach a screen. A buffered entry counts
+    readers on the cache file; a direct read (a seek, or a session that never
+    cached) has no entry to count, so it registers itself in `_direct` for as
+    long as bytes are moving. Reporting only the buffered half is what left
+    Home blank while something was plainly playing.
+    """
     out = []
     for e in _entries.values():
         if e.consumers <= 0:
@@ -1342,7 +1449,9 @@ def active_stream_details() -> list[dict]:
             "total":    e.total,
             "consumers": e.consumers,
             "picker":   e.picker or "",
+            "mode":     "buffered",
         })
+    out.extend(_direct.values())
     return out
 
 
@@ -1392,6 +1501,62 @@ async def serve_hls(token: str, request) -> Response:
     return await hlsproxy.serve_resource(token, entry, request)
 
 
+# sig -> (when, avail) at the previous watchdog tick, for rate + stall detection
+_fill_marks: dict[str, tuple[float, int]] = {}
+
+
+async def _watch_fill(now: float) -> None:
+    """Record how fast each live entry is filling, and alarm when it isn't.
+
+    Written because a producer once parked with a viewer still asking for
+    bytes and *nothing was recorded at all*: the buffer silently stopped
+    growing, every later range was fetched cold from upstream, and the only
+    way to establish that was stat()-ing the cache file by hand twice. A
+    stalled fill is the single most useful fact about a misbehaving stream,
+    so it is now an event with the numbers attached rather than an inference.
+
+    Emits `fill` while bytes are moving and `stalled` when they are not,
+    for entries a reader still wants. Cheap: one pass per reap interval.
+    """
+    for e in list(_entries.values()):
+        if e.complete or e.failed:
+            _fill_marks.pop(e.sig, None)
+            continue
+        mark = _fill_marks.get(e.sig)
+        _fill_marks[e.sig] = (now, e.avail)
+        if mark is None:
+            continue
+        elapsed = now - mark[0]
+        if elapsed <= 0:
+            continue
+        gained = e.avail - mark[1]
+        mbps = (gained * 8 / elapsed) / 1e6
+        wanted = _reader_interested(e)
+        if gained <= 0 and wanted:
+            logger.warning(
+                "bufcache %s: fill STALLED at %d/%s bytes for %.0fs "
+                "(readers=%d, head=%d) — reader still waiting",
+                e.sig, e.avail, e.total, elapsed, e.consumers, e.head)
+            telemetry.record_buffer(
+                "stalled", sig=_release_sig(e), picker=e.picker,
+                media_id=e.media_id, source=(e.source or {}).get("lbl", ""),
+                dbr=(e.source or {}).get("dbr", ""), node=e.node,
+                offset=e.head, avail=e.avail, total=e.total, mbps=0.0,
+                reason=f"no bytes in {elapsed:.0f}s, readers={e.consumers}")
+            # Belt and braces: whatever parked it, wake it. The producer
+            # re-evaluates its own pause condition, so this is a no-op when it
+            # is legitimately paused and a rescue when it is not.
+            async with e.cond:
+                e.cond.notify_all()
+        elif gained > 0:
+            telemetry.record_buffer(
+                "fill", sig=_release_sig(e), picker=e.picker,
+                media_id=e.media_id, source=(e.source or {}).get("lbl", ""),
+                dbr=(e.source or {}).get("dbr", ""), node=e.node,
+                offset=e.head, avail=e.avail, total=e.total, mbps=round(mbps, 2),
+                reason=f"readers={e.consumers}")
+
+
 async def _reaper() -> None:
     """Keep the cache inside its budget: drop entries idle past BUFFER_TTL, and
     when total on-disk exceeds BUFFER_CACHE_BYTES evict least-recently-used ones
@@ -1403,6 +1568,7 @@ async def _reaper() -> None:
             _prune_sessions()
             if PROXY_BUFFER:
                 now = time.time()
+                await _watch_fill(now)
                 for e in list(_entries.values()):
                     if e.consumers <= 0 and now - e.last > BUFFER_TTL:
                         logger.info(f"bufcache: TTL-evict {e.sig} "
@@ -1530,10 +1696,15 @@ async def _produce(e: _Entry, token: str, resp, it, prebuf: list) -> None:
             e.avail += sum(len(c) for c in prebuf)
             e.cond.notify_all()
         tried = {e.source["u"]} if e.source else set()
+        if e.total and e.total > BUFFER_TAIL_BYTES * 2:
+            t = asyncio.create_task(_fetch_tail(e))
+            _bg_tasks.add(t)
+            t.add_done_callback(_reap_task)
         while True:
             async with e.cond:            # backpressure + pause when nobody's watching
                 await e.cond.wait_for(
-                    lambda: e.consumers > 0 and e.avail - e.head <= BUFFER_AHEAD_BYTES)
+                    lambda: _reader_interested(e)
+                    and e.avail - e.head <= BUFFER_AHEAD_BYTES)
             try:
                 chunk = await it.__anext__()
             except StopAsyncIteration:
@@ -1985,7 +2156,17 @@ async def _serve_direct(session: dict, cands: list, request, token: str,
     be tried after its preferred source."""
     rh = request.headers.get("range")
     offset, _, had_range = _parse_range(rh)
-    seek = _suffix_length(rh) is not None or (had_range and offset > 0)
+    suffix = _suffix_length(rh)
+    seek = suffix is not None or (had_range and offset > 0)
+    if suffix is not None and expected_total:
+        # Rewrite `bytes=-N` to its absolute equivalent before asking upstream.
+        # Both forms are legal HTTP; not every server agrees. nzbdav parses the
+        # header by splitting on "-" and dropping empty parts, so the suffix
+        # form comes back as the *head* of the file — which _range_response_ok
+        # rightly refuses, turning a player's opening index read into a 502.
+        # Asking the unambiguous way costs nothing. `seek` is decided above,
+        # from the original header, so this cannot change failover behaviour.
+        rh = f"bytes={max(0, expected_total - suffix)}-{expected_total - 1}"
     anchor = source or (cands[0] if cands else None)
     if seek and source is None:
         # A seek-first request without a persisted selection has no safe release
@@ -2011,9 +2192,29 @@ async def _serve_direct(session: dict, cands: list, request, token: str,
             if not seek:
                 _pin_selection(token, session, session.get("cands") or cands, c)
             async def gen(resp=resp, cand=c):
+                global _direct_seq
                 current = resp
                 base, promised = _response_span(current, expected_total)
                 sent, retries = 0, 0
+                _direct_seq += 1
+                card_id = _direct_seq
+                card = {
+                    "media_id": session.get("id", "") or "",
+                    "label":    cand.get("lbl", ""),
+                    "debrid":   cand.get("dbr", ""),
+                    "res":      cand.get("res", 0),
+                    "node":     "",
+                    # A direct read has no cache file behind it, so there is no
+                    # buffered-ahead figure to show. `total` stays None and the
+                    # card renders without a progress meter rather than with a
+                    # meaningless full one.
+                    "avail":    0,
+                    "total":    None,
+                    "consumers": 1,
+                    "picker":   session.get("picker", "") or "",
+                    "mode":     "direct",
+                }
+                _direct[card_id] = card
                 try:
                     while True:
                         failed = False
@@ -2060,6 +2261,7 @@ async def _serve_direct(session: dict, cands: list, request, token: str,
                 except asyncio.CancelledError:
                     raise
                 finally:
+                    _direct.pop(card_id, None)
                     try:
                         await current.aclose()
                     except Exception:
@@ -2074,6 +2276,81 @@ async def _serve_direct(session: dict, cands: list, request, token: str,
                     else "bad-content-range"))
         await resp.aclose()
     return Response(status_code=502)
+
+
+async def _fetch_tail(e: _Entry) -> None:
+    """Pull the file's tail into memory so index reads never go upstream.
+
+    Best-effort and silent on failure: without it, tail ranges simply keep
+    falling through to the direct path exactly as before.
+    """
+    want = min(BUFFER_TAIL_BYTES, e.total or 0)
+    if want <= 0 or not e.source:
+        return
+    # Absolute range, never `bytes=-N`. The suffix form is the natural way to
+    # ask for a tail and it is what this used to send — but nzbdav parses it by
+    # splitting on "-" and discarding empties, so `bytes=-8388608` comes back as
+    # the first 8 MB of the file. _range_response_ok correctly refuses that, and
+    # tail warming then silently never happened on the one lane it was written
+    # for. We always know `total` here (`want` is derived from it), so there is
+    # no reason to use the ambiguous form at all.
+    rh = f"bytes={e.total - want}-{e.total - 1}"
+    try:
+        resp = await _send(e.source, rh)
+    except Exception:
+        return
+    try:
+        if not _range_response_ok(resp, rh):
+            return
+        chunks, got = [], 0
+        async for chunk in resp.aiter_raw():
+            chunks.append(chunk)
+            got += len(chunk)
+            if got > want:                       # server ignored the range
+                return
+        if got != want:
+            return
+        e.tail = b"".join(chunks)
+        e.tail_off = (e.total or want) - want
+        async with e.cond:
+            e.cond.notify_all()
+        logger.info(f"bufcache {e.sig}: tail warmed ({want // 1024} KB @ "
+                    f"{e.tail_off})")
+    except Exception:
+        pass
+    finally:
+        try:
+            await resp.aclose()
+        except Exception:
+            pass
+
+
+def _tail_response(e: _Entry, offset: int, end: int | None):
+    """Serve a range entirely inside the warmed tail from memory, or None."""
+    if e.tail is None or e.total is None or offset < e.tail_off:
+        return None
+    last = min(end if end is not None else e.total - 1, e.total - 1)
+    if last < offset:
+        return None
+    data = e.tail[offset - e.tail_off:last + 1 - e.tail_off]
+    return Response(
+        content=data, status_code=206,
+        headers={"Accept-Ranges": "bytes",
+                 "Content-Range": f"bytes {offset}-{last}/{e.total}",
+                 "Content-Length": str(len(data)),
+                 "Content-Type": e.content_type or "application/octet-stream"})
+
+
+def _reader_interested(e: _Entry) -> bool:
+    """Whether the producer should keep filling this entry.
+
+    A live reader obviously counts. So does one that touched the entry within
+    BUFFER_IDLE_GRACE: a player fetching in discrete ranges holds no connection
+    between them, and a range past the write head is served directly without
+    ever taking a consumer ref. Judging solely on `consumers` mistakes that for
+    an abandoned stream.
+    """
+    return e.consumers > 0 or (time.time() - (e.last or 0.0)) < BUFFER_IDLE_GRACE
 
 
 async def _serve_buffered(token: str, session: dict, cands: list, offset: int,
@@ -2105,6 +2382,24 @@ async def _serve_buffered(token: str, session: dict, cands: list, offset: int,
     # Seek ahead of what's cached (and not done): pass through directly rather than
     # block waiting for the sequential fill to reach it.
     if offset >= e.avail and not e.complete:
+        # Index/cue reads land here: serve them from the warmed tail with zero
+        # upstream round-trips. This is the range every player asks for on open.
+        tail = _tail_response(e, offset, end)
+        if tail is not None:
+            return tail
+        # Serving this range directly must not read as "nobody is watching".
+        # This request is a reader — it just wants bytes the fill hasn't reached
+        # — so wake the producer. Without this it stays parked on its consumer
+        # check and the entry never fills again, degrading the whole title to a
+        # cold fetch per range.
+        #
+        # Deliberately NOT advancing e.head. That is the backpressure anchor,
+        # and a player reads the container index from the tail the moment it
+        # opens a file: pinning head at EOF from one such probe leaves
+        # avail-head permanently negative, so the producer would never pause
+        # and would fetch the whole file however little of it gets watched.
+        async with e.cond:
+            e.cond.notify_all()
         if offset == 0 and e.failed:                    # producer never got going
             return await _serve_direct(session, e.cands, request, token,
                                        source=e.source, expected_total=e.total)
@@ -2157,6 +2452,13 @@ async def serve(token: str, request) -> Response:
         cache_id = entry.get("bufcid") or entry.get("bufsig")
         cached = _entries.get(cache_id) if cache_id else None
         if cached is not None:
+            # A suffix range is the classic on-open index read; the warmed
+            # tail answers it from memory.
+            if cached.total is not None:
+                tail = _tail_response(cached, max(0, cached.total - suffix),
+                                      None)
+                if tail is not None:
+                    return tail
             return await _serve_direct(entry, cached.cands, request, token,
                                        source=cached.source,
                                        expected_total=cached.total)

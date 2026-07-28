@@ -83,6 +83,28 @@ RELEASE_RANK = {
     for index, kind in enumerate(RELEASE_ORDER)
 }
 MIN_SEEDERS = max(0, int(os.environ.get("PRIVATE_TRACKER_MIN_SEEDERS", "5")))
+# How thin an ordinary result has to be before private trackers are consulted
+# as well. Private searching used to be reachable only when the public path
+# found *nothing*, which is a threshold of zero hard-coded into picker.py.
+#   0  keep that: last resort only
+#   N  also search when fewer than N distinct public releases were found
+#  -1  always search, alongside every slow pick
+# One number rather than a separate always-on switch, so there is a single
+# place to look when asking "why did this hit my trackers".
+try:
+    MIN_PUBLIC_SOURCES = int(os.environ.get("PRIVATE_TRACKER_MIN_SOURCES", "0"))
+except (TypeError, ValueError):
+    MIN_PUBLIC_SOURCES = 0
+
+
+def should_search(public_releases: int) -> bool:
+    """Whether a pick that found `public_releases` distinct releases should
+    also consult the private trackers. Never true when they are not set up."""
+    if not enabled():
+        return False
+    if MIN_PUBLIC_SOURCES < 0:
+        return True
+    return public_releases < MIN_PUBLIC_SOURCES
 MAX_TORRENT_GB = max(0.0, float(os.environ.get(
     "PRIVATE_TRACKER_MAX_TORRENT_GB", "0")))
 MAX_ACTIVE_DOWNLOADS = max(0, int(os.environ.get(

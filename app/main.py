@@ -7,6 +7,7 @@ import pathlib
 import re
 import secrets
 import signal
+from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
@@ -30,8 +31,9 @@ except ValueError as exc:
 from app import (acquire, admin_auth, adminui, anime, connect_ui, connections,  # noqa: E402
                  dashboard, envref, home_ui, library, meta, picker, picks_ui,
                  private_trackers, private_ui, probe, prowlarr, proxy,
-                 recs_mount, reputation, scrapers, sources, tbcache, telemetry,
-                 tune_ui, usenet, usenet_health, vprobe, wizard)
+                 recs_mount, reputation, scrapers, source_health, source_ui,
+                 sources, tbcache, telemetry, tune_ui, usenet, usenet_health,
+                 vprobe, wizard)
 
 NOTICE_FILE = pathlib.Path(__file__).parent / "static" / "notice.mp4"
 NOTICE_THEATRICAL_FILE = (pathlib.Path(__file__).parent / "static"
@@ -439,6 +441,14 @@ async def health_page(request: Request, min_n: int = 3):
     return HTMLResponse(dashboard.render(telemetry.load(), blocks, min_n=min_n))
 
 
+@app.get("/health/source/{name:path}")
+async def source_page(request: Request, name: str):
+    """One source's own page. The home-page warning names a source; landing
+    that link on the full health dump leaves you to find it again yourself."""
+    await _admin(request)
+    return HTMLResponse(source_ui.render(name, telemetry.load()))
+
+
 @app.get("/connections")
 async def connections_page(request: Request):
     await _admin(request)
@@ -600,6 +610,27 @@ async def unblock(request: Request, sig: str):
     else:
         reputation.unblock(sig)
     return RedirectResponse(url="/health/sources", status_code=303)
+
+
+@app.post("/api/source/dismiss")
+async def source_dismiss(request: Request, name: str):
+    await _admin(request, mutation=True)
+    source_health.dismiss(name)
+    return RedirectResponse(url=f"/health/source/{quote(name)}", status_code=303)
+
+
+@app.post("/api/source/block")
+async def source_block(request: Request, name: str):
+    await _admin(request, mutation=True)
+    source_health.block(name)
+    return RedirectResponse(url=f"/health/source/{quote(name)}", status_code=303)
+
+
+@app.post("/api/source/clear")
+async def source_clear(request: Request, name: str):
+    await _admin(request, mutation=True)
+    source_health.clear(name)
+    return RedirectResponse(url=f"/health/source/{quote(name)}", status_code=303)
 
 
 @app.post("/api/decode/clear")

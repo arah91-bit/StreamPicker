@@ -561,9 +561,16 @@ def record_buffer(event: str, *, sig: str = "", picker: str = "",
     """One durable record per notable event on the buffering proxy's *producer*
     side — the part playback records can't see because it happens behind the
     read-ahead buffer. `event` is start | drop | reconnect | failed | twin | slow
-    | complete. This is the post-mortem trail: when a stream misbehaves, these
-    lines say which source fed it, where (byte offset) it dropped or slowed, what
-    it switched to, and whether it ever recovered. Persisted to probes.jsonl."""
+    | complete | fill | stalled. This is the post-mortem trail: when a stream
+    misbehaves, these lines say which source fed it, where (byte offset) it
+    dropped or slowed, what it switched to, and whether it ever recovered.
+
+    `fill` and `stalled` are the periodic pair, sampled once per reap interval.
+    They exist because every other event here is edge-triggered: a producer
+    that simply stopped writing matched none of them, so a frozen buffer with a
+    viewer still waiting on it left no trace at all and had to be caught by
+    stat()-ing the cache file by hand. `mbps` with `avail`/`total` makes fill
+    rate reconstructable after the fact. Persisted to probes.jsonl."""
     _append({
         "ts": round(time.time(), 1),
         "kind": "buffer",

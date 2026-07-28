@@ -2,8 +2,9 @@ import asyncio
 import json
 import os
 import tempfile
+import time
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from app import content_identity, proxy, telemetry
 
@@ -402,11 +403,178 @@ class ActiveStreamDetailsTests(unittest.TestCase):
 
     def setUp(self):
         self._saved = dict(proxy._entries)
+        self._saved_direct = dict(proxy._direct)
         proxy._entries.clear()
+        proxy._direct.clear()
 
     def tearDown(self):
         proxy._entries.clear()
         proxy._entries.update(self._saved)
+        proxy._direct.clear()
+        proxy._direct.update(self._saved_direct)
+
+    def test_tail_range_is_served_from_memory(self):
+        """The on-open index read (MKV cues at EOF) must not go upstream."""
+        e = proxy._Entry("sigT", "/tmp/sigT", [], {"lbl": "X"},
+                         "video/x-matroska", 1000, "fast", "tt1")
+        e.tail, e.tail_off = b"0123456789", 990
+
+        r = proxy._tail_response(e, 995, None)
+
+        self.assertEqual(206, r.status_code)
+        self.assertEqual(b"56789", r.body)
+        self.assertEqual("bytes 995-999/1000", r.headers["content-range"])
+        self.assertEqual("video/x-matroska", r.headers["content-type"])
+
+    def test_range_before_the_tail_falls_through(self):
+        e = proxy._Entry("sigT2", "/tmp/sigT2", [], {"lbl": "X"},
+                         None, 1000, "fast", "tt1")
+        e.tail, e.tail_off = b"0123456789", 990
+
+        self.assertIsNone(proxy._tail_response(e, 100, None))
+        self.assertIsNone(proxy._tail_response(e, 989, None))
+
+    def test_no_tail_yet_falls_through(self):
+        e = proxy._Entry("sigT3", "/tmp/sigT3", [], {"lbl": "X"},
+                         None, 1000, "fast", "tt1")
+
+        self.assertIsNone(proxy._tail_response(e, 995, None))
+
+    def test_bounded_tail_range_respects_end(self):
+        e = proxy._Entry("sigT4", "/tmp/sigT4", [], {"lbl": "X"},
+                         None, 1000, "fast", "tt1")
+        e.tail, e.tail_off = b"0123456789", 990
+
+        r = proxy._tail_response(e, 992, 994)
+
+        self.assertEqual(b"234", r.body)
+        self.assertEqual("bytes 992-994/1000", r.headers["content-range"])
+
+    def test_a_frozen_fill_with_a_waiting_reader_is_recorded(self):
+        """The event that was missing. A producer that stops writing matched no
+        edge-triggered event, so the only way to establish a frozen buffer was
+        stat()-ing the cache file twice by hand."""
+        e = proxy._Entry("sigS", "/tmp/sigS", [], {"lbl": "X"}, None, 1000,
+                         "fast", "tt1")
+        e.avail, e.consumers, e.last = 500, 0, time.time()
+        proxy._entries["sigS"] = e
+        proxy._fill_marks.clear()
+
+        with patch("app.proxy.telemetry.record_buffer") as rec:
+            asyncio.run(proxy._watch_fill(time.time()))       # first tick: mark
+            self.assertEqual(0, rec.call_count)
+            asyncio.run(proxy._watch_fill(time.time() + 60))  # second: no gain
+
+        self.assertEqual("stalled", rec.call_args.args[0])
+        self.assertEqual(0.0, rec.call_args.kwargs["mbps"])
+        self.assertEqual(500, rec.call_args.kwargs["avail"])
+        proxy._fill_marks.clear()
+
+    def test_a_healthy_fill_records_its_rate(self):
+        e = proxy._Entry("sigR", "/tmp/sigR", [], {"lbl": "X"}, None, 10_000_000,
+                         "fast", "tt1")
+        e.avail, e.consumers, e.last = 0, 1, time.time()
+        proxy._entries["sigR"] = e
+        proxy._fill_marks.clear()
+
+        with patch("app.proxy.telemetry.record_buffer") as rec:
+            asyncio.run(proxy._watch_fill(time.time()))
+            e.avail = 8_000_000                              # 8 MB in 60s
+            asyncio.run(proxy._watch_fill(time.time() + 60))
+
+        self.assertEqual("fill", rec.call_args.args[0])
+        self.assertAlmostEqual(1.07, rec.call_args.kwargs["mbps"], places=1)
+        proxy._fill_marks.clear()
+
+    def test_an_abandoned_stream_does_not_alarm(self):
+        e = proxy._Entry("sigA2", "/tmp/sigA2", [], {"lbl": "X"}, None, 1000,
+                         "fast", "tt1")
+        e.avail, e.consumers = 500, 0
+        e.last = time.time() - proxy.BUFFER_IDLE_GRACE - 1   # nobody waiting
+        proxy._entries["sigA2"] = e
+        proxy._fill_marks.clear()
+
+        with patch("app.proxy.telemetry.record_buffer") as rec:
+            asyncio.run(proxy._watch_fill(time.time()))
+            asyncio.run(proxy._watch_fill(time.time() + 60))
+
+        rec.assert_not_called()
+        proxy._fill_marks.clear()
+
+    def test_a_tail_probe_does_not_disable_backpressure(self):
+        """Players read the container index from the end of the file on open.
+        Letting that seek advance the backpressure anchor would leave
+        avail-head negative forever, so the producer would never pause and
+        would fetch a whole 4K remux for a viewer who watched ten minutes."""
+        e = proxy._Entry("sigB", "/tmp/sigB", [], {"lbl": "X"}, None,
+                         50_000_000_000, "fast", "tt1")
+        e.avail, e.head = 1_000_000, 500_000
+
+        self.assertEqual(500_000, e.head)
+        self.assertLess(e.avail - e.head, proxy.BUFFER_AHEAD_BYTES)
+
+    def test_producer_keeps_filling_across_a_reader_gap(self):
+        """The bug that froze a 4.66 GB stream at 14.9%.
+
+        A player fetching discrete ranges drops `consumers` to zero between
+        them, and a range past the write head is served directly without ever
+        taking a consumer ref. Pausing strictly on `consumers > 0` parked the
+        producer for good: the buffer never grew again and every later range
+        was fetched cold from upstream — endless buffering, no error logged.
+        """
+        e = proxy._Entry("sigF", "/tmp/sigF", [], None, None, None, "fast", "tt1")
+        e.consumers = 0
+        e.last = time.time()                       # a range was just served
+
+        self.assertTrue(proxy._reader_interested(e))
+
+    def test_producer_stops_for_a_genuinely_abandoned_stream(self):
+        e = proxy._Entry("sigG", "/tmp/sigG", [], None, None, None, "fast", "tt1")
+        e.consumers = 0
+        e.last = time.time() - proxy.BUFFER_IDLE_GRACE - 1
+
+        self.assertFalse(proxy._reader_interested(e))
+
+    def test_a_live_reader_always_counts(self):
+        e = proxy._Entry("sigH", "/tmp/sigH", [], None, None, None, "fast", "tt1")
+        e.consumers = 1
+        e.last = time.time() - 10_000              # ancient, but reading now
+
+        self.assertTrue(proxy._reader_interested(e))
+
+    def test_a_direct_read_is_playing_too(self):
+        """A seek, or a session that never cached, is served straight through
+        with no cache entry behind it. Home reported only the buffered half,
+        so a stream plainly playing left the page blank."""
+        proxy._direct[1] = {
+            "media_id": "tt7", "label": "Show.S01E01.1080p.mkv", "debrid": "RD",
+            "res": 1080, "node": "", "avail": 0, "total": None,
+            "consumers": 1, "picker": "fast", "mode": "direct",
+        }
+
+        out = proxy.active_stream_details()
+
+        self.assertEqual(1, len(out))
+        self.assertEqual("tt7", out[0]["media_id"])
+        self.assertEqual("direct", out[0]["mode"])
+        # No cache file behind it, so no buffered-ahead figure to invent.
+        self.assertIsNone(out[0]["total"])
+
+    def test_buffered_and_direct_are_reported_together(self):
+        entry = proxy._Entry("sigA", "/tmp/sigA", [], {"lbl": "A"}, None, None,
+                             "fast", "tt1")
+        entry.consumers = 1
+        proxy._entries["sigA"] = entry
+        proxy._direct[1] = {
+            "media_id": "tt2", "label": "B", "debrid": "", "res": 0,
+            "node": "", "avail": 0, "total": None, "consumers": 1,
+            "picker": "fast", "mode": "direct",
+        }
+
+        out = proxy.active_stream_details()
+
+        self.assertEqual({"tt1", "tt2"}, {d["media_id"] for d in out})
+        self.assertEqual({"buffered", "direct"}, {d["mode"] for d in out})
 
     def test_lists_only_entries_with_readers(self):
         watched = proxy._Entry(
@@ -440,6 +608,179 @@ class ActiveStreamDetailsTests(unittest.TestCase):
         self.assertEqual(1, len(out))
         self.assertEqual("", out[0]["media_id"])
         self.assertIsNone(out[0]["total"])
+
+
+class SuffixRangeTests(unittest.TestCase):
+    """`bytes=-N` is legal HTTP that a real upstream gets wrong.
+
+    nzbdav parses the Range header by splitting on "-" and dropping empty
+    parts, so `bytes=-8388608` is answered with the *first* 8 MB of the file.
+    Verified live: Content-Range came back `bytes 0-8388608/6108448173`. Our
+    validator correctly refuses that — which meant tail warming silently never
+    ran on direct-usenet sources, the one lane it was written for, and a
+    player's opening index read became a 502. Whenever the total is known,
+    ask the unambiguous way.
+    """
+
+    def test_tail_warming_asks_for_an_absolute_range(self):
+        e = proxy._Entry("sigA", "/tmp/sigA", [], {"u": "https://h/f.mkv"},
+                         None, 1000, "fast", "tt1")
+        sent = {}
+
+        async def fake_send(cand, rh):
+            sent["rh"] = rh
+            raise RuntimeError("stop here — the header is the assertion")
+
+        with patch("app.proxy._send", fake_send), \
+             patch("app.proxy.BUFFER_TAIL_BYTES", 100):
+            asyncio.run(proxy._fetch_tail(e))
+
+        self.assertEqual("bytes=900-999", sent["rh"])
+        self.assertNotIn("bytes=-", sent["rh"])
+
+    def test_a_player_suffix_range_is_translated_when_the_total_is_known(self):
+        session = {"id": "tt1", "picker": "fast"}
+        cand = {"sig": "file:" + "a" * 64, "lbl": "X", "u": "https://h/f.mkv"}
+        req = type("R", (), {"headers": {"range": "bytes=-65536"}})()
+        sent = {}
+
+        async def fake_send(c, rh):
+            sent["rh"] = rh
+            raise RuntimeError("stop here")
+
+        with patch("app.proxy._send", fake_send), \
+             patch("app.proxy.telemetry.record_buffer"):
+            asyncio.run(proxy._serve_direct(
+                session, [cand], req, "tok", source=cand,
+                expected_total=1_000_000))
+
+        self.assertEqual("bytes=934464-999999", sent["rh"])
+
+    def test_without_a_known_total_the_suffix_is_left_alone(self):
+        """No total, no safe rewrite — forward it and let validation judge."""
+        session = {"id": "tt1", "picker": "fast"}
+        cand = {"sig": "file:" + "a" * 64, "lbl": "X", "u": "https://h/f.mkv"}
+        req = type("R", (), {"headers": {"range": "bytes=-65536"}})()
+        sent = {}
+
+        async def fake_send(c, rh):
+            sent["rh"] = rh
+            raise RuntimeError("stop here")
+
+        with patch("app.proxy._send", fake_send), \
+             patch("app.proxy.telemetry.record_buffer"):
+            asyncio.run(proxy._serve_direct(
+                session, [cand], req, "tok", source=cand))
+
+        self.assertEqual("bytes=-65536", sent["rh"])
+
+
+class _StartResponse:
+    """An upstream that accepts the request, then behaves as told."""
+
+    def __init__(self, chunks, stall=0.0):
+        self.status_code = 200
+        self.headers = {}
+        self._chunks = chunks
+        self._stall = stall
+        self.closed = False
+
+    async def aclose(self):
+        self.closed = True
+
+    def aiter_raw(self):
+        async def gen():
+            if self._stall:
+                await asyncio.sleep(self._stall)
+            for c in self._chunks:
+                yield c
+        return gen()
+
+
+class DeadStartTests(unittest.TestCase):
+    """A source that delivers no bytes is a corpse, not a slow link.
+
+    Both shapes were previously scored "slow": the candidate burned the whole
+    evaluation deadline before anyone said so, and one bad session was not
+    enough for reputation to cool it, so the very next open served the same
+    corpse again. Live, that read as ~40s of "Starting stream" across two 502
+    rounds for a release nobody could ever have played.
+    """
+
+    def _select(self, cands, rep):
+        with patch("app.proxy.reputation", rep), \
+             patch("app.proxy.telemetry.record_buffer"), \
+             patch("app.proxy.usenet_health"), \
+             patch("app.proxy.START_TTFB", 0.5), \
+             patch("app.proxy.NZB_START_RETRY_SECS", 0):
+            return asyncio.run(
+                proxy._select_start(cands, None, 0, None, "tok"))
+
+    @staticmethod
+    def _rep():
+        rep = MagicMock()
+        rep.blocked.return_value = False
+        rep.cooled.return_value = False
+        return rep
+
+    @staticmethod
+    def _cand():
+        return {"sig": "file:" + "a" * 64, "lbl": "Movie.2024.mkv",
+                "u": "https://host/f.mkv", "dbr": ""}
+
+    def test_a_source_that_never_sends_a_byte_is_dead_not_slow(self):
+        c, rep = self._cand(), self._rep()
+        resp = _StartResponse([b"x" * 4096], stall=30.0)
+
+        with patch("app.proxy._send", AsyncMock(return_value=resp)):
+            self.assertIsNone(self._select([c], rep))
+
+        self.assertTrue(resp.closed)
+        self.assertEqual("dead", rep.observe.call_args.args[2])
+        self.assertTrue(rep.observe.call_args.kwargs["extreme"])
+        rep.cooldown.assert_called_once_with(c["sig"])
+
+    def test_a_source_that_replies_and_sends_nothing_is_dead(self):
+        """HTTP 200, clean EOF, zero bytes — an expired debrid link's calling
+        card. It is not a media container either, but it must be judged dead
+        before that, so the verdict names the real fault."""
+        c, rep = self._cand(), self._rep()
+        resp = _StartResponse([])
+
+        with patch("app.proxy._send", AsyncMock(return_value=resp)):
+            self.assertIsNone(self._select([c], rep))
+
+        self.assertEqual("dead", rep.observe.call_args.args[2])
+        self.assertTrue(rep.observe.call_args.kwargs["extreme"])
+
+    def test_the_wait_for_a_first_byte_is_capped_at_the_ttfb_budget(self):
+        """Waiting past START_TTFB for byte one is time nobody can spend: the
+        candidate is rejected at that budget whenever the byte arrives. Before
+        the cap this blocked on the client's 60s read timeout instead."""
+        c, rep = self._cand(), self._rep()
+        resp = _StartResponse([b"x" * 4096], stall=30.0)
+
+        t0 = time.monotonic()
+        with patch("app.proxy._send", AsyncMock(return_value=resp)):
+            self._select([c], rep)
+        elapsed = time.monotonic() - t0
+
+        self.assertLess(elapsed, 5.0, "dead source held the start gate open")
+
+    def test_a_live_source_after_a_dead_one_still_gets_served(self):
+        """Failing fast is only worth anything if the failover still lands."""
+        dead, live = self._cand(), dict(self._cand(), sig="file:" + "b" * 64,
+                                        u="https://host/g.mkv")
+        rep = self._rep()
+        responses = [_StartResponse([]),
+                     _StartResponse([b"\x1aE\xdf\xa3" + b"\0" * (3 * 1024 * 1024)])]
+
+        with patch("app.proxy._send", AsyncMock(side_effect=responses)):
+            got = self._select([dead, live], rep)
+
+        self.assertIsNotNone(got)
+        self.assertEqual(1, got[0])                 # served the second candidate
+        self.assertEqual(live["sig"], got[1]["sig"])
 
 
 if __name__ == "__main__":

@@ -213,6 +213,21 @@ CATALOG = [
     ("DECODE_TTL_DAYS", "proxy", "num", "90", "",
      "Learned codec verdicts expire after this — an upgraded player gets a "
      "clean slate."),
+    ("DECODE_LEARN_MIN_MB", "proxy", "num", "8", "",
+     "A player rejection only strikes the file's codecs when at least this "
+     "much of the file was available to the player. Below it the failure is "
+     "starvation, not a codec verdict — blaming codecs for starved streams "
+     "is how universally-supported ones end up demoted."),
+    ("BUFFER_TAIL_MB", "proxy", "num", "8", "",
+     "File tail fetched into memory the moment a buffered stream starts. "
+     "Players read the container index (MKV cues, MP4 moov) from the end of "
+     "the file on every open and seek; serving those bytes warm removes an "
+     "upstream round-trip from each. 0 disables."),
+    ("NZB_START_RETRY_SECS", "proxy", "num", "2", _S,
+     "One extra chance for a direct-usenet source that failed to start, after "
+     "this pause. nzbdav mount readiness can flap for a few seconds while an "
+     "import settles; without the retry that flap surfaces as a 502 the "
+     "player has to recover from itself. 0 disables."),
     ("PROXY_SESSION_TTL", "proxy", "num", "86400", _S,
      "How long a playback token stays valid."),
     ("PROXY_SESSION_MAX_BYTES", "proxy", "num", "20971520", _B,
@@ -243,6 +258,14 @@ CATALOG = [
      "Window over which producer slowness is judged."),
     ("BUFFER_SLOW_MARGIN", "proxy", "num", "0.9", "",
      "Fraction of bitrate below which the producer switches source."),
+    ("BUFFER_IDLE_GRACE", "proxy", "num", "180", _S,
+     "How long the read-ahead keeps filling after the last request, with no "
+     "reader attached. Players that fetch in discrete ranges disconnect "
+     "between them, and a range past the write head is served directly "
+     "without holding a reader slot — pausing the instant nothing is attached "
+     "froze the buffer for the rest of the film and turned every later range "
+     "into a cold fetch. Lower it to over-download less on abandoned streams; "
+     "0 restores the old pause-immediately behaviour."),
 
     # ── cloudflare solver ────────────────────────────────────────────────────
     ("CF_SOLVER", "cloudflare", "bool", "1", "",
@@ -339,6 +362,13 @@ CATALOG = [
      "Cooldown after a transient network/provider failure."),
     ("NZB_INDEXER_HALF_LIFE_DAYS", "usenet", "num", "45", "d",
      "Half-life for time-decaying indexer evidence in the learned ordering."),
+    ("NZB_TRANSPORT_MIN_RELEASES", "usenet", "num", "3", "",
+     "How many different releases must fail to deliver a byte, with nothing "
+     "succeeding in between, before the home page calls it a stalled "
+     "connection to your news provider rather than bad releases. One bad "
+     "release is a bad release; several at once is the pipe."),
+    ("NZB_TRANSPORT_WINDOW_MINUTES", "usenet", "num", "10", "min",
+     "The window those failures have to land inside to count as one outage."),
 
     # ── library & acquire ────────────────────────────────────────────────────
     ("JELLYFIN_INDEX_TTL", "acquire", "num", "300", _S,
@@ -355,6 +385,14 @@ CATALOG = [
      "HLS with the token kept server-side. Off: such titles are dropped from "
      "library results rather than handed over as audio-only. Needs the "
      "Jellyfin user's 'allow video transcoding' permission enabled."),
+    ("PRIVATE_TRACKER_MIN_SOURCES", "acquire", "num", "0", "",
+     "When to consult your private trackers as well as the public sources. "
+     "0 keeps them a last resort — searched only when the ordinary path found "
+     "nothing playable. Set 5 and any pick turning up fewer than 5 distinct "
+     "public releases also searches privately, so thin results get a second "
+     "look. Set -1 to search on every slow pick. The search itself downloads "
+     "nothing — it offers rows you choose to add. Needs the trackers "
+     "configured on the Private trackers page."),
     ("ANIME_ENABLED", "acquire", "bool", "1", "",
      "Anime-aware episode matching: reconcile absolute ('Show - 50'), seasonal "
      "(S03E13) and per-cour numbering so the right episode is confirmed and a "

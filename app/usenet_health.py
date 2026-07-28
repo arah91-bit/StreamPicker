@@ -50,6 +50,32 @@ TRANSIENT_RETRY = float(os.environ.get("NZB_TRANSIENT_RETRY_MINUTES", "30")) * 6
 HARD_FAILURES_TO_BLOCK = int(os.environ.get("NZB_HARD_FAILURES_TO_BLOCK", "2"))
 HALF_LIFE = float(os.environ.get("NZB_INDEXER_HALF_LIFE_DAYS", "45")) * 86400
 
+# ── transport watchdog ──────────────────────────────────────────────────────
+# One release that will not mount is a bad release. Several *different*
+# releases failing the same transport-shaped way inside a few minutes, with
+# nothing succeeding in between, is not bad luck about content — it is the pipe.
+#
+# Observed live: nzbdav leaked CLOSE_WAIT sockets to one backup provider until
+# its connection pool held nothing but corpses, after which every article fetch
+# sat out an NNTP login timeout. 1547 "could not login to usenet host" warnings
+# in a day, a cold 1 MB read taking 41 seconds, five separate releases judged
+# dead inside one hour. Not one of those releases was bad; restarting nzbdav
+# fixed them all at once.
+#
+# Per-release policy is exactly the wrong response to that: every strike blames
+# the content, so an outage quietly retires a shelf of good releases and the
+# operator sees only that "everything is broken". This watchdog exists to say
+# the other thing instead — and to say it while it is still true, since the
+# condition ends the moment anything reads successfully.
+TRANSPORT_WINDOW = float(
+    os.environ.get("NZB_TRANSPORT_WINDOW_MINUTES", "10")) * 60
+TRANSPORT_MIN_RELEASES = int(os.environ.get("NZB_TRANSPORT_MIN_RELEASES", "3"))
+# Reason codes (already normalised by _safe_reason) meaning "the bytes never
+# came" rather than "this release is wrong". Slow-but-flowing is not this: a
+# wedged pool times out, it does not deliver at half speed.
+_TRANSPORT_REASONS = frozenset(
+    {"dead", "timeout", "mount-timeout", "transport"})
+
 _CANON_RE = re.compile(r"[^a-z0-9]+")
 _IMDB_RE = re.compile(r"^(?:tt)?(\d+)$", re.I)
 
@@ -169,6 +195,12 @@ def _safe_reason(reason: str, kind: str) -> str:
                 or "media" in r):
             return "wrong-title"
         return "not-video"
+    # The start gate's verdict for a source that connected and then delivered
+    # nothing at all. Worth its own code rather than the generic "transport"
+    # bucket: on the health page "dead" is the whole diagnosis, and it is the
+    # shape a wedged provider connection produces over and over.
+    if r.startswith("dead") or "zero bytes" in r or "no first byte" in r:
+        return "dead"
     if "timeout" in r or "first byte" in r:
         return "timeout"
     if "never" in r and "appear" in r:
@@ -382,6 +414,11 @@ class HealthStore:
         attempt_hash = hashlib.sha256(attempt_id.encode()).hexdigest()[:24]
         now = self._now()
         kind = "ok" if ok else classify_reason(reason)
+        # Ahead of the replay check on purpose: a replay of the same key only
+        # refreshes that key's timestamp, and the watchdog counts *distinct*
+        # releases, so it cannot inflate itself. Being deduped out of the
+        # transport picture, on the other hand, would hide a live outage.
+        _note_transport(key, ok, "" if ok else _safe_reason(reason, kind))
         with self._lock:
             try:
                 conn = self._conn
@@ -719,6 +756,59 @@ def _store() -> HealthStore | None:
             if _default is None:
                 _default = HealthStore(DB_PATH, MAX_BYTES)
     return _default
+
+
+_transport_lock = threading.Lock()
+_transport_dead: dict[str, float] = {}     # release key -> when it went dead
+_transport_ok_at = 0.0                     # last time a usenet read worked
+
+
+def _note_transport(key: str, ok: bool, reason: str) -> None:
+    """Fold one release outcome into the live transport picture.
+
+    In memory only, and deliberately so: this answers "is the pipe wedged
+    *now*", which a restart of either process legitimately resets. It must
+    never become a stored strike — that is the mistake it exists to correct.
+
+    Wall clock, not the store's injectable one: this is a claim about the
+    present moment that has to agree with transport_stalled()'s reading of it.
+    """
+    global _transport_ok_at
+    now = time.time()
+    with _transport_lock:
+        if ok:
+            # Something read. Whatever was failing, the pipe is not dead, and
+            # a claim that it is would be the worst kind of alarm: confident
+            # and wrong. Start counting again from here.
+            _transport_ok_at = now
+            _transport_dead.clear()
+            return
+        if reason not in _TRANSPORT_REASONS:
+            return
+        _transport_dead[key] = now
+        for k, ts in list(_transport_dead.items()):
+            if now - ts > TRANSPORT_WINDOW:
+                del _transport_dead[k]
+
+
+def transport_stalled() -> dict:
+    """Evidence that usenet delivery itself is wedged, or {} if it isn't.
+
+    Returns the count of distinct releases that died, how long the condition
+    has held, and when anything last worked — the three facts needed to write
+    an alarm a person can act on rather than a number they have to interpret.
+    """
+    now = time.time()
+    with _transport_lock:
+        recent = {k: ts for k, ts in _transport_dead.items()
+                  if now - ts <= TRANSPORT_WINDOW}
+        if len(recent) < TRANSPORT_MIN_RELEASES:
+            return {}
+        since = min(recent.values())
+        return {"releases": len(recent),
+                "since": since,
+                "for_secs": int(now - since),
+                "last_ok": _transport_ok_at}
 
 
 def should_skip(key: str) -> bool:

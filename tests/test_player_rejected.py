@@ -164,6 +164,78 @@ class SilenceTimerTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(e.playfail.get("rejected"))
         observe.assert_not_called()
 
+    async def test_any_recent_request_cancels_silence_rejection(self):
+        """A player streaming from cache holds no connection between range
+        reads, and a range past the write head takes no consumer ref at all.
+        Judging silence on `consumers` alone cooled a release the viewer was
+        actively watching (observed live), then struck every codec in it —
+        poisoning decode-health with codec-independent noise. Any request that
+        touched the entry inside the window (e.last) means they're still here."""
+        e = _entry("file:seeking")
+        _short(e.playfail, sig="file:seeking")
+        _short(e.playfail, sig="file:seeking")
+        with (patch.object(proxy, "_REJECT_SILENCE_SECS", 0.05),
+              patch("app.proxy.reputation.observe") as observe):
+            proxy._arm_reject_timer(e, "tok1")
+            await asyncio.sleep(0.03)              # partway into the silence
+            e.last = time.time()                   # player pulls another range
+            await asyncio.sleep(0.2)
+
+        self.assertFalse(e.playfail.get("rejected"))
+        observe.assert_not_called()
+
+    async def test_a_stale_touch_is_still_silence(self):
+        """The escape must stay narrow, or the detector never fires again."""
+        e = _entry("file:gone")
+        _short(e.playfail, sig="file:gone")
+        _short(e.playfail, sig="file:gone")
+        with (patch.object(proxy, "_REJECT_SILENCE_SECS", 0.05),
+              patch("app.proxy.reputation.observe"),
+              patch("app.proxy.reputation.cooldown"),
+              patch("app.proxy.telemetry.record_buffer")):
+            proxy._arm_reject_timer(e, "tok1")
+            e.last = time.time() - 60               # long finished
+            await asyncio.sleep(0.2)
+
+        self.assertTrue(e.playfail.get("rejected"))
+
+    async def test_a_starved_rejection_does_not_strike_codecs(self):
+        """Cooling the release is right either way; feeding decode_health a
+        codec verdict when the player never had enough bytes to judge is how
+        AAC and H.264 earned ~17% "failure" rates in the live store."""
+        e = _entry("file:starved")
+        e.avail = 1024 * 1024                       # 1 MB ever delivered
+        e.last = time.time() - 60
+        _short(e.playfail, sig="file:starved")
+        _short(e.playfail, sig="file:starved")
+        with (patch.object(proxy, "_REJECT_SILENCE_SECS", 0.05),
+              patch("app.proxy.reputation.observe"),
+              patch("app.proxy.reputation.cooldown"),
+              patch("app.proxy.telemetry.record_buffer"),
+              patch("app.proxy._spawn_learn") as learn):
+            proxy._arm_reject_timer(e, "tok1")
+            await asyncio.sleep(0.2)
+
+        self.assertTrue(e.playfail.get("rejected"))  # still cooled
+        learn.assert_not_called()                    # but codecs not blamed
+
+    async def test_a_well_fed_rejection_still_teaches_decode_health(self):
+        e = _entry("file:fed")
+        e.avail = proxy.DECODE_LEARN_MIN_BYTES + 1
+        e.last = time.time() - 60
+        _short(e.playfail, sig="file:fed")
+        _short(e.playfail, sig="file:fed")
+        with (patch.object(proxy, "_REJECT_SILENCE_SECS", 0.05),
+              patch("app.proxy.reputation.observe"),
+              patch("app.proxy.reputation.cooldown"),
+              patch("app.proxy.telemetry.record_buffer"),
+              patch("app.proxy._spawn_learn") as learn):
+            proxy._arm_reject_timer(e, "tok1")
+            await asyncio.sleep(0.2)
+
+        self.assertTrue(e.playfail.get("rejected"))
+        learn.assert_called_once_with(e, played=False)
+
     async def test_below_strike_threshold_never_arms_the_timer(self):
         e = _entry("file:once")
         _short(e.playfail, sig="file:once")
