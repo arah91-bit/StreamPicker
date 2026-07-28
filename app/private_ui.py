@@ -25,7 +25,7 @@ KEYS = (
     "PRIVATE_TRACKER_START_TIMEOUT", "PRIVATE_TRACKER_SEARCH_TTL",
     "PRIVATE_TRACKER_MAX_TORRENT_GB",
     "PRIVATE_TRACKER_MAX_ACTIVE_DOWNLOADS",
-    "PRIVATE_TRACKER_WHOLE_TORRENT",
+    "PRIVATE_TRACKER_WHOLE_TORRENT", "PRIVATE_TRACKER_MIN_SOURCES",
 )
 
 # Page-specific CSS only — palette, cards, buttons, switches, dots, meters,
@@ -42,6 +42,9 @@ _CSS = """
 .switchtitle{font-weight:700}
 .masterstate{font:12px var(--mono);color:var(--mut);white-space:nowrap}
 .masterstate.ok{color:var(--ok)}.masterstate.bad{color:var(--bad)}
+.trigger{display:flex;justify-content:space-between;align-items:center;gap:18px;
+margin-top:15px;padding-top:15px;border-top:1px solid var(--line)}
+.trigger input.thin{width:88px;text-align:center;font:600 15px var(--mono)}
 .result{font:12px var(--mono);color:var(--mut);margin-top:10px;overflow-wrap:anywhere}
 .result.ok{color:var(--ok)}.result.bad{color:var(--bad)}
 .statusline{display:flex;gap:9px;align-items:center;margin:9px 0}
@@ -80,7 +83,14 @@ function values(){const out={};document.querySelectorAll('[data-key]').forEach(e
 const policy=$('#release_policy'),policyValue=$('#PRIVATE_TRACKER_RELEASE_ORDER');
 function syncPolicy(){if(!policy||!policyValue)return;const enabled=[];policy.querySelectorAll('.policyblock').forEach(block=>{const box=block.querySelector('.include input');block.classList.toggle('disabled',!box.checked);if(box.checked)enabled.push(block.dataset.kind)});policyValue.value=enabled.join(',')}
 if(policy){let dragged=null;policy.querySelectorAll('.policyblock').forEach(block=>{block.addEventListener('dragstart',()=>{dragged=block;block.classList.add('dragging')});block.addEventListener('dragend',()=>{block.classList.remove('dragging');dragged=null;syncPolicy()});block.addEventListener('dragover',e=>{e.preventDefault();if(!dragged||dragged===block)return;const rect=block.getBoundingClientRect();policy.insertBefore(dragged,e.clientY<rect.top+rect.height/2?block:block.nextSibling)});block.querySelector('.include input').addEventListener('change',syncPolicy);block.querySelector('[data-move=\"up\"]').onclick=()=>{const prev=block.previousElementSibling;if(prev)policy.insertBefore(block,prev);syncPolicy()};block.querySelector('[data-move=\"down\"]').onclick=()=>{const next=block.nextElementSibling;if(next)policy.insertBefore(next,block);syncPolicy()}});syncPolicy()}
-$('#private_master').onchange=async()=>{const el=$('#private_master'),r=$('#master_result'),before=el.dataset.saved;el.disabled=true;r.className='masterstate';r.textContent='saving…';try{const d=await post('/api/private-trackers/save',{values:{PRIVATE_TRACKERS_ENABLED:el.checked?'1':'0'}});el.dataset.saved=el.checked?'1':'0';r.className='masterstate ok';r.textContent='Saved · restart to apply';$('#restart').style.display='inline-block'}catch(e){el.checked=before==='1';r.className='masterstate bad';r.textContent=e.message}el.disabled=false};
+async function saveOne(key,value,el,r){el.disabled=true;r.className='masterstate';r.textContent='saving…';try{await post('/api/private-trackers/save',{values:{[key]:value}});el.dataset.saved=value;r.className='masterstate ok';r.textContent='Saved · restart to apply';$('#restart').style.display='inline-block';return true}catch(e){r.className='masterstate bad';r.textContent=e.message;return false}finally{el.disabled=false}}
+$('#private_master').onchange=async()=>{const el=$('#private_master'),before=el.dataset.saved;if(!await saveOne('PRIVATE_TRACKERS_ENABLED',el.checked?'1':'0',el,$('#master_result')))el.checked=before==='1'};
+const thin=$('#private_min_sources');
+function thinCopy(v){v=Number(v);if(!Number.isFinite(v)||!Number.isInteger(v))return'A whole number: −1 always, 0 last resort, otherwise the thin-results threshold.';if(v<0)return'Always on — every slow pick searches your trackers alongside the public sources.';if(v===0)return'Last resort — searched only when the public path found nothing playable at all.';return`Searched as well whenever a pick turns up fewer than ${v} distinct public release${v===1?'':'s'}.`}
+function thinNote(){$('#thin_note').textContent=thinCopy(thin.value)}
+thin.oninput=thinNote;
+thin.onchange=async()=>{let v=Math.round(Number(thin.value));if(!Number.isFinite(v))v=Number(thin.dataset.saved)||0;v=Math.max(-1,Math.min(1000,v));thin.value=String(v);thinNote();if(String(v)===thin.dataset.saved)return;if(!await saveOne('PRIVATE_TRACKER_MIN_SOURCES',String(v),thin,$('#thin_result'))){thin.value=thin.dataset.saved;thinNote()}};
+thinNote();
 $('#save').onclick=async()=>{const b=$('#save'),r=$('#result');b.disabled=true;r.className='result';r.textContent='saving…';try{const d=await post('/api/private-trackers/save',{values:values()});r.className='result ok';r.textContent='Saved. Restart to apply.';$('#restart').style.display='inline-block'}catch(e){r.className='result bad';r.textContent=e.message}b.disabled=false};
 $('#test').onclick=async()=>{const b=$('#test'),r=$('#result');b.disabled=true;r.className='result';r.textContent='testing private connections…';try{const d=await post('/api/private-trackers/test',{values:values()});const parts=Object.entries(d).filter(([k,v])=>v&&typeof v==='object'&&'ok'in v).map(([k,v])=>`${v.ok?'✓':'✗'} ${k}: ${v.detail}`);r.className='result '+(d.ok?'ok':'bad');r.textContent=parts.join(' · ')}catch(e){r.className='result bad';r.textContent=e.message}b.disabled=false};
 $('#restart').onclick=async()=>{const b=$('#restart');b.disabled=true;try{await post('/api/settings/restart',{});b.textContent='Restarting…'}catch(e){b.disabled=false;alert(e.message)}};
@@ -285,6 +295,8 @@ def render(metrics: dict) -> str:
     whole_on = config.pending("PRIVATE_TRACKER_WHOLE_TORRENT").lower() not in (
         "", "0", "false", "no", "off")
     scores_json = config.pending("PRIVATE_TRACKER_INDEXER_SCORES") or "{}"
+    thin = config.pending("PRIVATE_TRACKER_MIN_SOURCES") or config.default(
+        "PRIVATE_TRACKER_MIN_SOURCES")
     events = metrics.get("events") or {}
     data = json.dumps({"metrics": metrics}, separators=(",", ":")) \
         .replace("<", "\\u003c")
@@ -297,7 +309,17 @@ def render(metrics: dict) -> str:
  </div><span class='masterstate' id='master_result'></span>
  <input class='swi' id='private_master' type='checkbox'
  data-key='PRIVATE_TRACKERS_ENABLED' data-saved='{'1' if on else '0'}'
- {'checked' if on else ''} aria-label='Enable private tracker downloads'></div></section>
+ {'checked' if on else ''} aria-label='Enable private tracker downloads'></div>
+ <div class='trigger'><div class='switchcopy'>
+ <div class='switchtitle'>Search when public sources are thin
+ <span class='envk'>PRIVATE_TRACKER_MIN_SOURCES</span></div>
+ <div class='note' id='thin_note'></div>
+ </div><span class='masterstate' id='thin_result'></span>
+ <input class='thin' id='private_min_sources' type='number' min='-1' max='1000'
+ step='1' data-key='PRIVATE_TRACKER_MIN_SOURCES' value='{_esc(thin)}'
+ data-saved='{_esc(thin)}'
+ aria-label='Public releases below which private trackers are also searched'>
+ </div></section>
 <div class='callout' style='margin-top:12px'><b>Progressive mode streams the
 selected file through rqbit.</b> Once that file is complete, qBittorrent
 rechecks the same files, finishes the release, and seeds indefinitely.</div>

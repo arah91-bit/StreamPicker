@@ -377,13 +377,16 @@ _INT_KEYS = {
     "TELEMETRY_SEGMENTS", "MAX_BITRATE_MBPS",
     "PROWLARR_RESOLVE_MAX", "PROWLARR_RESOLVE_CONCURRENCY", "PROWLARR_MIN_SEEDERS",
     "PRIVATE_TRACKER_CANDIDATES", "PRIVATE_TRACKER_MIN_SEEDERS",
-    "PRIVATE_TRACKER_MAX_ACTIVE_DOWNLOADS",
+    "PRIVATE_TRACKER_MAX_ACTIVE_DOWNLOADS", "PRIVATE_TRACKER_MIN_SOURCES",
 }
 
 _FRACTION_KEYS = {
     "DURATION_MIN_FRAC", "QUALITY_BAND", "TWIN_SPLICE_MARGIN",
     "BUFFER_SLOW_MARGIN",
 }
+
+# Counts where -1 is a documented sentinel rather than an out-of-range number.
+_SENTINEL_NEGATIVE_KEYS = {"PRIVATE_TRACKER_MIN_SOURCES"}
 
 
 def _advanced_bounds(spec: dict) -> tuple[float, float]:
@@ -392,6 +395,10 @@ def _advanced_bounds(spec: dict) -> tuple[float, float]:
         return 0.0, 60.0
     if key in _FRACTION_KEYS:
         return 0.0, 1.0
+    if key in _SENTINEL_NEGATIVE_KEYS:
+        # -1 means "always", not "minus one source". Without this the generic
+        # floor of zero would reject the very value the knob documents.
+        return -1.0, 1_000.0
     maximum = {
         "s": 31 * 86400,
         "bytes": float(1 << 40),

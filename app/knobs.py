@@ -385,12 +385,12 @@ CATALOG = [
      "HLS with the token kept server-side. Off: such titles are dropped from "
      "library results rather than handed over as audio-only. Needs the "
      "Jellyfin user's 'allow video transcoding' permission enabled."),
-    ("PRIVATE_TRACKER_MIN_SOURCES", "acquire", "num", "0", "",
+    ("PRIVATE_TRACKER_MIN_SOURCES", "acquire", "num", "5", "",
      "When to consult your private trackers as well as the public sources. "
-     "0 keeps them a last resort — searched only when the ordinary path found "
-     "nothing playable. Set 5 and any pick turning up fewer than 5 distinct "
-     "public releases also searches privately, so thin results get a second "
-     "look. Set -1 to search on every slow pick. The search itself downloads "
+     "Default 5: any pick turning up fewer than 5 distinct public releases "
+     "also searches privately, so thin results get a second look. 0 makes "
+     "them a last resort — searched only when the ordinary path found nothing "
+     "playable. -1 searches on every slow pick. The search itself downloads "
      "nothing — it offers rows you choose to add. Needs the trackers "
      "configured on the Private trackers page."),
     ("ANIME_ENABLED", "acquire", "bool", "1", "",

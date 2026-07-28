@@ -92,9 +92,10 @@ MIN_SEEDERS = max(0, int(os.environ.get("PRIVATE_TRACKER_MIN_SEEDERS", "5")))
 # One number rather than a separate always-on switch, so there is a single
 # place to look when asking "why did this hit my trackers".
 try:
-    MIN_PUBLIC_SOURCES = int(os.environ.get("PRIVATE_TRACKER_MIN_SOURCES", "0"))
+    MIN_PUBLIC_SOURCES = max(
+        -1, int(os.environ.get("PRIVATE_TRACKER_MIN_SOURCES", "5")))
 except (TypeError, ValueError):
-    MIN_PUBLIC_SOURCES = 0
+    MIN_PUBLIC_SOURCES = 5
 
 
 def should_search(public_releases: int) -> bool:
@@ -105,6 +106,8 @@ def should_search(public_releases: int) -> bool:
     if MIN_PUBLIC_SOURCES < 0:
         return True
     return public_releases < MIN_PUBLIC_SOURCES
+
+
 MAX_TORRENT_GB = max(0.0, float(os.environ.get(
     "PRIVATE_TRACKER_MAX_TORRENT_GB", "0")))
 MAX_ACTIVE_DOWNLOADS = max(0, int(os.environ.get(

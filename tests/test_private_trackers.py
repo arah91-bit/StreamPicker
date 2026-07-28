@@ -62,6 +62,45 @@ class ThinResultPolicyTests(unittest.TestCase):
                                   return_value=False):
             self.assertFalse(private_trackers.should_search(0))
 
+    def test_thin_results_are_the_shipped_default(self):
+        """Someone who turns the lane on and touches nothing else gets the
+        second look on thin results, not last-resort-only."""
+        self.assertEqual("5", config.default("PRIVATE_TRACKER_MIN_SOURCES"))
+
+    def test_always_on_sentinel_is_a_saveable_value(self):
+        """-1 is documented as 'always'. The generic floor for an advanced
+        number is zero, which would have rejected the one value the knob
+        exists to offer."""
+        old = os.environ.get("CONFIG_FILE")
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                os.environ["CONFIG_FILE"] = os.path.join(tmp, "config.json")
+                config.save({"PRIVATE_TRACKER_MIN_SOURCES": "-1"})
+                self.assertEqual(
+                    "-1", config.pending("PRIVATE_TRACKER_MIN_SOURCES"))
+                config.save({"PRIVATE_TRACKER_MIN_SOURCES": "0"})
+                self.assertEqual(
+                    "0", config.pending("PRIVATE_TRACKER_MIN_SOURCES"))
+                with self.assertRaisesRegex(ValueError, "at least"):
+                    config.save({"PRIVATE_TRACKER_MIN_SOURCES": "-2"})
+                with self.assertRaisesRegex(ValueError, "whole number"):
+                    config.save({"PRIVATE_TRACKER_MIN_SOURCES": "2.5"})
+        finally:
+            if old is None:
+                os.environ.pop("CONFIG_FILE", None)
+            else:
+                os.environ["CONFIG_FILE"] = old
+
+    def test_the_trigger_sits_beside_the_master_switch(self):
+        """One page, one place: the on/off and the 'how thin' number are the
+        first two controls, and the page's save endpoint accepts the number."""
+        page = private_ui.render({"events": {}})
+        head = page.split("Progressive mode streams", 1)[0]
+        self.assertIn("PRIVATE_TRACKERS_ENABLED", head)
+        self.assertIn("id='private_min_sources'", head)
+        self.assertIn("min='-1'", head)
+        self.assertIn("PRIVATE_TRACKER_MIN_SOURCES", private_ui.KEYS)
+
 
 class ReleasePolicyTests(unittest.TestCase):
     def test_foreign_series_searches_canonical_and_native_titles(self):
