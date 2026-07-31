@@ -16,7 +16,7 @@ import random
 import time
 from itertools import combinations
 
-from app.recs import config, db, fingerprint, preseed, taste, tmdb
+from app.recs import breadth, config, db, fingerprint, preseed, taste, tmdb
 from app.recs.holidays import active_holiday
 from app.recs.kids import band_for_age, effective_kid_age
 from app.recs.profile import build_profile
@@ -83,6 +83,21 @@ PICK_WEIGHT_FINGERPRINT = 0.45
 # times an average popular title is already a strong signal; measured on real
 # history the best genuine matches land between 2 and 7.
 LIFT_FULL_MATCH = 3.0
+
+# The exploration band. A candidate qualifies as a departure when the
+# fingerprint does *not* already vouch for it — but only up to a point: below
+# the floor there is no thread connecting it to anything the viewer likes, and
+# a page of unrelated titles is not a wider catalogue, it is noise.
+#
+# The household's own example is the specification. Mythic Quest is neither
+# animation nor a nature documentary and is one of their favourite things;
+# what connects it is Rob McElhenney, who is also in It's Always Sunny. That
+# is one step outside the core, and reachable. Random is not.
+EXPLORE_LIFT_FLOOR = 0.55
+EXPLORE_LIFT_CEILING = 1.6
+# Quality bar for a departure. If we are spending a slot on something the
+# viewer has not asked for, it had better be good.
+EXPLORE_MIN_RATING = 6.8
 
 # What decides a candidate's place in Top Picks. Seed strength leads because
 # "similar to something you loved" is the row's premise; TMDB's own ordering
@@ -892,6 +907,14 @@ class Generator:
                 "adventurousness": self.adventurousness,
                 "preferred_media": self.user.get("preferred_media", "balanced"),
             }
+        # What this surface actually looks like, recorded with it. Narrowing is
+        # something you notice weeks late and cannot then attribute; a number
+        # stored next to each build makes it a diff instead of a feeling.
+        composition = await self._measure_breadth(catalogs)
+        for warning in breadth.warnings(composition):
+            logger.warning(f"[{self.token[:8]}] surface breadth: {warning}")
+        logger.info(f"[{self.token[:8]}] surface: {composition}")
+
         await db.replace_catalogs(
             self.token, catalogs,
             policy_id="deep-home-v3-home-release",
@@ -904,6 +927,7 @@ class Generator:
                 "preferred_media": self.user.get("preferred_media", "balanced"),
                 "home_release_types": sorted(tmdb.HOME_RELEASE_TYPES),
                 "home_release_fallback_days": config.HOME_RELEASE_FALLBACK_DAYS,
+                "breadth": composition,
             },
         )
         holiday = active_holiday()
@@ -1068,6 +1092,50 @@ class Generator:
                 + remainder * (0.35 * seed_strength + 0.20 * order
                                + 0.20 * genre_fit + 0.25 * rating))
 
+    async def _measure_breadth(self, catalogs: list[dict]) -> dict:
+        """Composition of the finished surface, lift-scored where possible."""
+        lifts: dict[str, float] = {}
+        if self.fingerprint:
+            ids = {meta.get("id") for catalog in catalogs
+                   for meta in catalog.get("metas") or () if meta.get("id")}
+            try:
+                store = await db.features_by_imdb(ids)
+                lifts = {imdb_id: self.fingerprint.lift(tokens)
+                         for imdb_id, tokens in store.items() if tokens}
+            except Exception:
+                logger.debug(f"[{self.token[:8]}] breadth scoring failed",
+                             exc_info=True)
+        return breadth.measure(catalogs, lifts)
+
+    @staticmethod
+    def _explore_score(meta: dict, lift: float | None) -> float:
+        """How good this would be *as a departure*, or 0 if it is not one.
+
+        A departure has to be two things at once. It must be genuinely outside
+        what the fingerprint already vouches for — otherwise the reserved
+        slots just fill with more of the same — and it must be well regarded,
+        because a slot spent on something unasked-for is only worth spending
+        on something good.
+
+        It must also not be *too* far outside. Below the floor there is no
+        thread back to anything the viewer likes, and a page of unconnected
+        titles is not a broader catalogue, it is noise.
+        """
+        if lift is None or not (EXPLORE_LIFT_FLOOR <= lift <= EXPLORE_LIFT_CEILING):
+            return 0.0
+        try:
+            rating = float(meta.get("imdbRating") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+        if rating < EXPLORE_MIN_RATING:
+            return 0.0
+        # Quality leads; distance from the core breaks ties, so the least
+        # familiar of two equally good departures is preferred.
+        quality = (rating - EXPLORE_MIN_RATING) / (10.0 - EXPLORE_MIN_RATING)
+        distance = 1.0 - (lift - EXPLORE_LIFT_FLOOR) / (
+            EXPLORE_LIFT_CEILING - EXPLORE_LIFT_FLOOR)
+        return 0.75 * quality + 0.25 * distance
+
     async def _fingerprint_candidates(self, print_) -> list[tuple[str, list[dict]]]:
         """Titles swept from the catalogue by what this viewer's taste is made of.
 
@@ -1216,22 +1284,26 @@ class Generator:
                     genres=genres,
                     seed_id=seed_id,
                     meta=meta,
+                    explore_score=self._explore_score(meta, lifts.get(imdb_id)),
                 ))
         if len(candidates) < 5:
             return None
-        chosen = taste.select_diverse(candidates, ROW_TARGET_ITEMS,
-                                      rng=self.rng,
-                                      movie_share=self._movie_share())
+        chosen = taste.select_diverse(
+            candidates, ROW_TARGET_ITEMS, rng=self.rng,
+            movie_share=self._movie_share(),
+            explore_share=taste.EXPLORE_SHARE,
+            target_genres=self.taste.genre_target(context) if self.taste else None)
         combined = [c.meta for c in chosen]
         if len(combined) < 5:
             return None
         contributing = len({c.seed_id for c in chosen})
         swept_in = sum(1 for c in chosen if c.seed_id in swept_sources)
         scored = sum(1 for c in chosen if c.imdb_id in lifts)
+        explored = sum(1 for c in chosen if c.explore_score > 0)
         logger.info(f"[{self.token[:8]}] top picks: {len(combined)} items from "
                     f"{contributing}/{len(sources)} sources "
                     f"({len(candidates)} candidates; {swept_in} swept by "
-                    f"fingerprint, {scored} lift-scored)")
+                    f"fingerprint, {scored} lift-scored, {explored} exploratory)")
         self.used_imdb.update(m["id"] for m in combined)
         return {"id": TOP_PICKS_ID, "type": config.COMBINED_TYPE,
                 "name": "Top Picks", "metas": combined}

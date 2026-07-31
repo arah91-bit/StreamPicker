@@ -370,6 +370,19 @@ class TasteModel:
         top = max(weights.values())
         return {slug: value / top for slug, value in weights.items()}
 
+    def genre_target(self, context: str | None = CONTEXT_SOLO) -> dict[str, float]:
+        """p(g|u) — this viewer's own genre proportions, for calibration.
+
+        Engagement-weighted, so the distribution reflects what they actually
+        watched rather than what they opened, and each title splits one unit
+        across its genres so a four-genre title is not four votes.
+        """
+        return genre_distribution(
+            (signal.genres, signal.engagement)
+            for signal in self.signals.values()
+            if (context is None or signal.context == context)
+            and signal.engagement > 0)
+
     def media_share(self, context: str = CONTEXT_SOLO) -> float:
         """Share of positive engagement spent on movies, 0..1."""
         movie = series = 0.0
@@ -513,20 +526,51 @@ def build(plays: list[dict], genres_for=None,
 # penalty ladder and not a filter — the previous implementation's hard `[:30]`
 # was exactly a filter, and it silently discarded four of six seeds.
 
-# Share of the row any single genre is expected to hold before it starts
-# costing. A third leaves room for a genuine favourite to lead without
-# letting it own the row.
-GENRE_CAP_FRACTION = 1 / 3
 # Below this, one seed with a deep recommendation list would still dominate.
 SEED_CAP_MINIMUM = 2
 # Weights are in the same units as the candidate score (0..1), so a weight of
 # 0.5 means "at quota, give up half a point of relevance".
-GENRE_PRESSURE = 0.55
 SEED_PRESSURE = 0.45
 MEDIA_PRESSURE = 0.30
+
+# ── calibration (Steck, "Calibrated Recommendations", RecSys 2018) ───────
+#
+# The genre pressure this replaced pushed a row toward *uniformity*, which is
+# the wrong target and actively destroys a viewer's real proportions: someone
+# who is 40% animation gets flattened to one ninth of the row, and their minor
+# tastes are given the same weight as their strongest.
+#
+# Calibration targets the viewer's own distribution instead. Steck's example
+# is the argument: a viewer who watched 70 romances and 30 action films should
+# get a list that is roughly 70/30, not 100/0 and not 50/50. The failure it
+# prevents is precisely the one described here as "mostly animation and nature
+# shows, but I really liked Mythic Quest" — accuracy alone lets the dominant
+# taste swallow the list and the minor one disappears.
+#
+# Divergence of the list's genre distribution from the viewer's, smoothed so a
+# genre missing from the list is expensive rather than infinite.
+CALIBRATION_ALPHA = 0.01
+# Steck's trade-off: 0 is pure relevance, 1 is pure calibration. Leaning
+# toward the viewer, as asked, while leaving calibration enough authority to
+# keep their smaller tastes on the page.
+#
+# The curve is steep at the bottom and flat after. Measured on a synthetic
+# 75/25 split with a wide score gap, the share of the minor taste went 0% at
+# λ=0, 3% at 0.3, 7% at 0.6, 17% at 0.9 — the first unit of calibration is
+# what rescues a taste from disappearing entirely, and the rest is fine
+# tuning. Real candidate pools are far more tightly scored than that, so
+# calibration bites harder here than the synthetic numbers suggest.
+CALIBRATION_LAMBDA = 0.75
 # Daily reshuffle. Large enough to reorder near-equal candidates, small enough
 # that it cannot lift a weak candidate over a strong one.
 SELECTION_JITTER = 0.08
+
+
+# Share of a row held back for titles the viewer's own taste does not already
+# vouch for. The number is the household's: "mostly tailored, maybe 20% for
+# exploratory recommendations… only showing me hyper focused stuff will make
+# the service feel shallow".
+EXPLORE_SHARE = 0.20
 
 
 @dataclass
@@ -539,6 +583,54 @@ class Candidate:
     genres: tuple[str, ...] = ()
     seed_id: str = ""
     meta: dict = field(default_factory=dict)
+    # How good this is *as a departure* — quality, times how far outside the
+    # viewer's usual it sits. Only consulted for the reserved slots.
+    explore_score: float = 0.0
+
+
+def genre_distribution(items) -> dict[str, float]:
+    """p(g) over a set of titles — each title splits one unit across its genres.
+
+    Splitting rather than counting matters: a title tagged with four genres
+    would otherwise contribute four times as much evidence as a single-genre
+    one, and animation-adventure-comedy-family titles are exactly the sort
+    that carry four.
+    """
+    weights: dict[str, float] = {}
+    total = 0.0
+    for genres, weight in items:
+        genres = [g for g in genres if g]
+        if not genres or weight <= 0:
+            continue
+        share = weight / len(genres)
+        for slug in genres:
+            weights[slug] = weights.get(slug, 0.0) + share
+        total += weight
+    if total <= 0:
+        return {}
+    return {slug: value / total for slug, value in weights.items()}
+
+
+def calibration_divergence(target: dict[str, float],
+                           actual: dict[str, float],
+                           alpha: float = CALIBRATION_ALPHA) -> float:
+    """KL(target || smoothed actual). Zero when the list matches the viewer.
+
+    Smoothing is what makes this usable as an objective: without it a genre
+    the list has not reached yet gives an infinite penalty, and the first pick
+    would be undefined.
+    """
+    if not target:
+        return 0.0
+    total = 0.0
+    for slug, wanted in target.items():
+        if wanted <= 0:
+            continue
+        got = (1 - alpha) * actual.get(slug, 0.0) + alpha * wanted
+        if got <= 0:
+            continue
+        total += wanted * math.log(wanted / got)
+    return total
 
 
 def _pressure(count: int, quota: float) -> float:
@@ -552,8 +644,57 @@ def _pressure(count: int, quota: float) -> float:
     return (count / quota) ** 2
 
 
+def _fill(limit: int, jittered: dict[str, float], taken: list[Candidate],
+          taken_genres: dict[str, float], taken_seeds: dict[str, int],
+          taken_media: dict[str, int], remaining: dict[str, Candidate],
+          target: dict[str, float], seed_quota: float, movie_quota: float,
+          series_quota: float) -> None:
+    """Greedy fill, in place, on Steck's accuracy/calibration trade-off.
+
+    Submodular, so the standard greedy step is within (1-1/e) of optimal —
+    which is why this is a loop of local choices rather than a search.
+    """
+    relevance = (1.0 - CALIBRATION_LAMBDA) if target else 1.0
+    while remaining and len(taken) < limit:
+        best_id, best_value = None, None
+        for imdb_id, candidate in remaining.items():
+            quota = (movie_quota if candidate.media_type == "movie"
+                     else series_quota)
+            value = (relevance * jittered[imdb_id]
+                     - SEED_PRESSURE * _pressure(
+                         taken_seeds.get(candidate.seed_id, 0), seed_quota)
+                     - MEDIA_PRESSURE * _pressure(
+                         taken_media.get(candidate.media_type, 0), quota))
+            if target:
+                # What the list's genre distribution would become with this
+                # title added, and how far that is from the viewer's own.
+                trial = dict(taken_genres)
+                genres = [g for g in candidate.genres if g]
+                if genres:
+                    share = 1.0 / len(genres)
+                    for slug in genres:
+                        trial[slug] = trial.get(slug, 0.0) + share
+                total = sum(trial.values()) or 1.0
+                value -= CALIBRATION_LAMBDA * calibration_divergence(
+                    target, {s: v / total for s, v in trial.items()})
+            if best_value is None or value > best_value:
+                best_id, best_value = imdb_id, value
+        candidate = remaining.pop(best_id)
+        taken.append(candidate)
+        genres = [g for g in candidate.genres if g]
+        if genres:
+            share = 1.0 / len(genres)
+            for slug in genres:
+                taken_genres[slug] = taken_genres.get(slug, 0.0) + share
+        taken_seeds[candidate.seed_id] = taken_seeds.get(candidate.seed_id, 0) + 1
+        taken_media[candidate.media_type] = (
+            taken_media.get(candidate.media_type, 0) + 1)
+
+
 def select_diverse(candidates: list[Candidate], limit: int, *,
-                   rng=None, movie_share: float = 0.5) -> list[Candidate]:
+                   rng=None, movie_share: float = 0.5,
+                   explore_share: float = 0.0,
+                   target_genres: dict[str, float] | None = None) -> list[Candidate]:
     """Greedily fill a row, spending relevance to buy variety.
 
     At every step the highest-scoring candidate wins *after* subtracting what
@@ -561,10 +702,17 @@ def select_diverse(candidates: list[Candidate], limit: int, *,
     many slots its seed already took, and whether its medium is over its
     share. The result is a row that leads with the strongest pick and then
     widens, rather than one that exhausts the best seed before moving on.
+
+    `explore_share` holds back a fraction of the row for candidates ranked by
+    `explore_score` instead. Diversity pressure alone cannot do this job: it
+    varies the row within whatever the candidates already are, and if every
+    candidate came from the viewer's own taste then a perfectly "diverse" row
+    is still thirty flavours of one thing. The reserved slots are the only
+    part of the row that is allowed to be something they have not already
+    proved they want.
     """
     if limit <= 0 or not candidates:
         return []
-    genre_quota = max(1.0, limit * GENRE_CAP_FRACTION)
     seed_count = len({c.seed_id for c in candidates if c.seed_id})
     seed_quota = max(SEED_CAP_MINIMUM, limit / max(1, seed_count))
     movie_quota = max(1.0, limit * movie_share)
@@ -576,33 +724,49 @@ def select_diverse(candidates: list[Candidate], limit: int, *,
         jittered[candidate.imdb_id] = candidate.score + jitter
 
     taken: list[Candidate] = []
-    taken_genres: dict[str, int] = {}
+    taken_genres: dict[str, float] = {}
     taken_seeds: dict[str, int] = {}
     taken_media: dict[str, int] = {}
     remaining = {c.imdb_id: c for c in candidates}
+    # With no viewer to calibrate toward — a cold-start profile, or a row
+    # built before any history exists — the candidate pool's own genre mix is
+    # the target. That is the neutral answer to "what should a page look
+    # like": like the catalogue it was drawn from. Without it, removing the
+    # old uniform genre pressure would have left such a row with no genre
+    # control whatever.
+    target = target_genres or genre_distribution(
+        (c.genres, 1.0) for c in candidates)
 
-    while remaining and len(taken) < limit:
-        best_id, best_value = None, None
-        for imdb_id, candidate in remaining.items():
-            genre_load = max((taken_genres.get(g, 0) for g in candidate.genres),
-                             default=0)
-            quota = (movie_quota if candidate.media_type == "movie"
-                     else series_quota)
-            value = (jittered[imdb_id]
-                     - GENRE_PRESSURE * _pressure(genre_load, genre_quota)
-                     - SEED_PRESSURE * _pressure(
-                         taken_seeds.get(candidate.seed_id, 0), seed_quota)
-                     - MEDIA_PRESSURE * _pressure(
-                         taken_media.get(candidate.media_type, 0), quota))
-            if best_value is None or value > best_value:
-                best_id, best_value = imdb_id, value
-        candidate = remaining.pop(best_id)
-        taken.append(candidate)
-        for slug in candidate.genres:
-            taken_genres[slug] = taken_genres.get(slug, 0) + 1
-        taken_seeds[candidate.seed_id] = taken_seeds.get(candidate.seed_id, 0) + 1
-        taken_media[candidate.media_type] = (
-            taken_media.get(candidate.media_type, 0) + 1)
+    explore_slots = 0
+    if explore_share > 0:
+        explorers = [c for c in candidates if c.explore_score > 0]
+        explore_slots = min(round(limit * explore_share), len(explorers))
+
+    # Tailored slots first, so the row opens on what the viewer came for.
+    _fill(limit - explore_slots, jittered, taken, taken_genres, taken_seeds,
+          taken_media, remaining, target, seed_quota, movie_quota, series_quota)
+
+    if explore_slots:
+        by_departure = sorted(
+            (c for c in remaining.values() if c.explore_score > 0),
+            key=lambda c: c.explore_score, reverse=True)
+        for candidate in by_departure[:explore_slots]:
+            remaining.pop(candidate.imdb_id, None)
+            taken.append(candidate)
+            genres = [g for g in candidate.genres if g]
+            if genres:
+                share = 1.0 / len(genres)
+                for slug in genres:
+                    taken_genres[slug] = taken_genres.get(slug, 0.0) + share
+            taken_seeds[candidate.seed_id] = (
+                taken_seeds.get(candidate.seed_id, 0) + 1)
+            taken_media[candidate.media_type] = (
+                taken_media.get(candidate.media_type, 0) + 1)
+
+    # A short exploration pool must not shorten the row.
+    if len(taken) < limit:
+        _fill(limit, jittered, taken, taken_genres, taken_seeds, taken_media,
+              remaining, target, seed_quota, movie_quota, series_quota)
     return taken
 
 

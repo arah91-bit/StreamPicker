@@ -5,6 +5,8 @@ Where a case names a real title it is because that title is what exposed the
 behaviour, and reproducing it is the point.
 """
 
+import collections
+import math
 import random
 import time
 import unittest
@@ -301,12 +303,18 @@ class DiversitySelectionTests(unittest.TestCase):
         self.assertEqual("strong", chosen[0].seed_id)
 
     def test_one_genre_cannot_take_the_whole_row(self):
-        pool = (self.candidates("a", ["horror"], 25, base=0.90)
-                + self.candidates("b", ["comedy"], 25, base=0.80)
-                + self.candidates("c", ["documentary"], 25, base=0.75))
+        """Every candidate here is its own source, so seed pressure cannot be
+        what limits the genre — only calibration can."""
+        pool = ([taste.Candidate(f"tt-h{n}", "series", 0.90 - n * 0.001,
+                                 ("horror",), f"h{n}") for n in range(25)]
+                + [taste.Candidate(f"tt-c{n}", "series", 0.80 - n * 0.001,
+                                   ("comedy",), f"c{n}") for n in range(25)]
+                + [taste.Candidate(f"tt-d{n}", "series", 0.75 - n * 0.001,
+                                   ("documentary",), f"d{n}") for n in range(25)])
         chosen = taste.select_diverse(pool, 30, rng=random.Random(3))
         horror = sum(1 for c in chosen if "horror" in c.genres)
         self.assertLess(horror, 18)
+
 
     def test_the_row_still_fills_when_only_one_seed_is_usable(self):
         """Soft quotas, not filters. A viewer with one strong title must get a
@@ -349,6 +357,143 @@ class DiversitySelectionTests(unittest.TestCase):
                    taste.select_diverse(pool, 30, rng=random.Random("tok:tue"))]
         self.assertEqual(monday, again)
         self.assertNotEqual(monday, tuesday)
+
+
+class CalibrationTests(unittest.TestCase):
+    """Steck, "Calibrated Recommendations", RecSys 2018.
+
+    The list should carry the viewer's *proportions*, not their single
+    strongest taste and not an even spread. Stated by the household as
+    "mostly animation and nature shows, but I really liked Mythic Quest" —
+    the minor taste has to survive.
+    """
+
+    def pool(self, spec):
+        out = []
+        for genre, count, base in spec:
+            out += [taste.Candidate(f"tt-{genre}{n}", "series", base - n * 0.001,
+                                    (genre,), f"{genre}{n}")
+                    for n in range(count)]
+        return out
+
+    def shares(self, chosen):
+        counts = collections.Counter(g for c in chosen for g in c.genres)
+        total = sum(counts.values()) or 1
+        return {g: n / total for g, n in counts.items()}
+
+    def test_a_minor_taste_is_not_swallowed_by_the_dominant_one(self):
+        """Optimising relevance alone hands the whole list to the strongest
+        genre and the viewer's smaller interests disappear — Steck's point,
+        and the household's "I really liked Mythic Quest"."""
+        pool = self.pool([("animation", 40, 0.90), ("comedy", 40, 0.60)])
+        target = {"animation": 0.75, "comedy": 0.25}
+        uncalibrated = taste.select_diverse(
+            pool, 30, rng=random.Random(1), target_genres={"animation": 1.0})
+        calibrated = taste.select_diverse(
+            pool, 30, rng=random.Random(1), target_genres=target)
+        self.assertEqual(0, self.shares(uncalibrated).get("comedy", 0))
+        self.assertGreater(self.shares(calibrated).get("comedy", 0), 0)
+
+    def test_calibration_moves_the_list_toward_the_viewer(self):
+        """The property that matters, stated as the objective states it: the
+        divergence of the list from the viewer must fall."""
+        pool = self.pool([("animation", 40, 0.90), ("comedy", 40, 0.60)])
+        target = {"animation": 0.75, "comedy": 0.25}
+        off = taste.select_diverse(pool, 30, rng=random.Random(1),
+                                   target_genres={"animation": 1.0})
+        on = taste.select_diverse(pool, 30, rng=random.Random(1),
+                                  target_genres=target)
+        self.assertLess(
+            taste.calibration_divergence(target, self.shares(on)),
+            taste.calibration_divergence(target, self.shares(off)))
+
+    def test_the_dominant_taste_still_leads(self):
+        """Calibration is not equalisation: 75/25 must not become 50/50."""
+        pool = self.pool([("animation", 40, 0.90), ("comedy", 40, 0.60)])
+        target = {"animation": 0.75, "comedy": 0.25}
+        shares = self.shares(taste.select_diverse(
+            pool, 30, rng=random.Random(2), target_genres=target))
+        self.assertGreater(shares.get("animation", 0),
+                           shares.get("comedy", 0))
+
+    def test_the_list_tracks_the_target_rather_than_the_scores(self):
+        weak = self.pool([("animation", 40, 0.90), ("documentary", 40, 0.55)])
+        heavy_doc = taste.select_diverse(
+            weak, 30, rng=random.Random(3),
+            target_genres={"animation": 0.3, "documentary": 0.7})
+        light_doc = taste.select_diverse(
+            weak, 30, rng=random.Random(3),
+            target_genres={"animation": 0.9, "documentary": 0.1})
+        self.assertGreater(self.shares(heavy_doc).get("documentary", 0),
+                           self.shares(light_doc).get("documentary", 0))
+
+    def test_divergence_is_zero_when_the_list_matches_the_viewer(self):
+        target = {"animation": 0.6, "comedy": 0.4}
+        self.assertAlmostEqual(
+            0.0, taste.calibration_divergence(target, target), places=6)
+
+    def test_a_missing_genre_costs_but_does_not_blow_up(self):
+        """Unsmoothed KL is infinite for a genre the list has not reached, and
+        the first pick of a greedy fill would then be undefined."""
+        value = taste.calibration_divergence({"animation": 0.5, "comedy": 0.5},
+                                             {"animation": 1.0})
+        self.assertTrue(math.isfinite(value))
+        self.assertGreater(value, 0)
+
+    def test_a_title_splits_one_vote_across_its_genres(self):
+        """Otherwise a four-genre title is four votes, and animation-comedy-
+        adventure-family titles are exactly the kind that carry four."""
+        one = taste.genre_distribution([(("animation",), 1.0)])
+        four = taste.genre_distribution(
+            [(("animation", "comedy", "adventure", "family"), 1.0)])
+        self.assertEqual(1.0, one["animation"])
+        self.assertAlmostEqual(0.25, four["animation"])
+
+    def test_an_empty_history_has_no_target(self):
+        self.assertEqual({}, taste.genre_distribution([]))
+
+
+class ExplorationTests(unittest.TestCase):
+    """The reserved slots. Diversity pressure varies a row within whatever the
+    candidates already are; if every candidate came from the viewer's own
+    taste, a perfectly diverse row is still thirty flavours of one thing."""
+
+    def pool(self, tailored=40, explorers=10):
+        out = [taste.Candidate(f"tt-t{n}", "series", 0.90 - n * 0.001,
+                               ("animation",), f"t{n}") for n in range(tailored)]
+        out += [taste.Candidate(f"tt-x{n}", "series", 0.20,
+                                ("western",), f"x{n}", explore_score=0.9 - n * 0.01)
+                for n in range(explorers)]
+        return out
+
+    def test_low_scoring_departures_still_reach_the_row(self):
+        """At least the reserved six. Possibly more — calibration can also
+        pull a departure into a tailored slot on its own merits, and that is
+        the system agreeing with itself, not a fault."""
+        chosen = taste.select_diverse(self.pool(), 30, rng=random.Random(1),
+                                      explore_share=0.2)
+        explored = sum(1 for c in chosen if c.explore_score > 0)
+        self.assertGreaterEqual(explored, 6)
+
+    def test_the_row_still_leads_with_what_the_viewer_came_for(self):
+        chosen = taste.select_diverse(self.pool(), 30, rng=random.Random(2),
+                                      explore_share=0.2)
+        self.assertEqual(0.0, chosen[0].explore_score)
+
+    def test_a_short_exploration_pool_does_not_shorten_the_row(self):
+        chosen = taste.select_diverse(self.pool(explorers=2), 30,
+                                      rng=random.Random(3), explore_share=0.2)
+        self.assertEqual(30, len(chosen))
+
+    def test_the_budget_is_what_puts_departures_on_the_page(self):
+        """Without it a departure only appears if it wins on relevance, which
+        for a low-scoring title in an unfamiliar genre is close to never."""
+        def count(share):
+            chosen = taste.select_diverse(self.pool(), 30, rng=random.Random(4),
+                                          explore_share=share)
+            return sum(1 for c in chosen if c.explore_score > 0)
+
+        self.assertGreater(count(0.2), count(0.0))
 
 
 class ModelSummaryTests(unittest.TestCase):
