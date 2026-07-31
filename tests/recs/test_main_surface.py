@@ -72,16 +72,23 @@ class MainSurfaceTests(unittest.IsolatedAsyncioTestCase):
             patch.object(main.db, "get_catalog_defs", AsyncMock(return_value=[])),
             patch.object(main.db, "get_recommendation_summary",
                          AsyncMock(return_value=summary)),
+            patch.object(main.db, "feedback_counts",
+                         AsyncMock(return_value={"liked": 7, "disliked": 3})),
         ):
             response = await self.client.get(
                 f"/setup/{SETUP_SECRET}/api/users")
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["users"][0]["measurement"], summary)
-        self.assertNotIn("content_id", response.json()["users"][0]["measurement"])
-        self.assertTrue(response.json()["users"][0]["manifest_url"].endswith(
+        listed = response.json()["users"][0]
+        self.assertEqual(listed["measurement"], summary)
+        self.assertNotIn("content_id", listed["measurement"])
+        self.assertTrue(listed["manifest_url"].endswith(
             f"/viewer/manifest.json?v={profile_streaming.PRIVATE_MANIFEST_VERSION}"
         ))
+        # The bootstrapper link is per viewer and its count drives the button
+        # label, so an operator can see who has actually done it.
+        self.assertTrue(listed["taste_url"].endswith("/viewer/taste"))
+        self.assertEqual(10, listed["taste_rated"])
 
     async def test_manifest_advertises_optional_skip_for_every_catalog(self):
         catalogs = [

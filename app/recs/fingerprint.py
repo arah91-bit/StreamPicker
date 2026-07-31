@@ -47,15 +47,38 @@ MIN_TITLES = 4
 MIN_DIMENSIONS = 40
 
 
+# Weight of the disliked centroid when it exists. Rocchio-style: a title is
+# scored by how much it looks like what they like *minus* how much it looks
+# like what they turned down. Deliberately well below 1 — a handful of taps in
+# a bootstrap session must be able to steer, never to veto.
+NEGATIVE_WEIGHT = 0.45
+# Below this many explicit dislikes the negative centroid is one person's
+# passing mood rather than a direction.
+MIN_NEGATIVE_TITLES = 3
+# An explicit "I liked this" is a statement, not an inference, so it enters the
+# positive centroid at a weight a well-watched title would have to earn.
+BOOTSTRAP_LIKE_WEIGHT = 0.7
+
+
 class Fingerprint:
-    """A viewer's centroid in feature space, with a baseline to read it against."""
+    """A viewer's centroid in feature space, with a baseline to read it against.
+
+    Optionally a second, negative centroid. Nothing derived from plays can
+    build one — "never watched" and "never heard of" are the same observation
+    from here — so it exists only when somebody has explicitly said no to
+    something in the bootstrapper.
+    """
 
     def __init__(self, vector: dict[str, float], vocabulary,
-                 baseline: list[float], titles: int):
+                 baseline: list[float], titles: int,
+                 negative: dict[str, float] | None = None,
+                 negative_titles: int = 0):
         self.vector = vector
         self.vocabulary = vocabulary
         self.baseline = baseline
         self.titles = titles
+        self.negative = negative or {}
+        self.negative_titles = negative_titles
         self.baseline_mean = (sum(baseline) / len(baseline)) if baseline else 0.0
 
     @property
@@ -68,8 +91,15 @@ class Fingerprint:
         if not tokens or not self.vector:
             return 0.0
         vector = self.vocabulary.vector(tokens)
-        return sum(self.vector.get(token, 0.0) * value
-                   for token, value in vector.items())
+        score = sum(self.vector.get(token, 0.0) * value
+                    for token, value in vector.items())
+        if self.negative:
+            score -= NEGATIVE_WEIGHT * sum(
+                self.negative.get(token, 0.0) * value
+                for token, value in vector.items())
+        # Lift is a ratio, so the score has to stay non-negative or the whole
+        # scale inverts for a strongly-rejected title.
+        return max(0.0, score)
 
     def lift(self, tokens) -> float:
         """How much more like this viewer than an average popular title."""
@@ -98,23 +128,20 @@ class Fingerprint:
         return [token for _, token in wanted[:limit]]
 
     def summary(self) -> dict:
-        return {
+        out = {
             "titles": self.titles,
             "dimensions": len(self.vector),
             "vocabulary": len(self.vocabulary),
             "baseline_mean": round(self.baseline_mean, 5),
         }
+        if self.negative:
+            out["disliked"] = self.negative_titles
+        return out
 
 
-def build(weights: dict[str, float], features_by_imdb: dict[str, list[str]],
-          vocabulary, baseline_pool: list[list[str]] | None = None,
-          rng: random.Random | None = None) -> Fingerprint:
-    """The fingerprint for one viewer.
-
-    `weights` maps IMDb id to that title's engagement — normally
-    `taste.TitleSignal.engagement`, already filtered to the context being
-    modelled, so a parent's fingerprint is not built from children's viewing.
-    """
+def _centroid(weights: dict[str, float],
+              features_by_imdb: dict[str, list[str]],
+              vocabulary) -> tuple[dict[str, float], int]:
     vector: dict[str, float] = {}
     used = 0
     for imdb_id, weight in weights.items():
@@ -129,8 +156,28 @@ def build(weights: dict[str, float], features_by_imdb: dict[str, list[str]],
     norm = math.sqrt(sum(value * value for value in vector.values()))
     if norm:
         vector = {token: value / norm for token, value in vector.items()}
+    return vector, used
 
-    fingerprint = Fingerprint(vector, vocabulary, [], used)
+
+def build(weights: dict[str, float], features_by_imdb: dict[str, list[str]],
+          vocabulary, baseline_pool: list[list[str]] | None = None,
+          rng: random.Random | None = None,
+          disliked: dict[str, float] | None = None) -> Fingerprint:
+    """The fingerprint for one viewer.
+
+    `weights` maps IMDb id to that title's engagement — normally
+    `taste.TitleSignal.engagement`, already filtered to the context being
+    modelled, so a parent's fingerprint is not built from children's viewing.
+    `disliked` is the same shape for titles explicitly turned down.
+    """
+    vector, used = _centroid(weights, features_by_imdb, vocabulary)
+    negative, rejected = ({}, 0)
+    if disliked:
+        negative, rejected = _centroid(disliked, features_by_imdb, vocabulary)
+        if rejected < MIN_NEGATIVE_TITLES:
+            negative, rejected = {}, 0
+
+    fingerprint = Fingerprint(vector, vocabulary, [], used, negative, rejected)
     if baseline_pool:
         rng = rng or random.Random(0)
         sample = (baseline_pool if len(baseline_pool) <= BASELINE_SAMPLE
@@ -141,7 +188,8 @@ def build(weights: dict[str, float], features_by_imdb: dict[str, list[str]],
     return fingerprint
 
 
-async def for_viewer(model, context: str | None, rng=None
+async def for_viewer(model, context: str | None, rng=None,
+                     user_token: str | None = None
                      ) -> tuple[Fingerprint | None, dict[str, list[str]]]:
     """(fingerprint, feature store) for a viewer.
 
@@ -162,6 +210,16 @@ async def for_viewer(model, context: str | None, rng=None
         if (context is None or signal.context == context)
         and model.may_seed(signal)
     }
+    disliked: dict[str, float] = {}
+    if user_token:
+        # A bootstrap "liked" is a deliberate statement rather than an
+        # inference, so it enters at full weight — a viewer who has rated
+        # twenty titles and watched nothing still gets a real fingerprint.
+        for imdb_id, entry in (await db.feedback_for(user_token)).items():
+            if entry["verdict"] == "liked":
+                weights.setdefault(imdb_id, BOOTSTRAP_LIKE_WEIGHT)
+            elif entry["verdict"] == "disliked":
+                disliked[imdb_id] = 1.0
     if len(weights) < MIN_TITLES or not store:
         return None, store
     vocabulary = await feature_lib.vocabulary()
@@ -169,6 +227,8 @@ async def for_viewer(model, context: str | None, rng=None
         return None, store
     baseline_pool = [tokens for imdb_id, tokens in store.items()
                      if tokens and imdb_id not in weights]
-    fingerprint = build({k: v for k, v in weights.items() if k in store},
-                        store, vocabulary, baseline_pool, rng)
+    fingerprint = build(
+        {k: v for k, v in weights.items() if k in store},
+        store, vocabulary, baseline_pool, rng,
+        disliked={k: v for k, v in disliked.items() if k in store})
     return (fingerprint if fingerprint.usable else None), store

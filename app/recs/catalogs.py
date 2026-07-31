@@ -934,7 +934,8 @@ class Generator:
             try:
                 context = taste.CONTEXT_SOLO if self.kid_age is None else None
                 self.fingerprint, self.feature_store = \
-                    await fingerprint.for_viewer(self.taste, context, self.rng)
+                    await fingerprint.for_viewer(self.taste, context, self.rng,
+                                                 user_token=self.token)
                 logger.info(
                     f"[{self.token[:8]}] fingerprint: "
                     f"{self.fingerprint.summary() if self.fingerprint else 'unavailable'}")

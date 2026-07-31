@@ -334,6 +334,7 @@ async function load() {{
       <div class="lbl">Add-ons to install (each one is tracked to this viewer)</div>
       <div class="lanes"></div>
       <div class="acts">
+        <button class="taste">Copy taste-setup link</button>
         <button class="copy">Copy main add-on URL</button>
         ${{u.streaming_collection_url
             ? '<button class="dl">Download ' + u.collection_filename + '</button>' : ""}}
@@ -387,6 +388,21 @@ async function load() {{
       navigator.clipboard.writeText(u.manifest_url);
       ev.target.textContent = "Copied";
       setTimeout(() => ev.target.textContent = "Copy add-on URL", 1800);
+    }};
+    // Meant to be sent to a phone: a cold profile has nothing to recommend
+    // from, and tapping through twenty familiar titles beats waiting weeks
+    // for a history to accumulate from picks made without one.
+    const taste = card.querySelector(".taste");
+    const tasteLabel = u.taste_rated
+      ? "Copy taste-setup link (" + u.taste_rated + " rated)"
+      : "Copy taste-setup link";
+    taste.textContent = tasteLabel;
+    taste.title = u.taste_url + "  —  open on a phone, mark titles liked or "
+      + "not for you. Anyone with this link can shape " + u.name + "'s rows.";
+    taste.onclick = ev => {{
+      navigator.clipboard.writeText(u.taste_url);
+      ev.target.textContent = "Copied — send it to a phone";
+      setTimeout(() => ev.target.textContent = tasteLabel, 2200);
     }};
     const dl = card.querySelector(".dl");
     if (dl) dl.onclick = () => {{

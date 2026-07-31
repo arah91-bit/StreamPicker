@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import html
 import json
 import logging
 import re
@@ -14,8 +15,8 @@ from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from app.recs import (config, db, dramas, kids_catalogs, playhistory,
-                      profile_streaming, watching)
+from app.recs import (bootstrap, config, db, dramas, kids_catalogs,
+                      playhistory, profile_streaming, watching)
 from app.recs.catalogs import generate_for_user
 from app.recs.kids import birthdate_from_age, clamp_age, effective_kid_age
 from app.recs import scheduler
@@ -44,6 +45,7 @@ _dramas_task: asyncio.Task | None = None
 _watching_task: asyncio.Task | None = None
 _playhistory_task: asyncio.Task | None = None
 CONFIGURE_HTML = (Path(__file__).parent / "templates" / "configure.html").read_text()
+BOOTSTRAP_HTML = (Path(__file__).parent / "templates" / "bootstrap.html").read_text()
 LANDING_HTML = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -224,6 +226,7 @@ async def list_users(secret: str):
         streaming_configured = bool(profile_streaming.profile_id_for_user(u))
         measurement = await db.get_recommendation_summary(
             u["token"], window_days=30)
+        verdicts = await db.feedback_counts(u["token"])
         out.append({
             "name": u["name"],
             "is_kid": bool(u["is_kid"]),
@@ -254,6 +257,8 @@ async def list_users(secret: str):
             ),
             "collection_filename": collection_filename(u),
             "lane_urls": _lane_urls(u["token"]),
+            "taste_url": f"{config.HOST_NAME}/{u['token']}/taste",
+            "taste_rated": verdicts.get("liked", 0) + verdicts.get("disliked", 0),
         })
     return {"users": out}
 
@@ -659,6 +664,86 @@ async def refresh(token: str):
     asyncio.create_task(generate_for_user(user, trigger="manual-refresh"))
     _queue_profile_streaming_build(user)
     return {"status": "refreshing"}
+
+
+# ── taste bootstrapper ───────────────────────────────────────────────────
+#
+# Reached by opening a per-viewer link on a phone. The token in the path is
+# the same one that addresses that viewer's addon, so this grants exactly the
+# access they already hand to their player — no new secret, and no new thing
+# to leak. Anyone holding the link can shape that viewer's recommendations,
+# which is why the page says whose profile it is.
+
+@app.get("/{token}/taste", response_class=HTMLResponse)
+async def taste_bootstrap(token: str):
+    user = await _require_user(token)
+    return BOOTSTRAP_HTML.replace("__VIEWER__", html.escape(user["name"]))
+
+
+@app.get("/{token}/taste/api/state")
+async def taste_state(token: str):
+    user = await _require_user(token)
+    genres, countries = db.bootstrap_taste(user)
+    return {
+        "name": user["name"],
+        "genres": [{"slug": s, "label": l} for s, l in bootstrap.PICKABLE_GENRES],
+        "countries": [{"code": c, "label": l}
+                      for c, l in bootstrap.PICKABLE_COUNTRIES],
+        "picked_genres": genres,
+        "picked_countries": countries,
+        "progress": await bootstrap.progress(token),
+    }
+
+
+class TastePicks(BaseModel):
+    genres: list[str] = []
+    countries: list[str] = []
+
+
+@app.post("/{token}/taste/api/picks")
+async def taste_picks(token: str, body: TastePicks):
+    await _require_user(token)
+    known = {slug for slug, _ in bootstrap.PICKABLE_GENRES}
+    codes = {code for code, _ in bootstrap.PICKABLE_COUNTRIES}
+    await db.set_bootstrap_taste(
+        token,
+        [g for g in body.genres if g in known],
+        [c for c in body.countries if c in codes])
+    return {"status": "saved"}
+
+
+@app.get("/{token}/taste/api/deck")
+async def taste_deck(token: str):
+    user = await _require_user(token)
+    from app.recs.profile_streaming import private_namespace_for_user
+    seen = await bootstrap.already_known(token,
+                                         private_namespace_for_user(user))
+    cards = await bootstrap.deck(user, seen)
+    return {"cards": cards, "progress": await bootstrap.progress(token)}
+
+
+class Verdict(BaseModel):
+    id: str
+    type: str = "movie"
+    verdict: str
+
+
+@app.post("/{token}/taste/api/verdict")
+async def taste_verdict(token: str, body: Verdict):
+    await _require_user(token)
+    if body.verdict not in db.VERDICTS:
+        raise HTTPException(400, "unknown verdict")
+    media_type = "movie" if body.type == "movie" else "series"
+    await db.record_feedback(token, body.id, media_type, body.verdict)
+    return {"progress": await bootstrap.progress(token)}
+
+
+@app.post("/{token}/taste/api/done")
+async def taste_done(token: str):
+    """Finish a session: rebuild now so the result is visible immediately."""
+    user = await _require_user(token)
+    asyncio.create_task(generate_for_user(user, trigger="taste-bootstrap"))
+    return {"status": "refreshing", "progress": await bootstrap.progress(token)}
 
 
 @app.get("/health")

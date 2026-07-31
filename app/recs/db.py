@@ -105,6 +105,24 @@ CREATE TABLE IF NOT EXISTS title_features (
 CREATE INDEX IF NOT EXISTS idx_title_features_imdb
     ON title_features (imdb_id);
 
+-- Explicit verdicts from the taste bootstrapper. This is the only place in
+-- the system that holds a *negative* label: everything else is inferred from
+-- plays, where "never watched" and "never heard of" are indistinguishable, so
+-- nothing can be scored badly without risking punishing our own delivery
+-- failures. Somebody tapping "not for me" is unambiguous, and is what lets the
+-- fingerprint carry a negative term at all.
+CREATE TABLE IF NOT EXISTS taste_feedback (
+    user_token TEXT NOT NULL,
+    imdb_id TEXT NOT NULL,
+    media_type TEXT NOT NULL,
+    verdict TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'bootstrap',
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (user_token, imdb_id)
+);
+CREATE INDEX IF NOT EXISTS idx_taste_feedback_user
+    ON taste_feedback (user_token, verdict);
+
 CREATE TABLE IF NOT EXISTS storage_migrations (
     id TEXT PRIMARY KEY,
     applied_at INTEGER NOT NULL
@@ -301,6 +319,12 @@ MIGRATIONS = [
     "ALTER TABLE title_state_syncs DROP COLUMN movie_watchlist_initialized",
     "ALTER TABLE title_state_syncs DROP COLUMN series_watchlist_initialized",
     "ALTER TABLE outcome_events DROP COLUMN trakt_id",
+    # What the bootstrapper asked for before it started showing titles. Stored
+    # so a half-finished session can be resumed on another device, and so the
+    # nightly build has something to work with for a viewer who picked genres
+    # and then rated nothing.
+    "ALTER TABLE users ADD COLUMN bootstrap_genres TEXT",
+    "ALTER TABLE users ADD COLUMN bootstrap_countries TEXT",
 ]
 
 # Applied before SCHEMA, unlike MIGRATIONS. `CREATE TABLE IF NOT EXISTS` would
@@ -1400,6 +1424,64 @@ async def cached_genres_by_imdb(imdb_ids: set[str]) -> dict[str, list[str]]:
         if genres:
             out[imdb_id] = list(genres)
     return out
+
+
+# ── taste feedback (explicit verdicts, the only negative labels we hold) ──
+
+VERDICTS = ("liked", "disliked", "seen", "unknown")
+
+
+async def record_feedback(user_token: str, imdb_id: str, media_type: str,
+                          verdict: str, source: str = "bootstrap") -> None:
+    """Store one verdict, replacing any earlier one for the same title."""
+    if verdict not in VERDICTS:
+        raise ValueError(f"unknown verdict: {verdict}")
+    await conn().execute(
+        "INSERT OR REPLACE INTO taste_feedback"
+        " (user_token, imdb_id, media_type, verdict, source, created_at)"
+        " VALUES (?,?,?,?,?,?)",
+        (user_token, imdb_id, media_type, verdict, source, int(time.time())),
+    )
+    await conn().commit()
+
+
+async def feedback_for(user_token: str) -> dict[str, dict]:
+    """IMDb id → {verdict, media_type} for one viewer."""
+    async with conn().execute(
+        "SELECT imdb_id, media_type, verdict FROM taste_feedback"
+        " WHERE user_token=?", (user_token,)) as cur:
+        rows = await cur.fetchall()
+    return {r["imdb_id"]: {"verdict": r["verdict"],
+                           "media_type": r["media_type"]} for r in rows}
+
+
+async def feedback_counts(user_token: str) -> dict[str, int]:
+    async with conn().execute(
+        "SELECT verdict, COUNT(*) AS n FROM taste_feedback"
+        " WHERE user_token=? GROUP BY verdict", (user_token,)) as cur:
+        return {r["verdict"]: r["n"] for r in await cur.fetchall()}
+
+
+async def set_bootstrap_taste(user_token: str, genres: list[str],
+                              countries: list[str]) -> None:
+    await conn().execute(
+        "UPDATE users SET bootstrap_genres=?, bootstrap_countries=?"
+        " WHERE token=?",
+        (json.dumps(genres), json.dumps(countries), user_token))
+    await conn().commit()
+
+
+def bootstrap_taste(user: dict) -> tuple[list[str], list[str]]:
+    """(genres, countries) a viewer picked, or empty lists."""
+    def load(value):
+        try:
+            parsed = json.loads(value) if value else []
+        except (TypeError, ValueError):
+            return []
+        return [str(x) for x in parsed] if isinstance(parsed, list) else []
+
+    return (load(user.get("bootstrap_genres")),
+            load(user.get("bootstrap_countries")))
 
 
 # ── title features (shared, content only — the fingerprint vocabulary) ──
