@@ -345,9 +345,10 @@ rechecks the same files, finishes the release, and seeds indefinitely.</div>
 <section class='card'>
  <div class='row'><div><div class='lbl'>Download the whole torrent (100%)
   <span class='envk'>PRIVATE_TRACKER_WHOLE_TORRENT</span></div>
-  <div class='desc'>On (default): the complete release downloads and seeds — no
-  hit-and-run. Off: only your clicked episode downloads from a season pack; the
-  rest is skipped and the torrent stays partial.</div></div>
+  <div class='desc'>Your clicked episode always downloads first and alone, so it
+  streams in order. On (default): once it finishes, the rest of the pack
+  resumes so the release completes and seeds — no hit-and-run. Off: the rest
+  stays skipped and the torrent stays partial.</div></div>
   <div class='ctl'><input class='swi' type='checkbox' data-key='PRIVATE_TRACKER_WHOLE_TORRENT'
   {'checked' if whole_on else ''} aria-label='Download the whole torrent'></div></div>
  <div class='pad'>

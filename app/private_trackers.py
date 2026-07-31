@@ -175,6 +175,8 @@ _search_outcomes: dict[tuple[str, str], dict] = {}
 _tokens: dict[str, tuple[float, dict]] = {}
 _token_locks: dict[str, asyncio.Lock] = {}
 _completion_tasks: dict[str, asyncio.Task] = {}
+# Staged season packs: info_hash -> task waiting to re-enable the other files.
+_promote_tasks: dict[str, asyncio.Task] = {}
 _rqbit_tasks: dict[str, asyncio.Task] = {}
 _rqbit_watch_selection: dict[str, int] = {}
 _rqbit_generation: dict[str, int] = {}
@@ -575,17 +577,73 @@ def _gb(size: int) -> str:
     return f"{size / 1e9:.2f} GB" if size else "unknown size"
 
 
+def _release_fingerprint(title: str) -> str:
+    """Match a tracker's result title against a torrent name already in a
+    client. Trackers and clients disagree on punctuation for the same release —
+    dots for spaces, brackets kept or dropped — so compare on alphanumerics
+    only. Deliberately not a fuzzy match: two genuinely different encodes of
+    one episode must stay distinct, or we would promise a download we do not
+    have."""
+    return re.sub(r"[^a-z0-9]+", "", (title or "").lower())
+
+
+async def downloaded_index() -> dict[str, dict]:
+    """Release fingerprint -> {"complete", "progress"} for everything already
+    in the local clients, so a search result we have on disk can be shown as
+    such instead of as one more thing to download.
+
+    qBittorrent is the whole inventory: it is the permanent store and the only
+    engine in use (the rqbit progressive lane is switched off). Best-effort — if
+    qBittorrent is unreachable this returns nothing and search results render
+    exactly the way they always did. One listing call, no per-torrent work."""
+    out: dict[str, dict] = {}
+    if not enabled():
+        return out
+    try:
+        response = await _qapi("GET", "/torrents/info",
+                               params={"category": CATEGORY})
+        for info in response.json()[:200]:
+            key = _release_fingerprint(str(info.get("name") or ""))
+            if not key:
+                continue
+            progress = float(info.get("progress") or 0.0)
+            out[key] = {"complete": progress >= 0.999999, "progress": progress}
+    except Exception as exc:
+        logger.info("private trackers: qBittorrent inventory unavailable: %s",
+                    type(exc).__name__)
+    return out
+
+
 def _resolution_label(*values) -> str:
     """Resolution text players can see without having to parse a filename."""
     match = _RES_RE.search(" ".join(str(value or "") for value in values))
     return f"{match.group(1)}p" if match else "unknown quality"
 
 
-def fallback_streams(media: str, media_id: str,
-                     found: list[dict]) -> list[dict]:
-    """Turn inert search results into explicit click-to-download stream rows."""
-    out = []
+def fallback_streams(media: str, media_id: str, found: list[dict],
+                     downloaded: dict[str, dict] | None = None) -> list[dict]:
+    """Turn inert search results into explicit click-to-download stream rows.
+
+    ``downloaded`` (see :func:`downloaded_index`) marks the results we already
+    hold and floats them to the top. A private search routinely returns twenty
+    near-identical rows; the one already on disk is categorically different
+    from the other nineteen — it plays now, costs no ratio and no download
+    slot — so it must not be left for the user to spot by luck. Clicking it is
+    safe: _activate_candidate finds the existing hash and skips the add.
+
+    Order is otherwise untouched, so within each group the quality ranking from
+    _search still decides."""
+    have = downloaded or {}
+    rows = []
     for cand in found:
+        state = have.get(_release_fingerprint(cand.get("title") or "")) or {}
+        rows.append((cand, state))
+    # Complete first, then partially downloaded, then everything else. Stable,
+    # so _search's quality ranking survives inside each group.
+    rows.sort(key=lambda r: (0 if r[1].get("complete") else
+                             1 if r[1] else 2))
+    out = []
+    for cand, state in rows:
         token = _mint({"mode": "candidate", **cand})
         indexer = _indexer_name(cand.get("indexer"))
         resolution = _resolution_label(cand.get("title"))
@@ -601,16 +659,29 @@ def fallback_streams(media: str, media_id: str,
                   if progressive_enabled() else
                   "The complete torrent downloads through qBittorrent and "
                   "seeds indefinitely.")
+        if state.get("complete"):
+            label = "Already Downloaded · Play Now"
+            note = ("You already have this release — opening it plays from "
+                    "your own copy and starts no new download.")
+        elif state:
+            pct = state.get("progress", 0.0) * 100
+            label = f"Already Downloading {pct:.0f}% · Click to Stream"
+            note = ("This release is already downloading here; opening it "
+                    "continues that download rather than starting another.")
+        else:
+            label = "Click to Download & Stream"
+            note = f"Starts only when opened; {action}"
         out.append({
-            "name": (f"🔒 {indexer} · {resolution} · "
-                     "Click to Download & Stream"),
+            "name": f"🔒 {indexer} · {resolution} · {label}",
             "title": (f"Private tracker: {indexer}\n{detail}\n{cand['title']}\n"
-                      f"Starts only when opened; {action}"),
+                      f"{note}"),
             "description": (f"Source: private-p2p\nPrivate tracker: {indexer}\n"
                             f"{detail}\n{cand['title']}"),
             "url": f"{PUBLIC_URL}/private/{token}",
             "behaviorHints": {"filename": cand["title"]},
-            "_private_action": True,
+            # A release already complete on disk needs no download step, so it
+            # is not an "action" row — it plays like any other local file.
+            "_private_action": not state.get("complete"),
             "_private_tracker": True,
             "_source_key": "private-p2p",
         })
@@ -624,7 +695,10 @@ async def choice_streams(media: str, media_id: str,
                          wait: float | None = None) -> list[dict]:
     """Manual alternatives that remain visible beside a local private row."""
     found = await candidates(media, media_id, wait=wait)
-    return fallback_streams(media, media_id, found) if found else []
+    if not found:
+        return []
+    return fallback_streams(media, media_id, found,
+                            await downloaded_index())
 
 
 # ── qBittorrent API ─────────────────────────────────────────────────────────
@@ -997,20 +1071,30 @@ async def _stop_qbit(info_hash: str) -> None:
 
 async def _prioritize_all(info_hash: str, files: list[dict], selected: int,
                           *, start: bool = True) -> None:
-    # The clicked file always gets maximal priority (7). This is a best-effort
-    # compatibility hint on the qBittorrent-only path; progressive mode reaches
-    # this function only after rqbit has completed the selected file.
+    # The clicked file gets maximal priority (7) and every *other* file is
+    # parked at 0 while it downloads. Priority alone cannot steer a sequential
+    # torrent: libtorrent picks the lowest-index piece that is merely *wanted*,
+    # so leaving the rest of a pack at 1 makes a season start at whichever
+    # episode happens to sit at file index 0 — not the one being watched.
+    # Parking them at 0 makes the clicked episode the only wanted range, so
+    # sequential + first/last-piece delivers it in order from its first byte.
     #
-    # WHOLE_TORRENT (default): every other file stays at normal priority (1),
-    # so the complete release downloads to 100% and seeds (no hit-and-run).
-    # When OFF: every other file is set to 0/skip, so only the clicked episode
-    # downloads and the release stays partial.
-    all_ids = "|".join(
-        str(int(f.get("index", i))) for i, f in enumerate(files))
-    if all_ids:
+    # WHOLE_TORRENT (default) then decides what happens *after* that episode
+    # lands: the rest of the pack is flipped back to 1 so the release still
+    # completes to 100% and seeds (no hit-and-run). When OFF the rest stays at
+    # 0 and the release stays partial.
+    rest_ids = "|".join(
+        str(int(f.get("index", i))) for i, f in enumerate(files)
+        if int(f.get("index", i)) != selected)
+    pick = next((f for f in files if int(f.get("index", -1)) == selected), None)
+    landed = float((pick or {}).get("progress") or 0) >= 0.999999
+    if rest_ids:
+        # Never park the rest while the episode is already whole — that would
+        # undo a completed promotion on every later open of the same torrent.
         await _qapi("POST", "/torrents/filePrio",
-                    data={"hash": info_hash, "id": all_ids,
-                          "priority": "1" if WHOLE_TORRENT else "0"})
+                    data={"hash": info_hash, "id": rest_ids,
+                          "priority": "1" if (WHOLE_TORRENT and landed)
+                                      else "0"})
     await _qapi("POST", "/torrents/filePrio",
                 data={"hash": info_hash, "id": str(selected), "priority": "7"})
     # Enforce the operator's "seed forever" decision per torrent rather than
@@ -1021,6 +1105,8 @@ async def _prioritize_all(info_hash: str, files: list[dict], selected: int,
                       "inactiveSeedingTimeLimit": "-1"})
     if start:
         await _start_qbit(info_hash)
+    if WHOLE_TORRENT and rest_ids and not landed:
+        _watch_staged_release(info_hash, selected)
 
 
 async def _wait_for_files(info_hash: str, timeout: float = 45) -> list[dict]:
@@ -1678,6 +1764,52 @@ def _notify_picker(media_id: str) -> None:
         logger.debug("private trackers: picker invalidation failed", exc_info=True)
 
 
+def _watch_staged_release(info_hash: str, selected: int) -> None:
+    """Flip the rest of a pack back on once the watched episode is whole.
+
+    `_prioritize_all` parks every other file at 0 so the clicked episode
+    downloads in order. That alone would leave the release partial, which is
+    hit-and-run territory on a private tracker — so this restores the rest to
+    normal priority the moment the episode finishes, and the pack completes and
+    seeds on its own.
+    """
+    task = _promote_tasks.get(info_hash)
+    if task and not task.done():
+        return
+
+    async def watch() -> None:
+        try:
+            while True:
+                files = await _files(info_hash)
+                pick = next((f for f in files
+                             if int(f.get("index", -1)) == selected), None)
+                if pick is None:
+                    return
+                if float(pick.get("progress") or 0) >= 0.999999:
+                    rest = "|".join(
+                        str(int(f.get("index", i))) for i, f in enumerate(files)
+                        if int(f.get("index", i)) != selected)
+                    if rest:
+                        await _qapi("POST", "/torrents/filePrio",
+                                    data={"hash": info_hash, "id": rest,
+                                          "priority": "1"})
+                        logger.info(
+                            "private trackers: %s episode complete — "
+                            "resuming the rest of the pack to seed",
+                            info_hash[:8])
+                    return
+                await asyncio.sleep(15)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("private trackers: staged promotion failed",
+                         exc_info=True)
+        finally:
+            _promote_tasks.pop(info_hash, None)
+
+    _promote_tasks[info_hash] = asyncio.create_task(watch())
+
+
 def _watch_completion(info_hash: str, media_id: str) -> None:
     task = _completion_tasks.get(info_hash)
     if task and not task.done():
@@ -2113,7 +2245,7 @@ async def test_connections(values: dict) -> dict:
 
 async def shutdown() -> None:
     tasks = (list(_search_tasks.values()) + list(_completion_tasks.values())
-             + list(_rqbit_tasks.values()))
+             + list(_promote_tasks.values()) + list(_rqbit_tasks.values()))
     if _reconcile_task is not None:
         tasks.append(_reconcile_task)
     for task in tasks:

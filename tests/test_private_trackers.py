@@ -221,6 +221,87 @@ class ReleasePolicyTests(unittest.TestCase):
             f"unrelated,{tag}"))
 
 
+def _cand(title, **over):
+    row = {"media": "series", "media_id": "tt1:1:4", "title": title,
+           "kind": "episode", "size": 2_000_000_000, "seeders": 14,
+           "indexer": "TorrentLeech", "indexer_id": 7,
+           "download_url": "http://prowlarr/7/download", "guid": title,
+           "season": 1, "episode": 4}
+    row.update(over)
+    return row
+
+
+class AlreadyDownloadedOrderingTests(unittest.TestCase):
+    """A private search returns ~20 near-identical rows. The one already on
+    disk plays now, costs no ratio and no download slot — so it leads, and says
+    so, instead of being left for the user to spot by luck."""
+
+    def _names(self, rows):
+        return [r["name"] for r in rows]
+
+    def test_downloaded_result_is_promoted_to_the_top(self):
+        found = [_cand("Show.S01E04.720p.WEB-DL"),
+                 _cand("Show.S01E04.2160p.REMUX"),
+                 _cand("Show.S01E04.1080p.WEB-DL")]
+        have = {private_trackers._release_fingerprint("Show.S01E04.1080p.WEB-DL"):
+                {"complete": True, "progress": 1.0}}
+        rows = private_trackers.fallback_streams("series", "tt1:1:4", found, have)
+        self.assertIn("Already Downloaded", rows[0]["name"])
+        self.assertIn("1080p", rows[0]["name"])
+
+    def test_partially_downloaded_ranks_between_complete_and_new(self):
+        found = [_cand("Show.S01E04.720p.WEB-DL"),
+                 _cand("Show.S01E04.2160p.REMUX"),
+                 _cand("Show.S01E04.1080p.WEB-DL")]
+        have = {
+            private_trackers._release_fingerprint("Show.S01E04.1080p.WEB-DL"):
+                {"complete": False, "progress": 0.42},
+            private_trackers._release_fingerprint("Show.S01E04.2160p.REMUX"):
+                {"complete": True, "progress": 1.0},
+        }
+        rows = private_trackers.fallback_streams("series", "tt1:1:4", found, have)
+        self.assertIn("Already Downloaded", rows[0]["name"])
+        self.assertIn("Already Downloading 42%", rows[1]["name"])
+        self.assertIn("Click to Download", rows[2]["name"])
+
+    def test_quality_order_survives_inside_each_group(self):
+        # Nothing downloaded: the search's own ranking must be untouched.
+        found = [_cand("Show.S01E04.2160p.REMUX"),
+                 _cand("Show.S01E04.1080p.WEB-DL"),
+                 _cand("Show.S01E04.720p.WEB-DL")]
+        rows = private_trackers.fallback_streams("series", "tt1:1:4", found, {})
+        self.assertEqual(["2160p", "1080p", "720p"],
+                         [n.split(" · ")[1] for n in self._names(rows)])
+
+    def test_completed_row_is_not_an_action_row(self):
+        found = [_cand("Show.S01E04.1080p.WEB-DL")]
+        have = {private_trackers._release_fingerprint("Show.S01E04.1080p.WEB-DL"):
+                {"complete": True, "progress": 1.0}}
+        rows = private_trackers.fallback_streams("series", "tt1:1:4", found, have)
+        self.assertFalse(rows[0]["_private_action"])
+        # …while one still downloading remains an action row.
+        have2 = {private_trackers._release_fingerprint("Show.S01E04.1080p.WEB-DL"):
+                 {"complete": False, "progress": 0.5}}
+        rows2 = private_trackers.fallback_streams("series", "tt1:1:4", found, have2)
+        self.assertTrue(rows2[0]["_private_action"])
+
+    def test_behaves_exactly_as_before_without_an_index(self):
+        found = [_cand("Show.S01E04.1080p.WEB-DL")]
+        rows = private_trackers.fallback_streams("series", "tt1:1:4", found)
+        self.assertIn("Click to Download & Stream", rows[0]["name"])
+        self.assertTrue(rows[0]["_private_action"])
+
+    def test_fingerprint_ignores_punctuation_but_not_different_encodes(self):
+        fp = private_trackers._release_fingerprint
+        # Tracker title vs the client's torrent name for the same release.
+        self.assertEqual(fp("Show.S01E04.1080p.WEB-DL-GRP"),
+                         fp("Show S01E04 1080p WEB DL GRP"))
+        # Two genuinely different encodes must not collide — promising a
+        # download we do not have is the one failure that matters here.
+        self.assertNotEqual(fp("Show.S01E04.1080p.WEB-DL-GRP"),
+                            fp("Show.S01E04.2160p.WEB-DL-GRP"))
+
+
 class TorrentMetainfoTests(unittest.TestCase):
     def test_info_hash_is_over_raw_info_dictionary(self):
         info = b"d4:name4:test6:lengthi123ee"
@@ -256,20 +337,73 @@ class ActivationBoundaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(204, response.status_code)
         activate.assert_not_awaited()
 
-    async def test_all_files_stay_selected_and_clicked_file_gets_priority(self):
+    async def test_pack_is_staged_so_clicked_episode_downloads_first(self):
+        # Everything but the clicked file parks at 0: a sequential torrent
+        # picks the lowest-index *wanted* piece, so leaving the rest at 1 would
+        # start the pack at file 0 instead of the episode being watched.
         files = [{"index": 0}, {"index": 1}, {"index": 2}]
         response = httpx.Response(200, request=httpx.Request("POST", "http://q"))
-        with mock.patch.object(private_trackers, "_qapi",
-                               new=mock.AsyncMock(return_value=response)) as api:
+        with mock.patch.object(
+                private_trackers, "_qapi",
+                new=mock.AsyncMock(return_value=response)) as api, \
+                mock.patch.object(private_trackers,
+                                  "_watch_staged_release") as watch:
             await private_trackers._prioritize_all("abc", files, 1)
         calls = api.await_args_list
-        self.assertEqual("0|1|2", calls[0].kwargs["data"]["id"])
-        self.assertEqual("1", calls[0].kwargs["data"]["priority"])
+        self.assertEqual("0|2", calls[0].kwargs["data"]["id"])
+        self.assertEqual("0", calls[0].kwargs["data"]["priority"])
         self.assertEqual("1", calls[1].kwargs["data"]["id"])
         self.assertEqual("7", calls[1].kwargs["data"]["priority"])
         self.assertEqual("/torrents/setShareLimits", calls[2].args[1])
         self.assertEqual("-1", calls[2].kwargs["data"]["ratioLimit"])
         self.assertEqual("-1", calls[2].kwargs["data"]["seedingTimeLimit"])
+        watch.assert_called_once_with("abc", 1)
+
+    async def test_finished_episode_leaves_rest_of_pack_enabled(self):
+        # A later open of the same torrent must not undo a promotion that
+        # already happened, or the pack would stop completing.
+        files = [{"index": 0}, {"index": 1, "progress": 1.0}, {"index": 2}]
+        response = httpx.Response(200, request=httpx.Request("POST", "http://q"))
+        with mock.patch.object(
+                private_trackers, "_qapi",
+                new=mock.AsyncMock(return_value=response)) as api, \
+                mock.patch.object(private_trackers,
+                                  "_watch_staged_release") as watch:
+            await private_trackers._prioritize_all("abc", files, 1)
+        self.assertEqual("1", api.await_args_list[0].kwargs["data"]["priority"])
+        watch.assert_not_called()
+
+    async def test_partial_release_mode_never_promotes_the_rest(self):
+        files = [{"index": 0}, {"index": 1}, {"index": 2}]
+        response = httpx.Response(200, request=httpx.Request("POST", "http://q"))
+        with mock.patch.object(private_trackers, "WHOLE_TORRENT", False), \
+                mock.patch.object(
+                    private_trackers, "_qapi",
+                    new=mock.AsyncMock(return_value=response)) as api, \
+                mock.patch.object(private_trackers,
+                                  "_watch_staged_release") as watch:
+            await private_trackers._prioritize_all("abc", files, 1)
+        self.assertEqual("0", api.await_args_list[0].kwargs["data"]["priority"])
+        watch.assert_not_called()
+
+    async def test_staged_pack_resumes_once_the_episode_is_whole(self):
+        partial = [{"index": 0}, {"index": 1, "progress": 0.4}, {"index": 2}]
+        done = [{"index": 0}, {"index": 1, "progress": 1.0}, {"index": 2}]
+        response = httpx.Response(200, request=httpx.Request("POST", "http://q"))
+        with mock.patch.object(
+                private_trackers, "_files",
+                new=mock.AsyncMock(side_effect=[partial, done])), \
+                mock.patch.object(
+                    private_trackers, "_qapi",
+                    new=mock.AsyncMock(return_value=response)) as api, \
+                mock.patch("app.private_trackers.asyncio.sleep",
+                           new=mock.AsyncMock()):
+            private_trackers._watch_staged_release("abc", 1)
+            await private_trackers._promote_tasks["abc"]
+        call = api.await_args_list[-1]
+        self.assertEqual("/torrents/filePrio", call.args[1])
+        self.assertEqual("0|2", call.kwargs["data"]["id"])
+        self.assertEqual("1", call.kwargs["data"]["priority"])
 
     async def test_active_download_count_ignores_completed_seeds(self):
         response = httpx.Response(
