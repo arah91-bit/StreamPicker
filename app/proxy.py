@@ -1351,12 +1351,31 @@ BUFFER_SLOW_MARGIN = float(os.environ.get("BUFFER_SLOW_MARGIN", "0.9"))
 # fill alive across the gap costs at most this much read-ahead on a stream that
 # really was abandoned, and the reaper still evicts it afterwards.
 BUFFER_IDLE_GRACE = float(os.environ.get("BUFFER_IDLE_GRACE", "180"))
+# The same grace for a source that rations concurrent connections rather than
+# bandwidth (see _reader_interested). Hosts are matched by name because that is
+# the one thing a candidate always carries honestly.
+BUFFER_IDLE_GRACE_RATIONED = float(
+    os.environ.get("BUFFER_IDLE_GRACE_RATIONED", "10"))
+_RATIONED_HOSTS = ("easynews.com",)
+
+
+def _rationed_source(source) -> bool:
+    """Whether this candidate's host limits us to a couple of transfers."""
+    url = (source or {}).get("u", "") if isinstance(source, dict) else (source or "")
+    host = (urlsplit(str(url)).hostname or "").lower()
+    return any(host == h or host.endswith("." + h) for h in _RATIONED_HOSTS)
 # The tail of the file, fetched eagerly when a producer starts. Players read
 # the container index (MKV cues / MP4 moov-at-end) from EOF the moment they
 # open a stream — observed live: a reader at offset 368,449,152 of a
 # 368,477,225-byte file while the sequential cache held only the front. Without
 # this, every open and every seek pays a cold upstream fetch for those bytes.
 BUFFER_TAIL_BYTES = int(float(os.environ.get("BUFFER_TAIL_MB", "8")) * 1024 * 1024)
+# How long the producer holds off its bulk fill to let that tail warm land
+# first. The index is on the critical path to the first frame and the fill is
+# not, so the fill can wait; letting them race cost 50s of black screen on
+# Easynews (see _produce). Bounded, so an expensive tail degrades to today's
+# background behaviour instead of stalling the start. 0 restores the race.
+TAIL_WARM_HEADSTART = float(os.environ.get("BUFFER_TAIL_HEADSTART", "3"))
 # One quick second chance for an NZB source that failed to start: nzbdav mount
 # readiness flaps while an import settles (observed: probe OK at 5 MB/s, dead
 # 11s later, playing fine 26s after that). Public debrid links don't flap this
@@ -1700,6 +1719,23 @@ async def _produce(e: _Entry, token: str, resp, it, prebuf: list) -> None:
             t = asyncio.create_task(_fetch_tail(e))
             _bg_tasks.add(t)
             t.add_done_callback(_reap_task)
+            # Give the warm a head start before the bulk fill begins competing
+            # with it. The player cannot show a single frame until it has the
+            # container index, which lives at EOF — and the sequential fill
+            # starting at byte 0 will never contain it. Letting the two race
+            # measured catastrophically on Easynews: an 8 MB tail read that
+            # takes 0.4 s unopposed took 50-56 s against a 40 MB/s fill, and
+            # the picture appeared the instant it finally landed (ffprobe:
+            # 1.3 s direct vs 49.5 s through here). The wait is bounded, so a
+            # source whose tail is genuinely expensive (a cold nzbdav mount
+            # costs ~7.7 s) just falls back to warming in the background
+            # exactly as before, having cost us TAIL_WARM_HEADSTART at most.
+            if TAIL_WARM_HEADSTART > 0:
+                try:
+                    await asyncio.wait_for(asyncio.shield(t),
+                                           TAIL_WARM_HEADSTART)
+                except Exception:       # timeout, or the warm failed on its own
+                    pass
         while True:
             async with e.cond:            # backpressure + pause when nobody's watching
                 await e.cond.wait_for(
@@ -2297,18 +2333,28 @@ async def _fetch_tail(e: _Entry) -> None:
     rh = f"bytes={e.total - want}-{e.total - 1}"
     try:
         resp = await _send(e.source, rh)
-    except Exception:
+    except Exception as ex:
+        # Say so. This used to fail completely silently, and the absence of the
+        # success line below is indistinguishable from "the feature is off" —
+        # which cost a full investigation when an Easynews connection cap
+        # started starving it. A warm that does not happen is a 7-second index
+        # read later, so it is worth one line.
+        logger.info(f"bufcache {e.sig}: tail warm failed ({type(ex).__name__})")
         return
+    why = ""
     try:
         if not _range_response_ok(resp, rh):
+            why = f"bad range response (HTTP {resp.status_code})"
             return
         chunks, got = [], 0
         async for chunk in resp.aiter_raw():
             chunks.append(chunk)
             got += len(chunk)
             if got > want:                       # server ignored the range
+                why = "source ignored the range"
                 return
         if got != want:
+            why = f"short read ({got} of {want} bytes)"
             return
         e.tail = b"".join(chunks)
         e.tail_off = (e.total or want) - want
@@ -2316,9 +2362,11 @@ async def _fetch_tail(e: _Entry) -> None:
             e.cond.notify_all()
         logger.info(f"bufcache {e.sig}: tail warmed ({want // 1024} KB @ "
                     f"{e.tail_off})")
-    except Exception:
-        pass
+    except Exception as ex:
+        why = type(ex).__name__
     finally:
+        if why:
+            logger.info(f"bufcache {e.sig}: tail warm failed ({why})")
         try:
             await resp.aclose()
         except Exception:
@@ -2345,12 +2393,22 @@ def _reader_interested(e: _Entry) -> bool:
     """Whether the producer should keep filling this entry.
 
     A live reader obviously counts. So does one that touched the entry within
-    BUFFER_IDLE_GRACE: a player fetching in discrete ranges holds no connection
+    the idle grace: a player fetching in discrete ranges holds no connection
     between them, and a range past the write head is served directly without
     ever taking a consumer ref. Judging solely on `consumers` mistakes that for
     an abandoned stream.
+
+    The grace is shorter for a source that rations connections. On an ordinary
+    CDN, reading ahead for an absent reader costs only bandwidth we have. On
+    Easynews it costs a *connection*, of which there are about two, and the
+    next stream's index read then queues behind this one — measured: a tail
+    warm that takes 0.36 s unopposed took 48.7 s with one abandoned fill still
+    running at 40 MB/s. Keeping a read-ahead warm for a viewer who left is not
+    worth a 48-second black screen for the one who is here.
     """
-    return e.consumers > 0 or (time.time() - (e.last or 0.0)) < BUFFER_IDLE_GRACE
+    grace = (BUFFER_IDLE_GRACE_RATIONED if _rationed_source(e.source)
+             else BUFFER_IDLE_GRACE)
+    return e.consumers > 0 or (time.time() - (e.last or 0.0)) < grace
 
 
 async def _serve_buffered(token: str, session: dict, cands: list, offset: int,

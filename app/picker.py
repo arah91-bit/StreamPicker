@@ -2490,13 +2490,18 @@ async def _pick_online(media: str, media_id: str,
 
 async def _gather_extras(media: str, media_id: str, wait: float) -> list[dict]:
     """Collect streams from every user-added addon (app.sources.EXTRAS) plus the
-    native Prowlarr lane when it is enabled. Each is joined like any built-in
-    source; failures/timeouts yield nothing and never break the pick. Folding
-    Prowlarr in here threads it through every merge site (fast finisher, slow
-    finish, slow foreground) that already concatenates these into the pool."""
+    native Prowlarr and Easynews lanes when they are enabled. Each is joined like
+    any built-in source; failures/timeouts yield nothing and never break the
+    pick. Folding them in here threads them through every merge site (fast
+    finisher, slow finish, slow foreground) that already concatenates these into
+    the pool — the fast race reaches them separately via sources.search_all(),
+    so this is what stops the quality picker from being the one surface that
+    cannot see them."""
     keys = list(sources.EXTRAS)
     if sources.has(sources.PROWLARR):
         keys.append(sources.PROWLARR)
+    if sources.has(sources.EASYNEWS):
+        keys.append(sources.EASYNEWS)
     if not keys:
         return []
     results = await asyncio.gather(
@@ -2772,7 +2777,8 @@ async def _finish_slow(cache_key: str, media: str, media_id: str,
             media, media_id, wait=max(left(), 0.0))
         if found:
             private_rows = private_trackers.fallback_streams(
-                media, media_id, found)
+                media, media_id, found,
+                await private_trackers.downloaded_index())
             _notice_until.pop(cache_key, None)
             _store(cache_key, private_rows)
             logger.info("%s: background cached %d private last-resort row(s)",
@@ -2829,7 +2835,8 @@ async def _no_source(cache_key: str, media: str, media_id: str,
     found = await private_trackers.candidates(
         media, media_id, wait=max(0.0, private_wait))
     if found:
-        streams = private_trackers.fallback_streams(media, media_id, found)
+        streams = private_trackers.fallback_streams(
+            media, media_id, found, await private_trackers.downloaded_index())
         _notice_until.pop(cache_key, None)
         _store(cache_key, streams)
         logger.info("%s: private last resort offers %d manual candidate(s)",

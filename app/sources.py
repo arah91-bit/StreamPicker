@@ -26,7 +26,7 @@ import time
 
 import httpx
 
-from app import prowlarr, telemetry, usenet
+from app import easynews, prowlarr, telemetry, usenet
 
 logger = logging.getLogger("stream-picker")
 
@@ -43,6 +43,11 @@ NZB = "nzb"
 # Native Prowlarr lane (app.prowlarr): our own Prowlarr search + debrid resolve,
 # also internal (not an HTTP addon) and, like NZB, slow (Prowlarr live-scrapes).
 PROWLARR = "prowlarr"
+# Easynews lane (app.easynews): our own Easynews search, answering with files
+# that are already assembled and served over plain HTTPS. Internal like NZB and
+# PROWLARR, but the opposite of them in cost — search and first byte are both
+# sub-second — so it races in the fast lane rather than trailing the slow one.
+EASYNEWS = "easynews"
 _SOURCE_TRUST_KEY = "_source_trust"
 _NZB_TRUST_SENTINEL = object()
 
@@ -58,6 +63,7 @@ _BASES = {
     MEDIAFUSION: (os.environ.get("MEDIAFUSION_BASE_URL") or "").rstrip("/") or None,
     NZB: "internal" if usenet.enabled() else None,
     PROWLARR: "internal" if prowlarr.enabled() else None,
+    EASYNEWS: "internal" if easynews.enabled() else None,
 }
 
 # httpx request timeout per source — how long the *underlying* search may run,
@@ -129,9 +135,11 @@ _load_extras()
 
 def search_all() -> list[str]:
     """Every source to search for a title, built-ins + user addons, that is
-    actually configured. The slow internal lanes (Prowlarr, then NZB) stay
+    actually configured. Easynews leads — it answers in well under a second with
+    a directly playable file. The slow internal lanes (Prowlarr, then NZB) stay
     last."""
-    return [k for k in [*BUILTIN_ONLINE, *EXTRAS, PROWLARR, NZB] if has(k)]
+    return [k for k in [EASYNEWS, *BUILTIN_ONLINE, *EXTRAS, PROWLARR, NZB]
+            if has(k)]
 
 
 # Successful (non-empty) searches are reused for RAW_TTL. Empty results —
@@ -159,6 +167,10 @@ def has(source: str) -> bool:
         return False
     if source == NZB:
         return True
+    if source == EASYNEWS:
+        # Its rows are direct HTTPS files, so the master gate for that output
+        # lane applies — its own toggle is already folded into _BASES.
+        return HTTPS_STREAMS_ENABLED
     if source in EXTRAS:
         # A custom addon may return both debrid/torrent and direct HTTPS rows;
         # search it while either output lane is enabled, then filter per row.
@@ -211,6 +223,14 @@ async def _run(key: tuple, base: str, media: str, media_id: str,
             state = str(pr_state.get("state") or
                         ("ok" if streams else "empty"))
             detail = str(pr_state.get("detail") or "")[:160]
+        elif source == EASYNEWS:   # internal lane, not an HTTP addon
+            # app.easynews returns [] rather than raising, and is fast enough
+            # that it needs no special deadline handling of its own.
+            streams = await easynews.streams(media, media_id)
+            en_state = easynews.outcome(media, media_id)
+            state = str(en_state.get("state") or
+                        ("ok" if streams else "empty"))
+            detail = str(en_state.get("detail") or "")[:160]
         else:
             url = f"{base}/stream/{media}/{media_id}.json"
             r = await _client.get(url, timeout=timeout)
@@ -249,10 +269,12 @@ async def _run(key: tuple, base: str, media: str, media_id: str,
         if source == NZB:
             item = dict(stream)
             item[_SOURCE_TRUST_KEY] = _NZB_TRUST_SENTINEL
-        elif source == PROWLARR:
-            # In-process lane: keep our own annotations (there is no untrusted
-            # upstream to strip), but it earns no NZB playability trust — every
-            # resolved link still goes through the normal playback probe.
+        elif source in (PROWLARR, EASYNEWS):
+            # In-process lanes: keep our own annotations (there is no untrusted
+            # upstream to strip), but they earn no NZB playability trust — every
+            # link still goes through the normal playback probe. For Easynews
+            # that is the whole point: its index says a file exists and what it
+            # claims to be, never that the file plays or is the right content.
             item = dict(stream)
         else:
             item = {k: v for k, v in stream.items()
@@ -341,6 +363,10 @@ def outcome(source: str, media: str, media_id: str) -> dict:
             return live
     if source == PROWLARR:
         live = prowlarr.outcome(media, media_id)
+        if live.get("state") != "unknown":
+            return live
+    if source == EASYNEWS:
+        live = easynews.outcome(media, media_id)
         if live.get("state") != "unknown":
             return live
     return dict(_outcomes.get(key) or {

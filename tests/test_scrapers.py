@@ -45,8 +45,8 @@ class CatalogTests(unittest.TestCase):
     def test_engine_meta_leaks_no_internals(self):
         for m in scrapers.engine_meta():
             self.assertEqual({"id", "label", "badge", "blurb", "needs_debrid",
-                              "custom_only", "needs_prowlarr", "internal",
-                              "docs"}, set(m))
+                              "custom_only", "needs_prowlarr", "needs_easynews",
+                              "internal", "docs"}, set(m))
 
 
 class TorrentioBuilderTests(unittest.TestCase):

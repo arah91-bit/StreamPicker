@@ -398,11 +398,16 @@ if(SBOX){
   else CUSTOM.push({name:en.name||'',url:en.url||''});});
  const PR={url:(DATA.prowlarr&&DATA.prowlarr.url)||'',
            hasKey:!!(DATA.prowlarr&&DATA.prowlarr.has_key),key:''};
+ const EN={user:(DATA.easynews&&DATA.easynews.user)||'',
+           hasPass:!!(DATA.easynews&&DATA.easynews.has_pass),pass:''};
  const havePr=()=>!!(PR.url&&(PR.hasKey||PR.key));
+ const haveEn=()=>!!(EN.user&&(EN.hasPass||EN.pass));
  const haveDebrid=()=>DROWS.length>0;
- // Why a toggle is grayed out: its Prowlarr backend or a debrid key is missing.
+ // Why a toggle is grayed out: its backend (Prowlarr / Easynews login) or a
+ // debrid key is missing.
  const gateReason=e=>{
   if(e.needs_prowlarr&&!havePr())return 'prowlarr';
+  if(e.needs_easynews&&!haveEn())return 'easynews';
   if(e.needs_debrid&&!haveDebrid()&&!ST[e.id].url)return 'debrid';
   return '';};
  const gated=e=>!!gateReason(e);
@@ -461,8 +466,9 @@ if(SBOX){
    const showUrl=!e.internal&&(e.custom_only||st.url!=='');
    const ph=e.custom_only?'paste your configured manifest URL'
      :'custom manifest URL (optional)';
-   const warn=gateReason(e)==='prowlarr'
-     ?'Add your Prowlarr above to switch this on.'
+   const gr=gateReason(e);
+   const warn=gr==='prowlarr'?'Add your Prowlarr above to switch this on.'
+     :gr==='easynews'?'Add your Easynews login above to switch this on.'
      :'Add a debrid key above to switch this on.';
    return `<div class='engrow' data-id='${e.id}'>`+
     `<input type='checkbox' class='swi engtoggle' data-id='${e.id}' `+
@@ -484,7 +490,12 @@ if(SBOX){
     `<button type='button' class='btn ghost engtest' data-id='${e.id}'>Test</button>`+
     `<span class='tres'></span></div>`;}).join('');}
  $('#enginelist').addEventListener('change',e=>{
-  const t=e.target.closest('.engtoggle');if(t)ST[t.dataset.id].on=t.checked;});
+  const t=e.target.closest('.engtoggle');if(!t)return;
+  ST[t.dataset.id].on=t.checked;
+  // Remember an explicit "off" so entering/editing a credential below does not
+  // helpfully switch the engine back on against the operator's decision.
+  if(!t.checked)ST[t.dataset.id].userOff=true;
+  else delete ST[t.dataset.id].userOff;});
  $('#enginelist').addEventListener('input',e=>{
   const i=e.target.closest('.enginput');if(i)ST[i.dataset.id].url=i.value.trim();});
  $('#enginelist').addEventListener('click',e=>{
@@ -493,8 +504,10 @@ if(SBOX){
    if(u){u.hidden=!u.hidden;if(!u.hidden)u.querySelector('input').focus();}return;}
   const t=e.target.closest('.engtest');if(!t)return;
   const row=t.closest('.engrow'),id=t.dataset.id;
-  if(ENG[id]&&ENG[id].internal){        // Prowlarr source → test its backend
-   testProwlarr(t,row.querySelector('.dot'),row.querySelector('.tres'));return;}
+  if(ENG[id]&&ENG[id].internal){        // internal lane → test its backend
+   const dot=row.querySelector('.dot'),res=row.querySelector('.tres');
+   if(id==='easynews')testEasynews(t,dot,res);else testProwlarr(t,dot,res);
+   return;}
   testOne(id,ST[id].url,t,row.querySelector('.dot'),row.querySelector('.tres'));});
 
  /* custom addons (folded in) */
@@ -558,6 +571,35 @@ if(SBOX){
   $('#prowlarr_test').addEventListener('click',()=>testProwlarr(
    $('#prowlarr_test'),$('#prowlarr_dot'),$('#prowlarr_res')));}
 
+ /* Easynews login: username + password, tested with a real search. A blank
+    password reuses the stored one, so the username stays editable without
+    retyping it. */
+ async function testEasynews(btnEl,dotEl,resEl){
+  dotEl.className='dot run';resEl.className='tres';resEl.textContent='testing…';
+  btnEl.disabled=true;
+  try{const r=await post('/api/settings/test/easynews',
+        {values:{EASYNEWS_USER:EN.user,EASYNEWS_PASS:EN.pass}});
+   dotEl.className='dot '+(r.ok?'ok':'bad');resEl.className='tres '+(r.ok?'ok':'bad');
+   resEl.textContent=`${r.ms} ms · ${r.detail}`;
+  }catch(err){dotEl.className='dot bad';resEl.className='tres bad';
+   resEl.textContent=err.message;}
+  btnEl.disabled=false;}
+ function initEasynews(){
+  $('#easynews_user').value=EN.user;
+  if(EN.hasPass)$('#easynews_pass').placeholder='kept · hidden — blank keeps it';
+  /* Credentials are the switch: the moment a complete login is present the
+     engine turns itself on, so nobody has to find a second control to make the
+     thing they just configured actually run. Turning it off afterwards sticks
+     (it writes EASYNEWS_SOURCE=0) and the login is kept either way. */
+  const sync=()=>{if(haveEn()&&!ST.easynews.userOff)ST.easynews.on=true;
+   renderEngines();};
+  $('#easynews_user').addEventListener('input',ev=>{
+   EN.user=ev.target.value.trim();sync();});
+  $('#easynews_pass').addEventListener('input',ev=>{
+   EN.pass=ev.target.value;sync();});
+  $('#easynews_test').addEventListener('click',()=>testEasynews(
+   $('#easynews_test'),$('#easynews_dot'),$('#easynews_res')));}
+
  /* collect enabled engines + custom addons, then save/test-keys together */
  function collectEngines(){
   const out=[];
@@ -573,7 +615,8 @@ if(SBOX){
   try{
    const res=await post('/api/settings/scrapers',
      {debrids,engines:collectEngines(),
-      prowlarr:{url:PR.url,api_key:PR.key},dry_run:dry});
+      prowlarr:{url:PR.url,api_key:PR.key},
+      easynews:{username:EN.user,password:EN.pass},dry_run:dry});
    const parts=Object.entries(res.results||{}).map(([k,v])=>
     (v.ok===false?'✗ ':v.ok===true?'✓ ':'• ')+(PROV[k]?PROV[k].label:k));
    if(dry)setRes(parts.join('   ')||'no checkable keys — save to apply',
@@ -584,6 +627,10 @@ if(SBOX){
     $('#prowlarr_key').value='';
     $('#prowlarr_key').placeholder=PR.hasKey?'kept · hidden — blank keeps it'
      :'Prowlarr API key';
+    EN.hasPass=EN.user?(EN.hasPass||!!EN.pass):false;EN.pass='';
+    $('#easynews_pass').value='';
+    $('#easynews_pass').placeholder=EN.hasPass?'kept · hidden — blank keeps it'
+     :'Easynews password';
     renderEngines();
     setRes('Saved — restart to apply.','ok');
     $$('.savebar').forEach(b=>b.dataset.restart='1');refreshBar();}
@@ -592,7 +639,7 @@ if(SBOX){
   btn.disabled=false;}
  $('#scrapers_test').addEventListener('click',()=>sendScrapers(true));
  $('#scrapers_save').addEventListener('click',()=>sendScrapers(false));
- renderDebrids();renderEngines();renderCustom();initProwlarr();
+ renderDebrids();renderEngines();renderCustom();initProwlarr();initEasynews();
 }
 
 const advsearch=$('#advsearch');
@@ -905,14 +952,21 @@ def _scrapers() -> str:
                       for p in debrid.PROVIDERS],
         "debrids": ids,
         "engines": scrapers.engine_meta(),
-        "enabled": scrapers.current(fast, stremthru, mediafusion,
-                                    config.pending("EXTRA_ADDONS"),
-                                    config.pending("SCRAPERS"),
-                                    config.pending("PROWLARR_SOURCE")),
+        "enabled": scrapers.current(
+            fast, stremthru, mediafusion,
+            config.pending("EXTRA_ADDONS"), config.pending("SCRAPERS"),
+            config.pending("PROWLARR_SOURCE"),
+            config.pending("EASYNEWS_SOURCE"),
+            bool(config.pending("EASYNEWS_USER")
+                 and config.pending("EASYNEWS_PASS"))),
         # Prowlarr backend: the URL is safe to echo; the key is a secret, so the
         # panel only learns whether one is stored (blank submit keeps it).
         "prowlarr": {"url": config.pending("PROWLARR_URL"),
-                     "has_key": bool(config.pending("PROWLARR_API_KEY"))}},
+                     "has_key": bool(config.pending("PROWLARR_API_KEY"))},
+        # Easynews login: same shape — the username echoes, the password only
+        # reports that one is stored.
+        "easynews": {"user": config.pending("EASYNEWS_USER"),
+                     "has_pass": bool(config.pending("EASYNEWS_PASS"))}},
         separators=(",", ":"))
     return (
         uitheme.section("CATALOG", "Sources",
@@ -944,6 +998,21 @@ def _scrapers() -> str:
         "the Prowlarr source below both use it. Comet reads Prowlarr from its "
         "own container environment, so point it at Prowlarr in your compose, "
         "not here.</p>"
+        "<div class='srcsub srcsub2'>Easynews "
+        "<span class='advhint'>your Easynews login — optional</span></div>"
+        "<div class='debridadd' style='margin-top:8px'>"
+        "<input id='easynews_user' type='text' spellcheck='false' "
+        "autocomplete='off' placeholder='Easynews username'>"
+        "<input id='easynews_pass' type='password' autocomplete='new-password' "
+        "spellcheck='false' placeholder='Easynews password'>"
+        "<button type='button' class='btn ghost' id='easynews_test'>Test</button>"
+        "<span class='dot' id='easynews_dot'></span>"
+        "<span class='tres' id='easynews_res'></span></div>"
+        "<p class='blurb' style='margin:6px 0 0'>Easynews serves finished files "
+        "over plain HTTPS, so it searches in well under a second and seeks "
+        "anywhere in a file just as fast — no NZB and no mounting. Saving a "
+        "login switches the Easynews source on; switch it off below and the "
+        "login is kept for next time.</p>"
         "<div class='srcsub srcsub2'>Scrapers</div>"
         "<div id='enginelist'></div>"
         "<div class='srcsub srcsub2'>Custom addon "

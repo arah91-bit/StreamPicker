@@ -66,6 +66,12 @@ ENGINES = [
      "blurb": "Search your own Prowlarr indexers directly and stream the cached "
               "torrents through your debrid. Add your Prowlarr above first.",
      "docs": "https://prowlarr.com"},
+    {"id": "easynews", "label": "Easynews", "badge": "EN", "key": None,
+     "needs_debrid": False, "custom_only": False, "needs_easynews": True,
+     "internal": True,
+     "blurb": "Search Easynews and stream the file straight over HTTPS — no "
+              "NZB, no mounting, sub-second seeks. Add your login above.",
+     "docs": "https://www.easynews.com"},
     {"id": "torrentio", "label": "Torrentio", "badge": "TO", "key": None,
      "needs_debrid": True, "custom_only": False,
      "blurb": "Public torrent scraper — mainstream plus anime (Nyaa, "
@@ -92,6 +98,7 @@ def engine_meta() -> list[dict]:
              "blurb": e["blurb"], "needs_debrid": e["needs_debrid"],
              "custom_only": e["custom_only"],
              "needs_prowlarr": e.get("needs_prowlarr", False),
+             "needs_easynews": e.get("needs_easynews", False),
              "internal": e.get("internal", False), "docs": e["docs"]}
             for e in ENGINES]
 
@@ -206,15 +213,31 @@ def _match_extra(url: str) -> str:
     return ""
 
 
+def _easynews_on(easynews_creds: bool, easynews_source: str) -> bool:
+    """Easynews is on as soon as a login is stored, unless it was explicitly
+    switched off. Credentials are the switch (EASYNEWS_SOURCE defaults to "1"),
+    and switching the engine off writes "0" without discarding them — so it can
+    be turned back on without retyping."""
+    return bool(easynews_creds
+                and str(easynews_source or "1").strip().lower()
+                not in ("0", "false", "no", "off"))
+
+
 def current(fast_url: str, stremthru_url: str, mediafusion_url: str,
             extra_addons: str, scrapers: str,
-            prowlarr_source: str = "") -> list[dict]:
+            prowlarr_source: str = "", easynews_source: str = "",
+            easynews_creds: bool = False) -> list[dict]:
     """The enabled engines the panel should render as [{"id", "url"?, "name"?}].
 
     SCRAPERS is authoritative once written; otherwise reconstruct from the
     runtime keys so an existing install opens with its sources already on. Never
     emits a debrid key — only which engines are configured (custom URLs, which a
-    user pasted themselves, are echoed back so they can edit them)."""
+    user pasted themselves, are echoed back so they can edit them).
+
+    Easynews is the exception to SCRAPERS being authoritative: its credentials
+    are its switch, so a login saved by any path shows the engine on even if
+    SCRAPERS predates it. An explicit off ("0") still wins."""
+    easynews = _easynews_on(easynews_creds, easynews_source)
     if (scrapers or "").strip():
         try:
             items = json.loads(scrapers)
@@ -228,10 +251,16 @@ def current(fast_url: str, stremthru_url: str, mediafusion_url: str,
                     if it.get("name"):
                         row["name"] = str(it["name"])
                     out.append(row)
+            if easynews and not any(o["id"] == "easynews" for o in out):
+                out.append({"id": "easynews"})
+            elif not easynews:
+                out = [o for o in out if o["id"] != "easynews"]
             return out
         except ValueError:
             pass
     out = []
+    if easynews:
+        out.append({"id": "easynews"})
     if (fast_url or "").strip():
         out.append({"id": "comet"})
     if (stremthru_url or "").strip():
@@ -300,6 +329,8 @@ async def apply(fast_url: str, stremthru_url: str, mediafusion_url: str,
                 extra_addons: str, debrids_submitted, engines_submitted,
                 *, prowlarr_submitted: dict | None = None,
                 prowlarr_url: str = "", prowlarr_key: str = "",
+                easynews_submitted: dict | None = None,
+                easynews_user: str = "", easynews_pass: str = "",
                 mf_api_password: str = "", dry_run: bool = False) -> dict:
     """Mint every enabled engine from the central debrid list and return the
     runtime-key updates to persist. Fresh checkable debrid keys are verified
@@ -311,7 +342,13 @@ async def apply(fast_url: str, stremthru_url: str, mediafusion_url: str,
     ``prowlarr_url``/``prowlarr_key`` the stored values a blank submit keeps) is
     persisted here and, when the MediaFusion or Prowlarr engines are on, wired
     into them — MediaFusion via its per-user indexer config, Prowlarr via the
-    native lane toggle (``PROWLARR_SOURCE``)."""
+    native lane toggle (``PROWLARR_SOURCE``).
+
+    The Easynews login (``easynews_submitted`` {"username", "password"}, with
+    ``easynews_user``/``easynews_pass`` the stored values a blank submit keeps)
+    is persisted the same way, but its lane toggle is inverted: saving a login
+    switches the engine on, and ``EASYNEWS_SOURCE`` is written "0" — never
+    cleared — to switch it off, so the credentials survive the round trip."""
     engines = _resolve_engines(engines_submitted)
     ids = {e["id"] for e in engines}
 
@@ -323,6 +360,14 @@ async def apply(fast_url: str, stremthru_url: str, mediafusion_url: str,
     eff_pkey = p_key_new or str(prowlarr_key or "").strip()
     prowlarr_cfg = ({"url": p_url, "api_key": eff_pkey}
                     if p_url and eff_pkey else None)
+
+    # Same shape for the Easynews login: a blank submitted password keeps the
+    # stored one, so the panel never has to echo it back to edit the username.
+    e_sub = easynews_submitted or {}
+    e_user = (str(e_sub.get("username", "")).strip()
+              if easynews_submitted is not None else str(easynews_user or "").strip())
+    e_pass_new = str(e_sub.get("password", ""))
+    eff_epass = e_pass_new or str(easynews_pass or "")
     wants_debrid = any((BY_ID.get(e["id"]) or {}).get("needs_debrid")
                        and not e["url"] for e in engines)
 
@@ -364,9 +409,9 @@ async def apply(fast_url: str, stremthru_url: str, mediafusion_url: str,
             values["MEDIAFUSION_BASE_URL"] = await _mediafusion_url(
                 mediafusion_url, resolved, e["url"],
                 prowlarr=prowlarr_cfg, api_password=mf_api_password)
-        elif sid == "prowlarr":
-            # Internal lane — no manifest URL to mint. Enablement is the
-            # PROWLARR_SOURCE flag, set below once creds are confirmed.
+        elif sid in ("prowlarr", "easynews"):
+            # Internal lanes — no manifest URL to mint. Enablement is their
+            # own flag, set below once credentials are confirmed.
             continue
         elif sid == "torrentio":
             extras.append({"name": "Torrentio", "url": _clean_base(e["url"])
@@ -400,6 +445,24 @@ async def apply(fast_url: str, stremthru_url: str, mediafusion_url: str,
         values["PROWLARR_SOURCE"] = "1"
     else:
         clears.append("PROWLARR_SOURCE")
+
+    # Persist the Easynews login. Clearing the username removes the whole
+    # login (and the lane with it); a blank password keeps the stored one.
+    if easynews_submitted is not None:
+        if e_user:
+            values["EASYNEWS_USER"] = e_user
+            if e_pass_new:
+                values["EASYNEWS_PASS"] = e_pass_new
+        else:
+            clears += ["EASYNEWS_USER", "EASYNEWS_PASS"]
+            eff_epass = ""
+    # Unlike PROWLARR_SOURCE this must be *written* off, never cleared: the
+    # schema default is "1" so that saving a login is what turns the lane on,
+    # which means clearing the flag would switch it straight back on.
+    if "easynews" in ids and e_user and eff_epass:
+        values["EASYNEWS_SOURCE"] = "1"
+    else:
+        values["EASYNEWS_SOURCE"] = "0"
 
     values["EXTRA_ADDONS"] = json.dumps(extras, separators=(",", ":")) if extras else ""
     values["SCRAPERS"] = json.dumps(

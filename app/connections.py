@@ -187,6 +187,37 @@ async def _prowlarr(overrides: dict) -> dict:
         return _fail(t0, e)
 
 
+async def _easynews(overrides: dict) -> dict:
+    """Authenticated Easynews check: run a real (tiny) search, so a bad login
+    fails clearly and the operator sees the index actually answering. Easynews
+    401s an unauthenticated request, which is what makes this decisive."""
+    user = _val("EASYNEWS_USER", overrides)
+    password = _val("EASYNEWS_PASS", overrides)
+    t0 = time.monotonic()
+    if not user:
+        return _fail(t0, "no username configured")
+    if not password:
+        return _fail(t0, "no password configured")
+    try:
+        r = await _client.get(
+            config.pending("EASYNEWS_SEARCH_URL")
+            or "https://members.easynews.com/2.0/search/solr-search/advanced",
+            params={"st": "adv", "sb": "1", "safeO": "0", "u": "1", "gx": "1",
+                    "fty[]": "VIDEO", "pby": "10", "pno": "1", "sS": "3",
+                    "s1": "relevance", "s1d": "-", "gps": "big buck bunny"},
+            auth=(user, password))
+        if r.status_code in (401, 403):
+            return _fail(t0, "rejected — check the username and password")
+        r.raise_for_status()
+        payload = r.json()
+        if not isinstance(payload, dict) or "data" not in payload:
+            return _fail(t0, "unexpected response — is this an Easynews URL?")
+        return _ok(t0, f"search ok — {payload.get('results', 0)} hits for a "
+                       "test query")
+    except Exception as e:
+        return _fail(t0, e)
+
+
 async def _tmdb(overrides: dict) -> dict:
     key = _val("TMDB_API_KEY", overrides)
     t0 = time.monotonic()
@@ -414,6 +445,7 @@ _TESTS = {
     # first-run wizard still tests a pasted MediaFusion URL by its manifest.
     "scraper": _scraper,
     "prowlarr": _prowlarr,
+    "easynews": _easynews,
     "mediafusion": lambda o: _manifest("MEDIAFUSION_BASE_URL", o),
     "jellyfin": _jellyfin,
     "addon": _addon,

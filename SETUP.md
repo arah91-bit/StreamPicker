@@ -37,9 +37,9 @@ follow only that lane in §4. You can always add the others later.
 | | **A · Debrid** | **B · Usenet** | **C · Self-hosted torrents** |
 |---|---|---|---|
 | **What it is** | A paid service that already holds popular releases and streams them to you instantly over HTTPS | Paid providers that store files you download fast and directly | You download the release to your own disk and watch it as it arrives |
-| **You pay for** | One subscription | A provider **and** indexers (two bills) | A VPN, plus whatever your trackers need |
-| **You run** | Nothing extra | A mounting helper (nzbdav) | Three services on your own storage box |
-| **Setup effort** | 🟢 Easiest — paste one key | 🟡 Fiddly | 🔴 Hardest — about an hour |
+| **You pay for** | One subscription | One or two bills — see §4 | A VPN, plus whatever your trackers need |
+| **You run** | Nothing extra | Nothing extra, *or* a mounting helper | Three services on your own storage box |
+| **Setup effort** | 🟢 Easiest — paste one key | 🟢 Easy *or* 🟡 fiddly, depending which route | 🔴 Hardest — about an hour |
 | **Starts playing in** | Seconds | Seconds | ~10–20 seconds, then streams as it downloads |
 | **Reliability** | Very high | Mixed — misses are normal and get skipped | High once it's running |
 | **You keep a copy** | No | No | **Yes** — and it seeds |
@@ -47,6 +47,11 @@ follow only that lane in §4. You can always add the others later.
 
 **Not sure? Choose A.** It's one signup and one copy-pasted key, and you can
 have it streaming today.
+
+> **If you're leaning toward usenet**, read §4 Lane B before you buy anything.
+> There are two very different routes, and the simpler one is one subscription
+> with nothing extra to run — closer to Lane A in effort than the table's
+> "fiddly" suggests.
 
 > **Bonus lane (free):** already have a **Jellyfin** server? You can point this
 > app at it so films you *already own* play first, with no subscription at all.
@@ -173,7 +178,38 @@ embeds your debrid key, like `https://comet…/<long-config-string>`. Hit
 
 ### Lane B · Usenet
 
-You need three things, and you must have the first two already:
+There are **two routes**, and they are not equally hard. Pick one; you can add
+the other later.
+
+#### B1 · The simple route — a provider that searches for you
+
+Some usenet providers keep their own search index *and* serve the finished file
+straight over HTTPS. There is nothing to assemble, so there are no indexers to
+buy and no mounting helper to run: you paste a username and password, and the
+app can search and play.
+
+1. Subscribe to a usenet provider that includes its own search.
+2. Dashboard → **Settings → Sources** → the **Easynews** block.
+3. Type your **username** and **password**, press **Test** (it runs a real
+   search and reports the hit count), then **Save sources** and restart.
+
+Saving a login switches the source on by itself. Turning it off later keeps the
+login stored, so switching back on doesn't mean retyping it.
+
+> **Known-good:** tested end-to-end with **Easynews**, which is the provider
+> this block is built around. Because the file is already assembled, seeking is
+> as cheap as starting — jumping to the middle of a film takes about as long as
+> opening it.
+>
+> **Its limits, honestly:** coverage is good but uneven. Some titles return
+> only sample clips, and the app correctly shows you nothing rather than a
+> 60-second sample. It is an excellent *first* source, not a complete one — most
+> people run it alongside another lane.
+
+#### B2 · The classic route — provider + indexers + nzbdav
+
+More work, wider coverage. You need three things, and the first two must be in
+place already:
 
 1. A **usenet provider** subscription (where files actually come from).
 2. One or more **Newznab indexers** (how releases are found). Most are paid.
@@ -186,17 +222,30 @@ In the dashboard, switch on the usenet cards and fill in your indexers
 > **Set expectations:** usenet releases go missing over time. Roughly 40% of
 > results won't play — this is normal, and the app detects and skips them
 > automatically, so you see working streams rather than dead ones. It just
-> means usenet is the fiddliest lane to tune.
+> means this is the fiddliest route to tune.
 
 ### Lane C · Self-hosted torrents (private trackers)
 
 This lane has its own complete walkthrough, because it's a bigger build — you
-run a downloader, a seeder, and a VPN on your own storage box.
+run a downloader and a VPN on your own storage box.
 
 **→ Follow [PRIVATE_TRACKERS.md](PRIVATE_TRACKERS.md).**
 
 In exchange you get your own permanent copy of everything you watch, and
 playback starts while it's still downloading.
+
+Two things worth knowing before you use it, because they change what you see:
+
+- **Results you already have are listed first**, labelled *Already Downloaded ·
+  Play Now*. A private search returns twenty near-identical rows; the one on
+  your disk plays immediately, costs no ratio and uses no download slot, so it
+  goes to the top instead of leaving you to spot it. Anything still in progress
+  follows, showing its percentage.
+- **Your clicked episode downloads first and alone**, so it can stream in
+  order rather than waiting behind the rest of a season pack. Once it finishes,
+  the remaining files resume so the release completes and seeds — no
+  hit-and-run. Turn that second half off with `PRIVATE_TRACKER_WHOLE_TORRENT`
+  if you only ever want the one episode.
 
 ---
 

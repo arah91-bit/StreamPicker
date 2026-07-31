@@ -29,7 +29,7 @@ except ValueError as exc:
     raise RuntimeError(f"invalid stream-picker configuration: {exc}") from exc
 
 from app import (acquire, admin_auth, adminui, anime, connect_ui, connections,  # noqa: E402
-                 dashboard, envref, home_ui, library, meta, picker, picks_ui,
+                 dashboard, easynews, envref, home_ui, library, meta, picker, picks_ui,
                  private_trackers, private_ui, probe, prowlarr, proxy,
                  recs_mount, reputation, scrapers, source_health, source_ui,
                  sources, tbcache, telemetry, tune_ui, usenet, usenet_health,
@@ -89,7 +89,8 @@ async def _lifespan(_app: FastAPI):
             ("proxy", proxy), ("picker", picker), ("probe", probe),
             ("metadata", meta), ("library", library), ("acquire", acquire),
             ("video probe", vprobe), ("sources", sources), ("usenet", usenet),
-            ("prowlarr", prowlarr), ("tbcache", tbcache), ("anime", anime),
+            ("prowlarr", prowlarr), ("easynews", easynews),
+            ("tbcache", tbcache), ("anime", anime),
             ("private trackers", private_trackers),
         ):
             shutdown = getattr(module, "shutdown", None)
@@ -703,6 +704,9 @@ async def settings_scrapers(request: Request):
             prowlarr_submitted=body.get("prowlarr"),
             prowlarr_url=config.pending("PROWLARR_URL"),
             prowlarr_key=config.pending("PROWLARR_API_KEY"),
+            easynews_submitted=body.get("easynews"),
+            easynews_user=config.pending("EASYNEWS_USER"),
+            easynews_pass=config.pending("EASYNEWS_PASS"),
             mf_api_password=config.pending("MEDIAFUSION_API_PASSWORD"),
             dry_run=bool(body.get("dry_run")))
         values = res.pop("values", None)

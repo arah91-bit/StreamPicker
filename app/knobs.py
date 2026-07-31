@@ -51,6 +51,7 @@ GROUPS = [
     ("cloudflare", "Cloudflare solver"),
     ("usenet", "Direct usenet"),
     ("prowlarr", "Prowlarr source"),
+    ("easynews", "Easynews source"),
     ("acquire", "Library & acquire"),
     ("reputation", "Reputation & blocking"),
     ("telemetry", "Telemetry & caches"),
@@ -292,6 +293,46 @@ CATALOG = [
      "Parallel debrid link resolutions."),
     ("PROWLARR_MIN_SEEDERS", "prowlarr", "num", "1", "",
      "Skip Prowlarr torrents below this seeder count."),
+
+    # ── easynews source ──────────────────────────────────────────────────────
+    ("EASYNEWS_SEARCH_URL", "easynews", "text",
+     "https://members.easynews.com/2.0/search/solr-search/advanced", "",
+     "Easynews search endpoint. Override only if Easynews moves it."),
+    ("EASYNEWS_SEARCH_TIMEOUT", "easynews", "num", "45", _S,
+     "Easynews search timeout. Generous on purpose: search usually answers in "
+     "well under a second but has a fat tail (the same query measured 0.7s, "
+     "8.6s and 1.3s on consecutive runs), and nothing blocks on it — a slow "
+     "search lands in the shared cache for the next request instead."),
+    ("EASYNEWS_PAGE_SIZE", "easynews", "num", "100", "",
+     "Rows requested per Easynews query. A 100-row page costs the same as a "
+     "small one and the strict title/sample gates discard most of them."),
+    ("EASYNEWS_MAX_RESULTS", "easynews", "num", "12", "",
+     "Easynews files offered per title after ranking. Each one can cost a "
+     "probe, so this is effectively a probe budget."),
+    ("BUFFER_IDLE_GRACE_RATIONED", "proxy", "num", "10", _S,
+     "BUFFER_IDLE_GRACE for a source that rations connections rather than "
+     "bandwidth (Easynews allows about two). Reading ahead for a viewer who "
+     "left costs a connection there, and the next stream's index read queues "
+     "behind it — measured 0.36s vs 48.7s for a tail warm."),
+    ("BUFFER_TAIL_HEADSTART", "proxy", "num", "3", _S,
+     "How long the buffer producer holds off its bulk fill so the file-tail "
+     "warm can land first. A player cannot show a frame until it has read the "
+     "container index at EOF, and the fill starts at byte 0, so the fill can "
+     "afford to wait and the index cannot. 0 lets them race (the old "
+     "behaviour, which cost ~50s of black screen on Easynews)."),
+    ("EASYNEWS_MAX_PROBES", "easynews", "num", "2", "",
+     "Easynews candidates probed at once. An Easynews account caps concurrent "
+     "transfers and the cap is low — measured: 4 fine, 6 makes the worst TTFB "
+     "5.9s, 8+ gets connections killed mid-stream. Playback needs two of its "
+     "own (producer + tail warm), so keep this well under the cap."),
+    ("EASYNEWS_MIN_MB", "easynews", "num", "50", "MB",
+     "Reject Easynews files below this size — at that point it is a sample or "
+     "a clip whatever the filename claims."),
+    ("EASYNEWS_RUNTIME_MIN_FRAC", "easynews", "num", "0.5", "",
+     "Reject an Easynews file whose *declared* runtime is below this fraction "
+     "of the title's expected runtime. Mirrors DURATION_MIN_FRAC, which stays "
+     "the authority — this only avoids spending a probe on a known sample. "
+     "0 disables the pre-filter."),
 
     # ── direct usenet ────────────────────────────────────────────────────────
     ("NZB_MOUNT_MAX", "usenet", "num", "6", "",

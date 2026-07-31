@@ -177,6 +177,16 @@ SETTINGS = [
          hidden=True, default="", label="Prowlarr API key"),
     dict(key="PROWLARR_SOURCE", group="identity", type="bool", hidden=True,
          default="0", label="Prowlarr as a source"),
+    # Easynews: username + password added in the Sources catalog. Unlike
+    # Prowlarr the credentials are the switch — EASYNEWS_SOURCE defaults to "1"
+    # so saving a login enables the lane, and toggling it off writes "0" while
+    # keeping the credentials stored for an easy switch back on.
+    dict(key="EASYNEWS_USER", group="identity", type="text",
+         hidden=True, default="", label="Easynews username"),
+    dict(key="EASYNEWS_PASS", group="identity", type="text", kind="secret",
+         hidden=True, default="", label="Easynews password"),
+    dict(key="EASYNEWS_SOURCE", group="identity", type="bool", hidden=True,
+         default="1", label="Easynews as a source"),
     # One master gate for every ordinary online tracker/addon source. Direct
     # Usenet, Jellyfin/library, and the separately controlled private fallback
     # remain independent.

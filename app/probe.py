@@ -64,6 +64,24 @@ _client = httpx.AsyncClient(
 # cached all along and no download was triggered.
 TORBOX_MAX_DOWNLOADS = max(1, int(os.environ.get("TORBOX_MAX_DOWNLOADS", "3")))
 _INGEST_LIMITS = {"TB": TORBOX_MAX_DOWNLOADS}
+
+# ── per-source connection slots ──────────────────────────────────────────────
+# Same mechanism, different reason. An Easynews account caps how many transfers
+# it will serve at once, and the cap is low. Measured on a live account, reading
+# the same file N ways simultaneously:
+#
+#       2-4 connections   clean, 0.26 s TTFB
+#       6 connections     all served, but worst TTFB 5.94 s
+#       8 and 12          RemoteProtocolError — connections killed mid-stream
+#
+# A title routinely yields a dozen Easynews candidates, so an ungated probe wave
+# opens a dozen transfers, and then playback's own producer and tail warm have
+# to queue behind them. That is what "stuck on the splash screen" looked like:
+# the picker answered in 2 s, but the probes ate every slot, the tail warm
+# failed silently, and probes died with RemoteProtocolError. Keep this well
+# under the cap so the two connections playback needs are always available.
+EASYNEWS_MAX_PROBES = max(1, int(os.environ.get("EASYNEWS_MAX_PROBES", "2")))
+_SOURCE_LIMITS = {"easynews": EASYNEWS_MAX_PROBES}
 # Semaphores bind to the running event loop on first await, so each tag keeps
 # (loop, semaphore) and re-creates on a new loop — production has one loop
 # forever; tests run many short-lived ones.
@@ -71,15 +89,23 @@ _ingest_slots: dict[str, tuple] = {}
 
 
 def ingest_gate(stream: dict) -> asyncio.Semaphore | None:
-    """The ingestion-slot semaphore this stream's probe must hold, or None.
-    Only debrid links not marked cached are gated — those are the requests
-    that can trigger a download into the account."""
-    tag = telemetry.debrid_tag(stream.get("name") or "")
-    if not tag or tag.endswith("+"):
-        return None
-    limit = _INGEST_LIMITS.get(tag)
+    """The slot semaphore this stream's probe must hold, or None.
+
+    Two kinds of stream are gated, for two different reasons:
+      * debrid links not marked cached — those requests can trigger a real
+        download into the account and occupy an ingestion slot;
+      * sources with a hard concurrent-transfer cap (Easynews), where an
+        unbounded probe wave starves playback of the connections it needs.
+    """
+    limit = _SOURCE_LIMITS.get(str(stream.get("_source_key") or ""))
+    tag = str(stream.get("_source_key") or "")
     if not limit:
-        return None
+        tag = telemetry.debrid_tag(stream.get("name") or "")
+        if not tag or tag.endswith("+"):
+            return None
+        limit = _INGEST_LIMITS.get(tag)
+        if not limit:
+            return None
     loop = asyncio.get_running_loop()
     entry = _ingest_slots.get(tag)
     if entry is None or entry[0] is not loop:

@@ -21,6 +21,7 @@ player (Stremio/Nuvio/Jellyfin)
         ├── byte cache + producer    _produce        — sequential read-ahead to disk
         └── source
               ├── debrid / HTTP      one hop, usually fine
+              ├── easynews           one hop, already-assembled file  app/easynews.py
               └── usenet             WebDAV mount (nzbdav) → NNTP providers
 ```
 
@@ -28,6 +29,12 @@ The usenet lane is the deep one: a single HTTP range request against the mount
 fans out into dozens of NNTP article fetches across multiple providers. Nearly
 all the pain lives there, and almost none of it is visible in HTTP status codes
 — a wedged NNTP pool returns a perfectly valid `206` that takes 41 seconds.
+
+The Easynews lane is the shallow one, and it is the structural answer to most
+of what follows: Easynews indexes files it has **already assembled** and serves
+them over ordinary range-capable HTTPS, so failure modes 1, 2 and 4 cannot
+occur on it. See "The Easynews lane" below before reaching for the usenet lane
+to explain a slow start.
 
 ---
 
@@ -358,6 +365,129 @@ connection, fixed by recreating the container" exactly.
 
 ---
 
+## The Easynews lane
+
+`app/easynews.py`. Easynews has its own search index over files it has already
+assembled, served over plain range-capable HTTPS. A search result *is* a
+playable URL — no NZB, no nzbdav, no NNTP. Measured against the same content on
+the direct-usenet path:
+
+| | Easynews | usenet lane |
+|---|---|---|
+| cold head TTFB | 0.33 s | 0.3 – 0.8 s |
+| **cold tail / index read** | **0.29 s** | **7.68 s** |
+| random mid-file seek | 0.29 s | interpolation search + article fetches |
+| throughput | 10 – 44 MB/s | ~34 MB/s |
+
+Enable it by saving an Easynews login in the Sources panel; the credentials are
+the switch (`EASYNEWS_SOURCE` defaults to `1`, and turning the engine off writes
+`0` rather than clearing it, so the login survives).
+
+**What the lane must never stop doing.** Easynews searches posted *filenames*,
+not a release index. It is not a curated source and its raw output is dangerous
+in three specific ways, all of which the gates in `_candidates` exist to answer
+— measured, not hypothetical:
+
+- **Wrong show.** `The Bear S03E05` returns *The Island With Bear Grylls* and
+  *The Yogi Bear Show* in the top five. They would resolve and probe fine.
+- **Samples.** `Dune Part Two 2024` returns **57 results, every one of them a
+  60-second `.sample`**. The correct answer for that title is zero rows, and
+  the lane returns zero rows. Samples outrank the real file because they carry
+  the same release name.
+- **Adult content matched on a cast member's name.** An unrestricted query for
+  `Game of Thrones` returns pornography, matched via actresses who appeared in
+  it. Easynews' own safe-search flag is **not** the fix — `safeO=1` is broken
+  server-side (it answers `{"results":0}` plus a raw PHP `Undefined variable:
+  SearchId` notice, so it is not even valid JSON). The title gate is the fix,
+  and it works because it anchors on the filename *starting* with the title.
+
+So: the lane reuses `usenet._release_title_match` / `_release_year_match` /
+`_episode_match` — one implementation, shared with the usenet and Prowlarr
+lanes — and adds a sample gate. Rows are then emitted **untrusted**: no trust
+sentinel, so `picker._lane_of` files them under `https` and they earn their
+place through the full probe (payload sniff, TTFB, bitrate-relative throughput,
+duration check, codec sniff) exactly like any other HTTPS source. Easynews'
+metadata is used to pre-rank and to skip obviously-wasted probes, never to skip
+validation.
+
+**Credentials go in the URL userinfo, not in `proxyHeaders`.** This is
+load-bearing. `proxy._must_wrap` treats a URL carrying userinfo as
+never-serve-raw, so an Easynews row is always proxied (even past `WRAP_MAX`)
+and is dropped outright when the proxy is off. `proxy.wrap` strips
+`behaviorHints.proxyHeaders` **only on its HLS branch** — the header route
+would have handed the player the account password on any row past #8. The
+direct-nzb lane embeds its WebDAV login the same way for the same reason.
+
+**The account caps concurrent transfers, and the cap is low.** This is the one
+operational gotcha of the lane, and it presents as a slow start rather than as
+an error. Measured live, reading one file N ways at once:
+
+```
+2 – 4 connections   clean, 0.26 s TTFB
+6 connections       all served, worst TTFB 5.94 s
+8 and 12            RemoteProtocolError — connections killed mid-stream
+```
+
+A title routinely yields a dozen Easynews candidates, so an *ungated* probe wave
+opens a dozen transfers and playback's own two connections (the producer and
+`_fetch_tail`) queue behind them. Observed symptom: the picker answered in 2.0 s
+and first byte took 0.36 s, yet the viewer sat on the splash screen — because
+the tail warm silently lost its slot and probes died with `RemoteProtocolError`.
+`probe.ingest_gate` therefore gates Easynews the same way it gates uncached
+TorBox links (`EASYNEWS_MAX_PROBES`, default 2) — different reason, same
+mechanism. **Do not raise it to "use the source harder"; that is the failure.**
+
+### The 50-second black screen (failure mode 2, second edition)
+
+Worth reading before touching the buffer, because every instinct here was wrong
+and only the last measurement was right.
+
+*Symptom.* Easynews stream, picker answered in 1.8 s, first byte in 0.36 s — and
+the viewer sat on a black screen for ~50 s. Reproduced exactly with ffprobe:
+**1.3 s reading the file directly, 49.5 s through our own proxy.**
+
+*Mechanism.* A player cannot show a frame until it has the container index,
+which lives at EOF. `_fetch_tail` fetches it — but it was fired as a background
+task racing the sequential fill, which was pulling the file at 40 MB/s. An 8 MB
+tail read that takes **0.36 s unopposed took 48.7 s** against one competing
+fill. The picture appeared the instant the warm landed, every time.
+
+The competing fill was usually not even for this stream: `_reader_interested`
+kept producers running for `BUFFER_IDLE_GRACE` (180 s) after their reader left,
+so an abandoned read-ahead — or the next-episode prefetch — held an Easynews
+connection, and Easynews grants about two.
+
+*Fix, in two parts.* `TAIL_WARM_HEADSTART` (3 s) holds the bulk fill back until
+the warm lands, because the index is on the critical path to the first frame and
+the fill is not; and `BUFFER_IDLE_GRACE_RATIONED` (10 s) stops reading ahead for
+a departed viewer on a connection-rationed host. Measured after, six cold
+streams: **0.43 – 1.11 s to first frame**, back-to-back included.
+
+*What was wrong on the way.* Easynews' connection cap was real but capping
+probes did not fix it; a sustained producer alone did **not** starve the tail
+(0.42 s at 6.5 GB pulled); it was not the httpx pool, not bandwidth, not the
+shared client. Only timing ffprobe direct-vs-proxy localised it, and only the
+per-entry `tail warmed` timestamps explained it. **Instrument the boundary
+before theorising about either side of it** — and note that `_fetch_tail` was
+silent on failure, which is why this hid for so long. It logs now.
+
+**Search latency has a fat tail; reads do not.** The same query measured 0.69 s,
+then 8.58 s, then 1.34 s, and a 15 s timeout fired twice consecutively on a
+query that answered in 0.47 s minutes later. `EASYNEWS_SEARCH_TIMEOUT` is
+therefore deliberately generous (45 s): nothing blocks on it — callers in
+`app.sources` wait only as long as their own deadline and the search is
+shielded, so a slow one finishes into the shared cache for the next request. A
+tight timeout just throws that work away.
+
+**It is a supplement, not a replacement.** Coverage is real but uneven — a
+title with only samples posted (Dune Part Two) or one whose releases don't
+surface for the query (Game of Thrones S01E01) correctly yields nothing, while
+Inception, Oppenheimer and The Bear return full 4K remuxes. It races in the
+fast lane alongside the debrid scrapers; the other lanes still cover what it
+misses.
+
+---
+
 ## Invariants worth not breaking
 
 - **Never advance `e.head` from a tail probe.** It is the backpressure anchor.
@@ -373,6 +503,10 @@ connection, fixed by recreating the container" exactly.
 - **Codec learning requires evidence the player was fed.** See failure mode 5.
 - **Content failures must stay content failures.** `missing-articles` is a bad
   post, not a bad pipe, however many of them arrive at once.
+- **Easynews rows stay untrusted, and its credentials stay in the userinfo.**
+  Both are one-line changes that look like tidying and are not. See "The
+  Easynews lane". Guarded by `TrustTests` and `DownloadUrlTests` in
+  `tests/test_easynews.py`.
 
 ---
 
@@ -387,6 +521,13 @@ connection, fixed by recreating the container" exactly.
 | `NZB_TRANSPORT_MIN_RELEASES` | 3 | Distinct releases that must die before calling it a transport stall |
 | `NZB_TRANSPORT_WINDOW_MINUTES` | 10 | Window those failures must land inside |
 | `PRIVATE_TRACKER_MIN_SOURCES` | 0 | Below this many public releases, also search private trackers |
+| `EASYNEWS_SEARCH_TIMEOUT` | 45 | Generous by design — search latency has a fat tail and nothing blocks on it |
+| `EASYNEWS_MAX_RESULTS` | 12 | Easynews files offered per title; effectively a probe budget |
+| `EASYNEWS_MIN_MB` | 50 | Size floor below which a "video" is a sample whatever it is named |
+| `EASYNEWS_RUNTIME_MIN_FRAC` | 0.5 | Reject a file whose declared runtime is this far under the title's |
+| `EASYNEWS_MAX_PROBES` | 2 | Easynews candidates probed at once — the account's transfer cap is low |
+| `BUFFER_TAIL_HEADSTART` | 3 | Bulk fill waits this long for the tail warm; the index gates the first frame |
+| `BUFFER_IDLE_GRACE_RATIONED` | 10 | Idle grace on a connection-rationed host (Easynews) instead of 180 |
 
 The last one is not a bug fix but it is the only real answer to one class of
 buffering: when a title has exactly one working copy, no amount of failover
