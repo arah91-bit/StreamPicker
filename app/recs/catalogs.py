@@ -10,6 +10,7 @@ order, with Top Picks always first. Kid profiles pass kid_age into every meta
 resolution, which filters all sources by US certification."""
 
 import asyncio
+import bisect
 import datetime
 import logging
 import random
@@ -56,6 +57,49 @@ SCORE_POPULAR = 30
 SCORE_DEPTH = 33
 
 KID_EXCLUDED_GENRES = {"horror", "war", "crime"}
+
+# How much of each row's ordering the viewer's fingerprint may decide. A row's
+# own promise sets the ceiling: "Popular Now" means popular, and quietly
+# reordering it by taste is both a lie and — measured on this surface — an 83%
+# cull, because 83% of that row is titles the fingerprint rates below average.
+# Rolling one strength out everywhere would have left the already-narrow rows
+# untouched and hollowed out Popular Now, New Releases, Hidden Gems and
+# Critically Acclaimed: exactly the rows that make a page feel like a
+# catalogue instead of a lens.
+#
+# Longest matching prefix wins.
+TAILORING = {
+    "nr-top-picks": 1.00,   # the row that exists to be personal
+    "nr-byw": 0.80,         # explicitly "because you watched"
+    "nr-related": 0.80,
+    "nr-holiday": 0.30,
+    "nr-genre": 0.25,       # reorder within; never reshape
+    "nr-decade": 0.25,
+    "nr-depth": 0.25,
+    "nr-actor": 0.25,
+    "nr-director": 0.25,
+    "nr-lang": 0.25,
+    "nr-new": 0.05,         # the promise is what is out, not what suits you
+    "nr-trending": 0.05,
+    "nr-popular": 0.05,
+    "nr-acclaimed": 0.00,   # the promise is quality, independent of taste
+    "nr-gems": 0.00,        # the promise is discovery
+    "nr-explore": 0.00,     # the promise is that taste had no say at all
+}
+DEFAULT_TAILORING = 0.25
+
+# The exploration row. Placed mid-page rather than at the top or the very
+# bottom, following the streaming-platform result that exploratory containers
+# belong at scroll depths that are cheap to skip but still reached — a row
+# that misses costs a flick, while a title never shown costs everything.
+SCORE_EXPLORE = 41
+EXPLORE_ROW_ID = "nr-explore"
+EXPLORE_ROW_NAME = "Nothing Like What You Usually Watch"
+# Quality floor for a row nobody asked for. Vote count matters as much as the
+# average: an unfiltered vote_average sort returns titles with one 10/10.
+EXPLORE_ROW_MIN_VOTES = 400
+EXPLORE_ROW_MIN_SCORE = 6.5
+EXPLORE_ROW_PAGES = 3
 
 # Top Picks draws from many seeds rather than a handful, because the row is
 # assembled by competition now: a seed that returns weak similars simply loses
@@ -201,6 +245,8 @@ class Generator:
         self.rows: list[tuple[float, dict]] = []
         self.taste: taste.TasteModel | None = None
         self.fingerprint: fingerprint.Fingerprint | None = None
+        # Loaded once per build and read by every row's tailoring.
+        self.feature_store: dict[str, list[str]] = {}
         self.used_imdb: set[str] = set()
         self.recently_shown: dict[str, int] = {}
         self.pinned_rows = 0
@@ -325,11 +371,56 @@ class Generator:
         )
         return self._freshen(metas, limit, depth)
 
+    def tailoring_for(self, cat_id: str) -> float:
+        """How much say the fingerprint has over one row's order."""
+        best, strength = "", DEFAULT_TAILORING
+        for prefix, value in TAILORING.items():
+            if cat_id.startswith(prefix) and len(prefix) > len(best):
+                best, strength = prefix, value
+        return strength
+
+    def _tailor(self, cat_id: str, metas: list[dict]) -> list[dict]:
+        """Re-order a row toward the viewer, in proportion to its promise.
+
+        Blends the row's own ranking with fingerprint lift rather than
+        replacing it, so a genre row stays that genre and a "what's new" row
+        stays chronological in spirit. At strength 0 nothing moves at all,
+        which is the point for the rows whose whole value is being unfiltered.
+        """
+        strength = self.tailoring_for(cat_id)
+        if not self.fingerprint or strength <= 0 or len(metas) < 2:
+            return metas
+        lifts = []
+        for meta in metas:
+            tokens = self.feature_store.get(meta.get("id"))
+            lifts.append(self.fingerprint.lift(tokens) if tokens else None)
+        known = sorted(lift for lift in lifts if lift is not None)
+        if len(known) < 2:
+            return metas
+        # Rank-normalised, so a row of uniformly high-lift titles is not
+        # scrambled by tiny absolute differences. Ties take the mid-rank:
+        # mapping each distinct value to its last index instead would collapse
+        # a row where most titles score alike into two adjacent ranks, and
+        # nothing would move.
+        rank_of = {}
+        for value in set(known):
+            below = bisect.bisect_left(known, value)
+            tied = bisect.bisect_right(known, value) - below
+            rank_of[value] = (below + tied / 2.0) / len(known)
+        ranked = []
+        for position, (meta, lift) in enumerate(zip(metas, lifts)):
+            original = 1.0 - position / max(1, len(metas) - 1)
+            fit = rank_of.get(lift, 0.5) if lift is not None else 0.5
+            ranked.append(((1 - strength) * original + strength * fit, meta))
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        return [meta for _, meta in ranked]
+
     def _add(self, score: float, cat_id: str, ctype: str, name: str,
              metas: list[dict], min_items: int = 5) -> bool:
         # Defense in depth for sources (notably optional search-based sources)
         # that do not go through resolve_many, and for accidental duplicate
         # rows produced by overlapping TMDB filters.
+        metas = self._tailor(cat_id, metas)
         excluded = self._exclude()
         clean: list[dict] = []
         seen: set[str] = set()
@@ -842,8 +933,8 @@ class Generator:
         if self.taste:
             try:
                 context = taste.CONTEXT_SOLO if self.kid_age is None else None
-                self.fingerprint = await fingerprint.for_viewer(
-                    self.taste, context, self.rng)
+                self.fingerprint, self.feature_store = \
+                    await fingerprint.for_viewer(self.taste, context, self.rng)
                 logger.info(
                     f"[{self.token[:8]}] fingerprint: "
                     f"{self.fingerprint.summary() if self.fingerprint else 'unavailable'}")
@@ -879,6 +970,7 @@ class Generator:
             self.pinned_rows += 1
         await self._because_you_watched()
         await self._more_like_loved()
+        await self._exploration_row()
         await self._new_releases()
         await self._trending_row()
         await self._genre_rows()
@@ -1092,19 +1184,73 @@ class Generator:
                 + remainder * (0.35 * seed_strength + 0.20 * order
                                + 0.20 * genre_fit + 0.25 * rating))
 
+    async def _exploration_row(self) -> None:
+        """A row the fingerprint had no hand in.
+
+        Two separate jobs, and both need it to be genuinely unconditioned.
+
+        For the viewer it is the answer to a service that has locked into one
+        shape — "once the algorithm becomes hyper tuned it gets set into a
+        lock state". Named and placed so it costs one flick to skip, because a
+        row that misses is cheap and a title never shown is invisible for ever.
+
+        For the model it is the only unbiased exposure on the page. The
+        fingerprint learns from plays, and plays come from what was
+        recommended, so a closed loop can only ever confirm itself —
+        degeneracy is a proven consequence of that loop, not a tuning failure,
+        and random exploration over a large pool is the documented remedy.
+        That is why this samples the catalogue rather than the neighbourhood:
+        adjacency would draw from inside the model that is degenerating.
+
+        Random, but not careless. A quality floor with a vote count behind it
+        keeps the row worth the slot; nothing else about it is personalised.
+        """
+        pool: list[dict] = []
+        seeded = random.Random(f"{self.token}:{self.today.isoformat()}:explore")
+        medias = ["movie", "tv"]
+        seeded.shuffle(medias)
+        for media in medias:
+            params = {
+                "sort_by": "vote_average.desc",
+                "vote_count.gte": EXPLORE_ROW_MIN_VOTES,
+                "vote_average.gte": EXPLORE_ROW_MIN_SCORE,
+                # A random page of a large, quality-floored result set is the
+                # cheapest honest way to sample broadly: page 1 every day
+                # would be its own kind of lock state.
+                "page": seeded.randint(1, EXPLORE_ROW_PAGES * 4),
+            }
+            try:
+                pool += await self._resolve_discover(
+                    media, params, ROW_TARGET_ITEMS, pages=EXPLORE_ROW_PAGES)
+            except Exception:
+                logger.debug(f"[{self.token[:8]}] exploration sweep failed",
+                             exc_info=True)
+        if len(pool) < 5:
+            return
+        seeded.shuffle(pool)
+        metas = self._mix_media(
+            [m for m in pool if m.get("type") == "movie"],
+            [m for m in pool if m.get("type") != "movie"])
+        if self.fingerprint and self.feature_store:
+            unfamiliar = sum(
+                1 for meta in metas
+                if self.fingerprint.lift(
+                    self.feature_store.get(meta.get("id")) or []) < 1.0)
+            logger.info(f"[{self.token[:8]}] exploration row: {len(metas)} items, "
+                        f"{unfamiliar} outside the fingerprint")
+        self._add(SCORE_EXPLORE, EXPLORE_ROW_ID, config.COMBINED_TYPE,
+                  EXPLORE_ROW_NAME, metas)
+
     async def _measure_breadth(self, catalogs: list[dict]) -> dict:
         """Composition of the finished surface, lift-scored where possible."""
         lifts: dict[str, float] = {}
         if self.fingerprint:
-            ids = {meta.get("id") for catalog in catalogs
-                   for meta in catalog.get("metas") or () if meta.get("id")}
-            try:
-                store = await db.features_by_imdb(ids)
-                lifts = {imdb_id: self.fingerprint.lift(tokens)
-                         for imdb_id, tokens in store.items() if tokens}
-            except Exception:
-                logger.debug(f"[{self.token[:8]}] breadth scoring failed",
-                             exc_info=True)
+            lifts = {
+                meta["id"]: self.fingerprint.lift(
+                    self.feature_store.get(meta["id"]) or [])
+                for catalog in catalogs for meta in catalog.get("metas") or ()
+                if meta.get("id") and self.feature_store.get(meta["id"])
+            }
         return breadth.measure(catalogs, lifts)
 
     @staticmethod
@@ -1253,9 +1399,9 @@ class Generator:
                            for m in metas if m.get("id")}
         lifts: dict[str, float] = {}
         if print_ and features_wanted:
-            store = await db.features_by_imdb(features_wanted)
-            lifts = {imdb_id: print_.lift(tokens)
-                     for imdb_id, tokens in store.items() if tokens}
+            lifts = {imdb_id: print_.lift(self.feature_store[imdb_id])
+                     for imdb_id in features_wanted
+                     if self.feature_store.get(imdb_id)}
 
         candidates: list[taste.Candidate] = []
         seen: set[str] = set()
@@ -1288,10 +1434,14 @@ class Generator:
                 ))
         if len(candidates) < 5:
             return None
+        # No exploration budget here. Departures used to be mixed into this
+        # row and it was the wrong container: unlabelled, a Godfather sitting
+        # at position 25 between two anime reads as the ranker being wrong
+        # rather than as an offer. They live in their own named row now, which
+        # costs one flick to skip and says what it is.
         chosen = taste.select_diverse(
             candidates, ROW_TARGET_ITEMS, rng=self.rng,
             movie_share=self._movie_share(),
-            explore_share=taste.EXPLORE_SHARE,
             target_genres=self.taste.genre_target(context) if self.taste else None)
         combined = [c.meta for c in chosen]
         if len(combined) < 5:

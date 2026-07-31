@@ -216,8 +216,12 @@ class FakeFingerprint:
 class FingerprintRowTests(unittest.IsolatedAsyncioTestCase):
     """Candidate generation and scoring once the viewer has a fingerprint."""
 
-    def generator(self, *, similars=None, swept=None, lifts=None, **user):
+    def generator(self, *, similars=None, swept=None, lifts=None,
+                  store=None, **user):
         gen = Generator({"token": "fp-viewer", "is_kid": 0, **user})
+        # The feature store is loaded once per build and read from memory;
+        # rows never query it per-row.
+        gen.feature_store = dict(store or {})
         gen.profile = profile([seed("tt-a", tmdb=1), seed("tt-b", tmdb=2)])
         gen.taste = model(signal("tt-a", engagement=0.9),
                           signal("tt-b", engagement=0.8))
@@ -241,8 +245,7 @@ class FingerprintRowTests(unittest.IsolatedAsyncioTestCase):
         gen = self.generator(
             similars=lambda s: self.metas("SEED", 10),
             swept=lambda m, p: self.metas("SWEPT", 20))
-        with patch.object(db, "features_by_imdb", AsyncMock(return_value={})):
-            row = await gen._top_picks()
+        row = await gen._top_picks()
         ids = {m["id"][:5] for m in row["metas"]}
         self.assertIn("ttSWE", ids)
         self.assertIn("ttSEE", ids)
@@ -256,8 +259,7 @@ class FingerprintRowTests(unittest.IsolatedAsyncioTestCase):
 
         gen = self.generator(similars=lambda s: self.metas("A", 10),
                              swept=sweep)
-        with patch.object(db, "features_by_imdb", AsyncMock(return_value={})):
-            await gen._top_picks()
+        await gen._top_picks()
         keyword_queries = [p["with_keywords"] for p in seen if "with_keywords" in p]
         self.assertTrue(keyword_queries)
         # OR-ed, not AND-ed: an intersection of three keywords is almost empty.
@@ -275,8 +277,7 @@ class FingerprintRowTests(unittest.IsolatedAsyncioTestCase):
             return self.metas("S", 5)
 
         gen = self.generator(similars=lambda s: self.metas("A", 10), swept=sweep)
-        with patch.object(db, "features_by_imdb", AsyncMock(return_value={})):
-            await gen._top_picks()
+        await gen._top_picks()
         sorts = {p.get("sort_by") for p in seen}
         self.assertIn("popularity.desc", sorts)
         self.assertIn("vote_average.desc", sorts)
@@ -294,8 +295,7 @@ class FingerprintRowTests(unittest.IsolatedAsyncioTestCase):
             return self.metas("S", 5)
 
         gen = self.generator(similars=lambda s: self.metas("A", 10), swept=sweep)
-        with patch.object(db, "features_by_imdb", AsyncMock(return_value={})):
-            await gen._top_picks()
+        await gen._top_picks()
         self.assertTrue(seen)
         for media, params in seen:
             if "with_people" in params:
@@ -307,11 +307,10 @@ class FingerprintRowTests(unittest.IsolatedAsyncioTestCase):
         gen = self.generator(
             similars=lambda s: (self.metas("LOW", 8) + self.metas("HIGH", 1)),
             swept=lambda m, p: [],
-            lifts={"k:match": 5.0})
-        store = {"ttHIGH000": ["k:match"]}
-        store.update({f"ttLOW{n:03d}": ["k:other"] for n in range(8)})
-        with patch.object(db, "features_by_imdb", AsyncMock(return_value=store)):
-            row = await gen._top_picks()
+            lifts={"k:match": 5.0},
+            store={"ttHIGH000": ["k:match"],
+                   **{f"ttLOW{n:03d}": ["k:other"] for n in range(8)}})
+        row = await gen._top_picks()
         order = [m["id"] for m in row["metas"]]
         self.assertLess(order.index("ttHIGH000"), order.index("ttLOW000"))
 
@@ -320,19 +319,15 @@ class FingerprintRowTests(unittest.IsolatedAsyncioTestCase):
         degrade to seed ranking, not to an empty row."""
         gen = self.generator(similars=lambda s: self.metas("A", 30),
                              swept=lambda m, p: [])
-        with patch.object(db, "features_by_imdb", AsyncMock(return_value={})):
-            row = await gen._top_picks()
+        row = await gen._top_picks()
         self.assertEqual(30, len(row["metas"]))
 
     async def test_without_a_fingerprint_nothing_is_swept_or_looked_up(self):
         gen = self.generator(similars=lambda s: self.metas("A", 30),
                              swept=lambda m, p: self.metas("S", 10))
         gen.fingerprint = None
-        lookup = AsyncMock(return_value={})
-        with patch.object(db, "features_by_imdb", lookup):
-            row = await gen._top_picks()
+        row = await gen._top_picks()
         gen._resolve_discover.assert_not_awaited()
-        lookup.assert_not_awaited()
         self.assertTrue(all(m["id"].startswith("ttA") for m in row["metas"]))
 
     async def test_a_failing_sweep_leaves_the_seed_candidates_intact(self):
@@ -340,16 +335,14 @@ class FingerprintRowTests(unittest.IsolatedAsyncioTestCase):
             raise RuntimeError("TMDB said no")
 
         gen = self.generator(similars=lambda s: self.metas("A", 30), swept=boom)
-        with patch.object(db, "features_by_imdb", AsyncMock(return_value={})):
-            row = await gen._top_picks()
+        row = await gen._top_picks()
         self.assertEqual(30, len(row["metas"]))
 
     async def test_swept_candidates_are_kids_filtered_like_any_other(self):
         gen = self.generator(
             similars=lambda s: self.metas("A", 10),
             swept=lambda m, p: self.metas("K", 20, genres=("Animation", "Kids")))
-        with patch.object(db, "features_by_imdb", AsyncMock(return_value={})):
-            row = await gen._top_picks()
+        row = await gen._top_picks()
         self.assertTrue(all("Kids" not in (m.get("genres") or [])
                             for m in row["metas"]))
 

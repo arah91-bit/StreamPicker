@@ -141,30 +141,34 @@ def build(weights: dict[str, float], features_by_imdb: dict[str, list[str]],
     return fingerprint
 
 
-async def for_viewer(model, context: str | None, rng=None) -> Fingerprint | None:
-    """Load the store and build this viewer's fingerprint, or None.
+async def for_viewer(model, context: str | None, rng=None
+                     ) -> tuple[Fingerprint | None, dict[str, list[str]]]:
+    """(fingerprint, feature store) for a viewer.
 
-    None when the history or the store is too thin to say anything — the
-    caller keeps its existing behaviour rather than ranking on noise.
+    The store is returned alongside because the caller needs it to score every
+    row on the surface, and loading it once per build rather than once per row
+    is the difference between one query and twenty.
+
+    The fingerprint is None when the history or the store is too thin to say
+    anything — the caller keeps its existing behaviour rather than ranking on
+    noise.
     """
     from app.recs import db
 
+    store = await db.features_by_imdb()
     weights = {
         signal.imdb_id: signal.engagement
         for signal in model.signals.values()
         if (context is None or signal.context == context)
         and model.may_seed(signal)
     }
-    if len(weights) < MIN_TITLES:
-        return None
+    if len(weights) < MIN_TITLES or not store:
+        return None, store
     vocabulary = await feature_lib.vocabulary()
     if not len(vocabulary):
-        return None
-    store = await db.features_by_imdb()
-    if not store:
-        return None
+        return None, store
     baseline_pool = [tokens for imdb_id, tokens in store.items()
                      if tokens and imdb_id not in weights]
     fingerprint = build({k: v for k, v in weights.items() if k in store},
                         store, vocabulary, baseline_pool, rng)
-    return fingerprint if fingerprint.usable else None
+    return (fingerprint if fingerprint.usable else None), store
