@@ -329,6 +329,113 @@ class FastRaceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(hd["url"], verified[0][0]["url"])
         self.assertLess(time.monotonic() - started, 1.0)   # did not wait 5s
 
+    async def test_lone_low_res_source_is_served_without_burning_the_grace(self):
+        """Plenty of older titles only ever have a 720p or an SD copy. That copy
+        is the answer, not a consolation prize — with nothing better left to
+        probe there is no judgment call to make, so sitting out the grace timer
+        would show the viewer an empty screen for no gain."""
+        sd = _stream("SD", "https://good.example/sd")
+        sd["name"] = "Old Show 480p"
+        sd["_effres"] = 480
+
+        async def fake_probe_race(candidates, *_a, outcomes=None, **_k):
+            await asyncio.sleep(0.02)
+            return [(candidates[0], probe.ProbeResult(True, ttfb=0.1,
+                                                      speed_bps=20_000_000))]
+
+        started = time.monotonic()
+        with (patch("app.picker.sources.search_all", return_value=[sources.FAST]),
+              patch("app.sources.get", return_value=[sd]),
+              patch("app.sources.peek", return_value=[]),
+              patch("app.picker.nzb_lane.in_progress", return_value=False),
+              patch("app.probe.probe_race", side_effect=fake_probe_race),
+              patch("app.reputation.blocked", return_value=False),
+              patch.object(picker, "FAST_VERIFIED_GRACE", 5)):
+            verified, _ = await picker._race_fast(
+                "movie", "tt1234567", picker.PROFILES["full"], 7200,
+                lambda _s: 1_000_000, started)
+
+        self.assertEqual(sd["url"], verified[0][0]["url"])
+        # _enough() is False for 480p, so the old rule would have waited 5s.
+        self.assertLess(time.monotonic() - started, 1.0)
+
+
+class NothingFoundNoticeTests(unittest.IsolatedAsyncioTestCase):
+    """'Re-open in a few seconds' is a promise. Only make it when a retry can
+    actually deliver — otherwise say plainly that nothing exists."""
+
+    def _notice(self, pool, *, nzb=False, srcs=False, priv_running=False,
+                priv_enabled=False, priv_outcome=None):
+        # Plain callables, not AsyncMocks: with create_task stubbed out an
+        # AsyncMock's coroutine is never awaited and warns.
+        with (patch.object(picker, "_background", {}),
+              patch("app.picker._finish_in_background", lambda *a, **k: None),
+              patch("app.picker.nzb_lane.in_progress", return_value=nzb),
+              patch("app.picker.sources.in_progress", return_value=srcs),
+              patch("app.picker.private_trackers.search_in_progress",
+                    return_value=priv_running),
+              patch("app.picker.private_trackers.enabled",
+                    return_value=priv_enabled),
+              patch("app.picker.private_trackers.candidates",
+                    lambda *a, **k: None),
+              patch("app.picker.private_trackers.search_outcome",
+                    lambda *a, **k: dict(priv_outcome or {})),
+              patch("asyncio.create_task", lambda *a, **k: None)):
+            rows = picker._fast_checking_notice(
+                "k", "movie", "tt1", picker.PROFILES["full"], 7200, pool)
+        return rows[0][picker._NOTICE_STATE_KEY]
+
+    async def test_says_nothing_found_when_every_lane_is_empty_and_idle(self):
+        self.assertEqual("not_found", self._notice([]))
+
+    async def test_says_checking_while_candidates_await_verification(self):
+        self.assertEqual("checking", self._notice([_stream("HD", "https://x/1")]))
+
+    async def test_says_checking_while_a_usenet_mount_is_still_running(self):
+        self.assertEqual("checking", self._notice([], nzb=True))
+
+    async def test_says_checking_while_a_source_search_is_still_running(self):
+        self.assertEqual("checking", self._notice([], srcs=True))
+
+    async def test_says_checking_while_private_trackers_are_searching(self):
+        self.assertEqual("checking", self._notice([], priv_running=True))
+
+    async def test_empty_public_result_consults_private_before_giving_up(self):
+        # Private is enabled and nothing public exists: search it and keep the
+        # viewer on 'checking' rather than declaring failure untried.
+        self.assertEqual("checking", self._notice([], priv_enabled=True))
+
+    async def test_private_already_answered_empty_stops_the_checking_loop(self):
+        # The retry case. Re-launching a search that already answered would pin
+        # the title on 'checking' forever — the exact lie being removed.
+        for state in ("empty", "failed"):
+            with self.subTest(state=state):
+                self.assertEqual("not_found", self._notice(
+                    [], priv_enabled=True, priv_outcome={"state": state}))
+
+    async def test_private_that_found_releases_keeps_checking(self):
+        self.assertEqual("checking", self._notice(
+            [], priv_enabled=True, priv_outcome={"state": "ok", "count": 3}))
+
+
+class SufficiencyRuleTests(unittest.TestCase):
+    """The rule the race stops on: hold something that plays, and keep waiting
+    only while something better is genuinely still coming."""
+
+    def test_enough_bar_itself_is_unchanged(self):
+        hd = _stream("HD", "https://x/hd")
+        hd["_effres"] = 1080
+        self.assertTrue(picker._enough([(hd, None)]))
+        sd = _stream("SD", "https://x/sd")
+        sd["_effres"] = 480
+        self.assertFalse(picker._enough([(sd, None)]))
+
+    def test_four_k_grace_never_exceeds_the_general_grace(self):
+        # A 4K hold is meant to be the *shorter* of the two waits: it defers a
+        # result we are otherwise happy with, where the general grace defers one
+        # we are not.
+        self.assertLessEqual(picker.FAST_4K_GRACE, picker.FAST_VERIFIED_GRACE)
+
 
 class ProbeRequirementTests(unittest.TestCase):
     def test_known_bitrate_uses_relative_headroom_without_unknown_floor(self):

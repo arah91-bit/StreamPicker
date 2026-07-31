@@ -1972,6 +1972,8 @@ def _notice_stream(kind: str = "added") -> dict:
       'added'      — sent to the library via Sonarr/Radarr, downloading now;
       'checking'   — sources exist and are still being verified in the background;
                      the best working one will appear on a retry in a moment;
+      'not_found'  — every lane came back empty and nothing is still running, so
+                     a retry cannot help. Only ever shown once that is true;
       'private_empty' — private indexers were searched but no exact eligible
                         release exists under the current policy."""
     if kind == "theatrical":
@@ -1989,6 +1991,15 @@ def _notice_stream(kind: str = "added") -> dict:
             "title": ("Verifying sources so the first one always plays.\n"
                       "Re-open in a few seconds and the best working stream "
                       "will be here."),
+            "url": NOTICE_URL,
+            _NOTICE_STATE_KEY: kind,
+        }
+    if kind == "not_found":
+        return {
+            "name": "🚫 Nothing Found",
+            "title": ("No source has this right now — every indexer, usenet "
+                      "provider and tracker came back empty.\nNothing is still "
+                      "searching, so this won't change on a retry."),
             "url": NOTICE_URL,
             _NOTICE_STATE_KEY: kind,
         }
@@ -2055,9 +2066,36 @@ def _fast_checking_notice(cache_key: str, media: str, media_id: str,
         _background[cache_key] = asyncio.create_task(
             _finish_in_background(cache_key, media, media_id, profile,
                                   runtime, list(pool)))
-    logger.info(f"{cache_key}: no verified link in fast budget — 'checking' "
+    # "Re-open in a few seconds" is a promise, and it has to be true. It is when
+    # candidates exist and merely need verifying, or a lane is still working —
+    # a retry then really does get a stream. It is a lie when every source came
+    # back empty and nothing is still running, which is exactly what this used
+    # to say anyway: the Columbo case logged "verifying 0 candidates" and still
+    # told the viewer to try again.
+    working = (bool(pool) or nzb_lane.in_progress(media, media_id)
+               or sources.in_progress(media, media_id)
+               or private_trackers.search_in_progress(media, media_id))
+    if not working and private_trackers.enabled():
+        # Nothing public at all is precisely when the private lane earns its
+        # keep, so consult it before declaring failure. should_search() governs
+        # the *partial* case (fewer than N public releases) and its default of 0
+        # never fires; finding literally nothing is unambiguous, so it triggers
+        # here regardless. The search is inert — it adds and downloads nothing.
+        #
+        # Once only. Re-launching it on every retry would keep the title on
+        # "checking" forever, which is the exact failure this function exists to
+        # remove: an outcome of "empty" or "failed" is an answer, and repeating
+        # a search that already answered will not change it.
+        seen = private_trackers.search_outcome(media, media_id)
+        if not seen:
+            asyncio.create_task(private_trackers.candidates(media, media_id))
+            working = True
+        elif seen.get("state") == "ok":
+            working = True          # it found releases; the finisher serves them
+    kind = "checking" if working else "not_found"
+    logger.info(f"{cache_key}: no verified link in fast budget — '{kind}' "
                 f"notice, finisher verifying {len(pool)} candidates in background")
-    return [_notice_stream("checking")]
+    return [_notice_stream(kind)]
 
 
 # ── fast picker ─────────────────────────────────────────────────────────────
@@ -2190,34 +2228,53 @@ async def _race_fast(media: str, media_id: str, profile: dict, runtime: float,
     first_verified_at: float | None = None   # when the safety net first appeared
     deadline = min(t0 + FAST_RACE_DEADLINE, t0 + TOTAL_DEADLINE)
 
-    # Completion-first with a safety net. A verified 1080p/4K returns at once
-    # (_enough). Otherwise, the moment the race holds *any* verified stream that
-    # definitely plays, it gives itself only FAST_VERIFIED_GRACE more seconds for
-    # something genuinely better to verify, then answers with the best it has —
-    # so a guaranteed DVD copy is never held hostage to a page of unproven "HD"
-    # scraper labels that may never verify. The slow picker and the background
+    # Completion-first, and the clock is never the reason to wait. Once the race
+    # holds a stream that definitely plays, waiting is justified only by a
+    # better candidate still being probed or still queued — that is when there
+    # is a judgment call to make. With nothing better left to try, the answer is
+    # already decided and running out a timer just shows the viewer an empty
+    # screen; a 720p or an SD copy is the right answer for plenty of older
+    # titles, not a consolation prize. When there *is* a real choice, quality
+    # ranking decides it (bitrate first — see _quality_key), and the grace is
+    # bounded so a page of unproven "HD" scraper labels that never verify cannot
+    # hold a guaranteed copy hostage. The slow picker and the background
     # finisher do the patient, thorough verification.
-    def _four_k_in_flight() -> bool:
-        """A 2160p candidate whose probe is running right now."""
-        return any(int(s.get("_effres") or _resolution(s)) >= 2160
-                   for s, _ in running_probes.values())
+    def _best_verified_res() -> int:
+        return max((int(s.get("_effres") or _resolution(s))
+                    for s, _ in verified), default=0)
+
+    def _better_pending(than: int) -> bool:
+        """Is a candidate ranked above what we already hold still being probed,
+        or still waiting for a slot? Only then is waiting buying anything."""
+        if any(int(s.get("_effres") or _resolution(s)) > than
+               for s, _ in running_probes.values()):
+            return True
+        return any(int(s.get("_effres") or _resolution(s)) > than
+                   for s in pool if s.get("url") not in probed)
 
     def _sufficient() -> bool:
-        if _enough(verified):
-            n4k, _ = _count_tiers(verified)
-            # Settling for 1080p while a 4K is *still being probed* throws away
-            # the better answer for a few seconds. Probing is best-quality-first
-            # so the 4K started earlier; it is simply bigger and slower to prove.
-            # Hold briefly — but only while one is genuinely in flight, so a
-            # title with no 4K at all is never delayed, and only once, so a
-            # queue of failing 4K probes cannot stall the answer indefinitely.
-            if (n4k == 0 and FAST_4K_GRACE > 0 and _four_k_in_flight()
-                    and first_verified_at is not None
-                    and time.monotonic() - first_verified_at < FAST_4K_GRACE):
-                return False
+        # Nothing that plays yet: there is nothing to serve, so keep looking.
+        if first_verified_at is None:
+            return False
+        held = _best_verified_res()
+        waited = time.monotonic() - first_verified_at
+        # One rule, applied at every tier: we hold something that definitely
+        # plays, so the *only* reason to keep the viewer waiting is that
+        # something better is genuinely still coming. When nothing better is
+        # left — every higher candidate probed and failed, or none existed —
+        # answer now rather than run out a timer against an empty screen. Lots
+        # of older titles only ever have a 720p or an SD copy, and that copy is
+        # the right answer, not a consolation prize.
+        if not _better_pending(held):
             return True
-        return (first_verified_at is not None
-                and time.monotonic() - first_verified_at >= FAST_VERIFIED_GRACE)
+        if _enough(verified):
+            # We hold 1080p+ and something better is still in flight. Probing
+            # runs best-quality-first, so a 2160p that has not landed yet is
+            # merely bigger and slower to prove, not worse — worth a few
+            # seconds, never more.
+            return held >= 2160 or FAST_4K_GRACE <= 0 or waited >= FAST_4K_GRACE
+        # Below the 1080p bar, allow the longer grace for a real upgrade.
+        return waited >= FAST_VERIFIED_GRACE
 
     def _add_streams(streams: list[dict]) -> None:
         changed = False
