@@ -306,21 +306,30 @@ CATALOG = [
     ("EASYNEWS_PAGE_SIZE", "easynews", "num", "100", "",
      "Rows requested per Easynews query. A 100-row page costs the same as a "
      "small one and the strict title/sample gates discard most of them."),
-    ("EASYNEWS_MAX_RESULTS", "easynews", "num", "12", "",
-     "Easynews files offered per title after ranking. Each one can cost a "
-     "probe, so this is effectively a probe budget."),
+    ("EASYNEWS_MAX_RESULTS", "easynews", "num", "6", "",
+     "Easynews files offered per title after ranking. Small on purpose: the "
+     "result list only holds ~15 rows beyond the verified ones, and Easynews "
+     "returns many near-identical encodes of the same episode, so a large "
+     "value spends the list on one lane instead of five. It is also a probe "
+     "budget against a source that rations connections."),
     ("BUFFER_IDLE_GRACE_RATIONED", "proxy", "num", "10", _S,
      "BUFFER_IDLE_GRACE for a source that rations connections rather than "
      "bandwidth (Easynews allows about two). Reading ahead for a viewer who "
      "left costs a connection there, and the next stream's index read queues "
      "behind it — measured 0.36s vs 48.7s for a tail warm."),
+    ("BUFFER_TAIL_HEADSTART_RATIONED", "proxy", "num", "30", _S,
+     "BUFFER_TAIL_HEADSTART on a connection-rationed host. Much longer, "
+     "because there the fill and the tail warm contend for the same scarce "
+     "connection, so holding the fill is what lets the warm through rather "
+     "than a cost. Only read-ahead waits; the opening bytes are already in "
+     "hand from the start gate."),
     ("BUFFER_TAIL_HEADSTART", "proxy", "num", "3", _S,
      "How long the buffer producer holds off its bulk fill so the file-tail "
      "warm can land first. A player cannot show a frame until it has read the "
      "container index at EOF, and the fill starts at byte 0, so the fill can "
      "afford to wait and the index cannot. 0 lets them race (the old "
      "behaviour, which cost ~50s of black screen on Easynews)."),
-    ("EASYNEWS_MAX_PROBES", "easynews", "num", "2", "",
+    ("EASYNEWS_MAX_PROBES", "easynews", "num", "1", "",
      "Easynews candidates probed at once. An Easynews account caps concurrent "
      "transfers and the cap is low — measured: 4 fine, 6 makes the worst TTFB "
      "5.9s, 8+ gets connections killed mid-stream. Playback needs two of its "

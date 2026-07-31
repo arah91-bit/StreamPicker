@@ -1376,6 +1376,15 @@ BUFFER_TAIL_BYTES = int(float(os.environ.get("BUFFER_TAIL_MB", "8")) * 1024 * 10
 # Easynews (see _produce). Bounded, so an expensive tail degrades to today's
 # background behaviour instead of stalling the start. 0 restores the race.
 TAIL_WARM_HEADSTART = float(os.environ.get("BUFFER_TAIL_HEADSTART", "3"))
+# …and how long on a source that rations connections. Much longer, because
+# there the fill and the warm are contending for the *same* scarce connection,
+# so making the fill wait is not a cost — it is what lets the warm through.
+# Three seconds was not enough: a second stream opened while an earlier fill
+# was still running (the idle grace, or a next-episode prefetch) saw its warm
+# take 39.6 s again. Read-ahead is the only thing delayed; the opening bytes
+# are already in hand from the start gate's prebuf.
+TAIL_WARM_HEADSTART_RATIONED = float(
+    os.environ.get("BUFFER_TAIL_HEADSTART_RATIONED", "30"))
 # One quick second chance for an NZB source that failed to start: nzbdav mount
 # readiness flaps while an import settles (observed: probe OK at 5 MB/s, dead
 # 11s later, playing fine 26s after that). Public debrid links don't flap this
@@ -1730,10 +1739,11 @@ async def _produce(e: _Entry, token: str, resp, it, prebuf: list) -> None:
             # source whose tail is genuinely expensive (a cold nzbdav mount
             # costs ~7.7 s) just falls back to warming in the background
             # exactly as before, having cost us TAIL_WARM_HEADSTART at most.
-            if TAIL_WARM_HEADSTART > 0:
+            headstart = (TAIL_WARM_HEADSTART_RATIONED
+                         if _rationed_source(e.source) else TAIL_WARM_HEADSTART)
+            if headstart > 0:
                 try:
-                    await asyncio.wait_for(asyncio.shield(t),
-                                           TAIL_WARM_HEADSTART)
+                    await asyncio.wait_for(asyncio.shield(t), headstart)
                 except Exception:       # timeout, or the warm failed on its own
                     pass
         while True:

@@ -486,6 +486,17 @@ Inception, Oppenheimer and The Bear return full 4K remuxes. It races in the
 fast lane alongside the debrid scrapers; the other lanes still cover what it
 misses.
 
+**Keep `EASYNEWS_MAX_RESULTS` small, and resist raising it.** `_assemble` shows
+the verified rows plus only `rest[:15]`, so candidates are a fixed budget shared
+by every lane. Easynews returns many near-identical encodes of one episode (a
+German dub, several HDR variants, two or three web-dls), and at the original
+default of 12 it filled that cap on every single request — measured across four
+real result lists it took **44-63% of the visible rows**, while the direct-usenet
+lane contributed 0-3. The point of running five lanes is breadth, and one lane
+returning twelve versions of the same file is the opposite of breadth. The same
+number is also a probe budget against a source that rations connections, so
+raising it costs start latency too. Both arguments point the same way.
+
 ---
 
 ## Invariants worth not breaking
@@ -522,7 +533,7 @@ misses.
 | `NZB_TRANSPORT_WINDOW_MINUTES` | 10 | Window those failures must land inside |
 | `PRIVATE_TRACKER_MIN_SOURCES` | 0 | Below this many public releases, also search private trackers |
 | `EASYNEWS_SEARCH_TIMEOUT` | 45 | Generous by design — search latency has a fat tail and nothing blocks on it |
-| `EASYNEWS_MAX_RESULTS` | 12 | Easynews files offered per title; effectively a probe budget |
+| `EASYNEWS_MAX_RESULTS` | 6 | Easynews files offered per title — small so one lane can't own the list |
 | `EASYNEWS_MIN_MB` | 50 | Size floor below which a "video" is a sample whatever it is named |
 | `EASYNEWS_RUNTIME_MIN_FRAC` | 0.5 | Reject a file whose declared runtime is this far under the title's |
 | `EASYNEWS_MAX_PROBES` | 2 | Easynews candidates probed at once — the account's transfer cap is low |

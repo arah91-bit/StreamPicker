@@ -80,7 +80,12 @@ _INGEST_LIMITS = {"TB": TORBOX_MAX_DOWNLOADS}
 # the picker answered in 2 s, but the probes ate every slot, the tail warm
 # failed silently, and probes died with RemoteProtocolError. Keep this well
 # under the cap so the two connections playback needs are always available.
-EASYNEWS_MAX_PROBES = max(1, int(os.environ.get("EASYNEWS_MAX_PROBES", "2")))
+# One, not two. Probing is background work that competes with playback for the
+# same two connections: a starting stream needs one for its producer and one for
+# the tail warm that gates its first frame. At 2 probes a start measured 55.9s
+# because the warm was the fourth request for a second and third slot. Verifying
+# candidates a little slower is invisible; a 55-second black screen is not.
+EASYNEWS_MAX_PROBES = max(1, int(os.environ.get("EASYNEWS_MAX_PROBES", "1")))
 _SOURCE_LIMITS = {"easynews": EASYNEWS_MAX_PROBES}
 # Semaphores bind to the running event loop on first await, so each tag keeps
 # (loop, semaphore) and re-creates on a new loop — production has one loop

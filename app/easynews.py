@@ -88,8 +88,17 @@ SEARCH_TIMEOUT = float(os.environ.get("EASYNEWS_SEARCH_TIMEOUT", "45"))
 # Rows to ask for per query. Easynews answers a 100-row page as fast as a 25-row
 # one, and the strict gates below discard most of them.
 PAGE_SIZE = max(10, int(os.environ.get("EASYNEWS_PAGE_SIZE", "100")))
-# Rows to emit after ranking. Each one costs a probe, so this is a probe budget.
-MAX_RESULTS = max(1, int(os.environ.get("EASYNEWS_MAX_RESULTS", "12")))
+# Rows to emit after ranking. Kept deliberately small for two reasons that
+# happen to agree. Breadth: the picker shows the verified rows plus only ~15
+# more, so a lane that returns a dozen near-identical encodes of one episode
+# (the German dub, three HDR variants, two web-dls) spends the list on itself
+# instead of on the other four lanes — measured, Easynews was taking 44-63% of
+# every result list while filling this cap exactly. Speed: each candidate can
+# cost a probe against a source that rations connections to about two, and that
+# contention is what made starts slow. Halving the candidates halves both
+# problems; the lane's own ranking already puts the good ones first, so this
+# drops the tail, not the winners.
+MAX_RESULTS = max(1, int(os.environ.get("EASYNEWS_MAX_RESULTS", "6")))
 # Floor under which a "video" is a sample/clip whatever its name claims.
 MIN_MB = max(0, int(os.environ.get("EASYNEWS_MIN_MB", "50")))
 # A row whose *declared* runtime is below this fraction of the title's expected
