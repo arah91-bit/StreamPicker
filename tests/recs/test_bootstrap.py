@@ -167,6 +167,77 @@ class NegativeFingerprintTests(unittest.TestCase):
         self.assertNotIn("disliked", plain.summary())
 
 
+class SeenItTests(unittest.IsolatedAsyncioTestCase):
+    """"It was fine" — watched, no opinion. A real answer with a real effect.
+
+    It carries no direction, so it must never reach either centroid. But it
+    does say they have seen the thing, and handing it back as a recommendation
+    is the plainest way to look like nobody was listening.
+    """
+
+    def generator(self, feedback):
+        from app.recs.catalogs import Generator
+        gen = Generator({"token": "t", "name": "V", "is_kid": 0})
+        gen.profile = {"watched_imdb": set(), "watched_tmdb_movie": set(),
+                       "watched_tmdb_show": set()}
+        gen.rated_titles = {i for i, e in feedback.items()
+                            if e["verdict"] in ("liked", "disliked", "seen")}
+        return gen
+
+    def test_everything_they_have_seen_is_kept_out_of_the_rows(self):
+        gen = self.generator({
+            "tt-liked": {"verdict": "liked"},
+            "tt-meh": {"verdict": "seen"},
+            "tt-no": {"verdict": "disliked"},
+        })
+        self.assertEqual({"tt-liked", "tt-meh", "tt-no"}, gen._exclude())
+
+    def test_never_seen_it_stays_recommendable(self):
+        """Excluding a skip would turn every "not sure" into a permanent ban
+        on a title they might well enjoy."""
+        gen = self.generator({"tt-skipped": {"verdict": "unknown"}})
+        self.assertEqual(set(), gen._exclude())
+
+    async def test_it_reaches_neither_centroid(self):
+        """Only liked and disliked may weigh anything. Verified by watching
+        what `for_viewer` hands to the builder, rather than by inspecting a
+        finished fingerprint — a corpus small enough to write out by hand
+        cannot clear the usability floor, and shrinking that floor to make a
+        test pass would be the wrong thing to change."""
+        import app.recs.db as real_db
+        from app.recs import taste
+
+        store = {f"tt-{k}{n}": [f"k:{k}"]
+                 for k in ("l", "m", "d") for n in range(6)}
+        feedback = {}
+        for kind, verdict in (("l", "liked"), ("m", "seen"), ("d", "disliked")):
+            for n in range(6):
+                feedback[f"tt-{kind}{n}"] = {"verdict": verdict,
+                                             "media_type": "movie"}
+        seen_args = {}
+
+        def spy(weights, features_by_imdb, vocabulary, baseline_pool=None,
+                rng=None, disliked=None):
+            seen_args["weights"] = weights
+            seen_args["disliked"] = disliked
+            return fingerprint.Fingerprint({}, vocabulary, [], 0)
+
+        with (patch.object(real_db, "features_by_imdb",
+                           AsyncMock(return_value=store)),
+              patch.object(real_db, "feedback_for",
+                           AsyncMock(return_value=feedback)),
+              patch.object(features, "vocabulary", AsyncMock(
+                  return_value=features.Vocabulary({"k:l": 6}, 18))),
+              patch.object(fingerprint, "build", spy)):
+            await fingerprint.for_viewer(taste.TasteModel(), None,
+                                         user_token="t")
+
+        self.assertEqual({f"tt-l{n}" for n in range(6)},
+                         set(seen_args["weights"]))
+        self.assertEqual({f"tt-d{n}" for n in range(6)},
+                         set(seen_args["disliked"]))
+
+
 class ProgressTests(unittest.IsolatedAsyncioTestCase):
     async def test_enough_is_reached_on_rated_titles_not_on_skips(self):
         """"Never seen it" is the honest answer to most of a deck and says

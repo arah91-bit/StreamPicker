@@ -247,6 +247,8 @@ class Generator:
         self.fingerprint: fingerprint.Fingerprint | None = None
         # Loaded once per build and read by every row's tailoring.
         self.feature_store: dict[str, list[str]] = {}
+        # Titles the viewer has told us they have seen, whichever way it went.
+        self.rated_titles: set[str] = set()
         self.used_imdb: set[str] = set()
         self.recently_shown: dict[str, int] = {}
         self.pinned_rows = 0
@@ -257,7 +259,13 @@ class Generator:
     # exclusion sets: everything the user watched + anything already placed
     # in an earlier catalog today (so rows don't repeat each other)
     def _exclude(self) -> set[str]:
-        return self.profile["watched_imdb"] | self.used_imdb
+        # Bootstrap verdicts count as watched. Three of the four say so
+        # outright — liked it, seen it, not for me — and handing back
+        # something somebody has just told you they have seen is the plainest
+        # way to look like you were not listening. "Never seen it" is
+        # deliberately absent: that is a perfectly good thing to recommend,
+        # and excluding it would turn every skip into a permanent ban.
+        return self.profile["watched_imdb"] | self.used_imdb | self.rated_titles
 
     def _excl_tmdb(self, media: str) -> set[int]:
         return (self.profile["watched_tmdb_movie"] if media == "movie"
@@ -888,6 +896,14 @@ class Generator:
 
     async def run(self) -> None:
         self.recently_shown = await db.get_recently_shown(self.token)
+        try:
+            self.rated_titles = {
+                imdb_id for imdb_id, entry in
+                (await db.feedback_for(self.token)).items()
+                if entry["verdict"] in ("liked", "disliked", "seen")
+            }
+        except Exception:
+            logger.exception(f"[{self.token[:8]}] taste feedback unreadable")
         # Taste comes from what this service actually played for this viewer.
         # There is no Trakt account behind any of this any more: a free Trakt
         # account allows one connected application, and that slot belongs to

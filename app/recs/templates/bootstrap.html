@@ -56,6 +56,14 @@ button.primary:disabled{background:#30363d;color:var(--dim)}
 .acts .em{font-size:1.3rem;line-height:1}
 .acts .no{border-color:#5a2f2b;color:var(--no)}
 .acts .yes{border-color:#22562f;color:var(--yes)}
+.acts .meh{color:var(--dim)}
+.seenlbl{margin:0;font-size:.8rem;color:var(--dim);letter-spacing:.02em}
+/* Wider and quieter than the verdicts: it is the honest answer to most of a
+   deck, so it has to be the easiest thing to hit, without looking like an
+   opinion. */
+.skip{width:100%;padding:13px;border-radius:12px;border:1px dashed var(--line);
+  background:transparent;color:var(--dim);font-size:.92rem;font-weight:600;
+  font-family:inherit;cursor:pointer}
 .bar{height:5px;background:#21262d;border-radius:3px;overflow:hidden}
 .bar i{display:block;height:100%;background:var(--accent);width:0;
   transition:width .25s}
@@ -94,11 +102,13 @@ button.primary:disabled{background:#30363d;color:var(--dim)}
   <div class="count"><span id="tally">No answers yet</span>
     <span id="remain"></span></div>
   <div class="deck" id="deck"></div>
+  <p class="seenlbl">Seen it? How was it —</p>
   <div class="acts">
     <button class="no" data-v="disliked"><span class="em">👎</span>Not for me</button>
-    <button data-v="unknown"><span class="em">🤷</span>Never seen it</button>
+    <button class="meh" data-v="seen"><span class="em">😐</span>It was fine</button>
     <button class="yes" data-v="liked"><span class="em">👍</span>Liked it</button>
   </div>
+  <button class="skip" data-v="unknown">🤷 Never seen it</button>
   <div class="go"><button class="primary" id="finish">Done for now</button></div>
 </section>
 
@@ -195,10 +205,16 @@ function render() {
 
 function tally() {
   const p = progress;
-  $("tally").textContent = p.rated
-    ? `${p.liked} liked · ${p.disliked} not for you` : "No answers yet";
+  const bits = [];
+  if (p.liked) bits.push(p.liked + " liked");
+  if (p.disliked) bits.push(p.disliked + " not for you");
+  if (p.seen) bits.push(p.seen + " just fine");
+  $("tally").textContent = bits.length ? bits.join(" · ") : "No answers yet";
+  // Only liked and not-for-me move the bar. "It was fine" and "never seen it"
+  // are both real answers and neither says which way your taste runs, so
+  // neither can be what completes the session.
   $("remain").textContent = p.enough ? "Enough to work with 🎉"
-    : `${Math.max(0, 12 - p.rated)} more for a good start`;
+    : `${Math.max(0, 12 - p.rated)} more likes or dislikes`;
   $("fill").style.width = Math.min(100, (p.rated / 12) * 100) + "%";
 }
 
@@ -209,6 +225,9 @@ async function answer(verdict) {
   const el = document.querySelector(".card");
   if (el) el.classList.add(verdict === "liked" ? "out-right"
     : verdict === "disliked" ? "out-left" : "out-up");
+  // "It was fine" is not a taste signal, but it is still something they have
+  // seen — so it stops the title being recommended back, the same as the two
+  // verdicts that do carry a direction.
   try {
     const r = await fetch(base + "/verdict", {
       method: "POST", headers: {"Content-Type": "application/json"},
@@ -218,15 +237,16 @@ async function answer(verdict) {
   setTimeout(() => { busy = false; render(); }, 120);
 }
 
-document.querySelectorAll(".acts button").forEach(b =>
+document.querySelectorAll("[data-v]").forEach(b =>
   b.onclick = () => answer(b.dataset.v));
 
 $("finish").onclick = async () => {
   $("finish").disabled = true; $("finish").textContent = "Saving…";
   const r = await fetch(base + "/done", {method: "POST"});
   const d = await r.json();
-  $("summary").textContent =
-    `${d.progress.liked} liked, ${d.progress.disliked} ruled out.`;
+  const p = d.progress;
+  $("summary").textContent = `${p.liked} liked, ${p.disliked} ruled out`
+    + (p.seen ? `, ${p.seen} already seen.` : ".");
   $("step-deck").classList.add("hide");
   $("step-done").classList.remove("hide");
 };
