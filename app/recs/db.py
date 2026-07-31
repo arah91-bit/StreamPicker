@@ -90,6 +90,21 @@ CREATE INDEX IF NOT EXISTS idx_play_history_recent
 CREATE INDEX IF NOT EXISTS idx_play_history_title
     ON play_history (viewer_key, imdb_id);
 
+-- Sparse feature tokens per title, for the taste fingerprint. Kept apart from
+-- meta_cache because the lifecycles differ: meta is re-fetched when a
+-- certificate or home-release date goes stale, while features change only when
+-- TMDB's own data does. Content metadata only — nothing here is user-specific.
+CREATE TABLE IF NOT EXISTS title_features (
+    tmdb_id INTEGER NOT NULL,
+    media_type TEXT NOT NULL,
+    imdb_id TEXT,
+    features TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (tmdb_id, media_type)
+);
+CREATE INDEX IF NOT EXISTS idx_title_features_imdb
+    ON title_features (imdb_id);
+
 CREATE TABLE IF NOT EXISTS storage_migrations (
     id TEXT PRIMARY KEY,
     applied_at INTEGER NOT NULL
@@ -1385,6 +1400,89 @@ async def cached_genres_by_imdb(imdb_ids: set[str]) -> dict[str, list[str]]:
         if genres:
             out[imdb_id] = list(genres)
     return out
+
+
+# ── title features (shared, content only — the fingerprint vocabulary) ──
+
+async def cache_put_features(tmdb_id: int, media_type: str,
+                             imdb_id: str | None, features: list[str]) -> None:
+    """Store one title's feature tokens. Empty lists are stored too, so a
+    title with genuinely no keywords is not re-fetched on every build."""
+    from app.recs import features as feature_lib
+
+    await conn().execute(
+        "INSERT OR REPLACE INTO title_features"
+        " (tmdb_id, media_type, imdb_id, features, updated_at)"
+        " VALUES (?,?,?,?,?)",
+        (tmdb_id, media_type, imdb_id, feature_lib.encode(features),
+         int(time.time())),
+    )
+    await conn().commit()
+
+
+async def features_by_imdb(imdb_ids: set[str] | None = None
+                           ) -> dict[str, list[str]]:
+    """IMDb id → feature tokens. Pass None for the whole store."""
+    from app.recs import features as feature_lib
+
+    async with conn().execute(
+        "SELECT imdb_id, features FROM title_features WHERE imdb_id IS NOT NULL"
+    ) as cur:
+        rows = await cur.fetchall()
+    wanted = None if imdb_ids is None else {i for i in imdb_ids if i}
+    out: dict[str, list[str]] = {}
+    for row in rows:
+        imdb_id = row["imdb_id"]
+        if wanted is not None and imdb_id not in wanted:
+            continue
+        if imdb_id in out:
+            continue
+        out[imdb_id] = feature_lib.decode(row["features"])
+    return out
+
+
+async def feature_document_frequency() -> tuple[dict[str, int], int]:
+    """({token: titles carrying it}, total titles) across the whole store.
+
+    Computed on demand rather than maintained incrementally: it is one pass
+    over a table of tens of thousands of short JSON arrays, which costs far
+    less than keeping a counter correct through every write path.
+    """
+    from app.recs import features as feature_lib
+
+    frequency: dict[str, int] = {}
+    documents = 0
+    async with conn().execute("SELECT features FROM title_features") as cur:
+        rows = await cur.fetchall()
+    for row in rows:
+        tokens = feature_lib.decode(row["features"])
+        if not tokens:
+            continue
+        documents += 1
+        for token in set(tokens):
+            frequency[token] = frequency.get(token, 0) + 1
+    return frequency, documents
+
+
+async def titles_missing_features(limit: int = 20000) -> list[dict]:
+    """Cached titles that have metadata but no features yet — the backfill
+    worklist. Features ride along on new resolutions, so this drains to
+    nothing and stays there."""
+    async with conn().execute(
+        "SELECT m.tmdb_id, m.media_type, m.imdb_id FROM meta_cache m"
+        " LEFT JOIN title_features f"
+        "   ON f.tmdb_id = m.tmdb_id AND f.media_type = m.media_type"
+        " WHERE f.tmdb_id IS NULL AND m.imdb_id IS NOT NULL"
+        " LIMIT ?", (limit,)) as cur:
+        return [dict(r) for r in await cur.fetchall()]
+
+
+async def feature_coverage() -> dict[str, int]:
+    async with conn().execute(
+        "SELECT (SELECT COUNT(*) FROM meta_cache WHERE imdb_id IS NOT NULL) AS metas,"
+        " (SELECT COUNT(*) FROM title_features) AS features") as cur:
+        row = await cur.fetchone()
+    return {"metas": row["metas"], "features": row["features"]}
 
 
 async def cache_put_meta(tmdb_id: int, media_type: str, imdb_id: str | None,

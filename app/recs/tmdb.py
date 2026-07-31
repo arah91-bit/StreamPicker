@@ -11,12 +11,15 @@ treated as not kid-safe."""
 
 import asyncio
 import datetime
+import logging
 import re
 from typing import Any, Literal, TypedDict
 
 import httpx
 
-from app.recs import config, db, kids
+from app.recs import config, db, features, kids
+
+logger = logging.getLogger("nuvio-recs")
 
 IMG = "https://image.tmdb.org/t/p"
 
@@ -651,8 +654,12 @@ async def resolve_meta(media_type: str, tmdb_id: int,
                 cached["cert"], max_age, (cached["meta"] or {}).get("genres")):
             return cached["meta"]
         return None
-    append = "external_ids,release_dates" if media_type == "movie" \
-        else "external_ids,content_ratings"
+    # Keywords and credits are the fingerprint's vocabulary and they cost
+    # nothing here: append_to_response bundles them into this same request.
+    # Movies expose flat `credits`; television needs `aggregate_credits` to
+    # get a series-level cast rather than one episode's.
+    append = "external_ids,release_dates,keywords,credits" if media_type == "movie" \
+        else "external_ids,content_ratings,keywords,aggregate_credits"
     try:
         detail = await _get(f"/{media_type}/{tmdb_id}", {"append_to_response": append})
     except (httpx.HTTPError, ValueError):
@@ -692,6 +699,13 @@ async def resolve_meta(media_type: str, tmdb_id: int,
     await db.cache_put_meta(
         tmdb_id, media_type, imdb_id, meta, cert, home_release_date,
         home_release_verified if media_type == "movie" else None)
+    try:
+        await db.cache_put_features(
+            tmdb_id, media_type, imdb_id, features.extract(detail, media_type))
+    except Exception:
+        # The fingerprint is an enhancement; metadata resolution is not
+        # allowed to fail because feature storage did.
+        logger.debug("features: could not store for %s", tmdb_id, exc_info=True)
     if require_home_release and not is_home_released(media_type, detail):
         return None
     if not cert_allowed(cert, max_age, meta.get("genres")):

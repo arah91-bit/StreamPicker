@@ -16,7 +16,7 @@ import random
 import time
 from itertools import combinations
 
-from app.recs import config, db, preseed, taste, tmdb
+from app.recs import config, db, fingerprint, preseed, taste, tmdb
 from app.recs.holidays import active_holiday
 from app.recs.kids import band_for_age, effective_kid_age
 from app.recs.profile import build_profile
@@ -64,6 +64,25 @@ KID_EXCLUDED_GENRES = {"horror", "war", "crime"}
 # from, which is what makes the diversity pressure meaningful.
 TOP_PICKS_SEED_COUNT = 10
 TOP_PICKS_PER_SEED = 12
+
+# Candidate generation from the fingerprint. Seeds can only reach what TMDB
+# already lists as similar to something watched; these sweep the catalogue by
+# the features the viewer's own history is made of, which is what takes the
+# pool from roughly a hundred candidates to several hundred.
+FINGERPRINT_KEYWORD_QUERIES = 6     # discover calls built from top keywords
+FINGERPRINT_KEYWORDS_PER_QUERY = 3  # OR-ed together, so each returns breadth
+FINGERPRINT_PEOPLE_QUERIES = 3
+FINGERPRINT_DISCOVER_PAGES = 2
+FINGERPRINT_PER_QUERY = 20
+
+# Weight of the fingerprint's own verdict when ranking a candidate. It is the
+# only signal that can compare titles from different seeds — or from no seed
+# at all — on one scale, so it leads; the rest survive as corroboration.
+PICK_WEIGHT_FINGERPRINT = 0.45
+# Lift at which a candidate is treated as a perfect match for scaling. Three
+# times an average popular title is already a strong signal; measured on real
+# history the best genuine matches land between 2 and 7.
+LIFT_FULL_MATCH = 3.0
 
 # What decides a candidate's place in Top Picks. Seed strength leads because
 # "similar to something you loved" is the row's premise; TMDB's own ordering
@@ -166,6 +185,7 @@ class Generator:
         self.day = today.toordinal()
         self.rows: list[tuple[float, dict]] = []
         self.taste: taste.TasteModel | None = None
+        self.fingerprint: fingerprint.Fingerprint | None = None
         self.used_imdb: set[str] = set()
         self.recently_shown: dict[str, int] = {}
         self.pinned_rows = 0
@@ -799,6 +819,23 @@ class Generator:
             logger.exception(f"[{self.token[:8]}] taste model failed")
             self.taste = None
 
+        # The same history as a vector, which is what lets a candidate nothing
+        # in the history is linked to still be scored. Returns None on a thin
+        # history or an unpopulated feature store, and the row falls back to
+        # seed similarity — a fingerprint built from two titles would rank the
+        # whole catalogue with unearned confidence.
+        if self.taste:
+            try:
+                context = taste.CONTEXT_SOLO if self.kid_age is None else None
+                self.fingerprint = await fingerprint.for_viewer(
+                    self.taste, context, self.rng)
+                logger.info(
+                    f"[{self.token[:8]}] fingerprint: "
+                    f"{self.fingerprint.summary() if self.fingerprint else 'unavailable'}")
+            except Exception:
+                logger.exception(f"[{self.token[:8]}] fingerprint failed")
+                self.fingerprint = None
+
         # thin history → blend in this user's hand-picked taste anchors and/or
         # real watch history pulled from elsewhere (e.g. Nuvio local history)
         if len(wm) + len(ws) < preseed.PRESEED_MAX_HISTORY:
@@ -1003,8 +1040,15 @@ class Generator:
         return out
 
     def _pick_score(self, meta: dict, seed_strength: float, order: float,
-                    affinity: dict[str, float]) -> float:
-        """A candidate's relevance to this viewer, 0..1."""
+                    affinity: dict[str, float],
+                    lift: float | None = None) -> float:
+        """A candidate's relevance to this viewer, 0..1.
+
+        With a fingerprint the weights are rebalanced rather than added to:
+        seed strength and TMDB's ordering are both statements about one seed,
+        and a pool drawn from six different queries plus ten seeds needs a
+        measure that spans all of them.
+        """
         genres = [taste.genre_slug(g) for g in meta.get("genres") or ()]
         genre_fit = max((affinity.get(slug, 0.0) for slug in genres),
                         default=0.0)
@@ -1012,10 +1056,84 @@ class Generator:
             rating = float(meta.get("imdbRating") or 0) / 10.0
         except (TypeError, ValueError):
             rating = 0.0
-        return (PICK_WEIGHT_SEED * seed_strength
-                + PICK_WEIGHT_ORDER * order
-                + PICK_WEIGHT_GENRE * genre_fit
-                + PICK_WEIGHT_RATING * max(0.0, min(1.0, rating)))
+        rating = max(0.0, min(1.0, rating))
+        if lift is None:
+            return (PICK_WEIGHT_SEED * seed_strength
+                    + PICK_WEIGHT_ORDER * order
+                    + PICK_WEIGHT_GENRE * genre_fit
+                    + PICK_WEIGHT_RATING * rating)
+        match = max(0.0, min(1.0, lift / LIFT_FULL_MATCH))
+        remainder = 1.0 - PICK_WEIGHT_FINGERPRINT
+        return (PICK_WEIGHT_FINGERPRINT * match
+                + remainder * (0.35 * seed_strength + 0.20 * order
+                               + 0.20 * genre_fit + 0.25 * rating))
+
+    async def _fingerprint_candidates(self, print_) -> list[tuple[str, list[dict]]]:
+        """Titles swept from the catalogue by what this viewer's taste is made of.
+
+        Each discover call OR-s a few of the fingerprint's strongest keywords
+        together, so a query returns a neighbourhood rather than an
+        intersection — `with_keywords=a|b|c` is broad on purpose. The
+        fingerprint then re-ranks everything it finds, which is the division of
+        labour that makes a wide sweep safe.
+
+        Returned per query rather than as one list, because the diversity
+        selector's quota is per source. Handing it two hundred candidates
+        under a single label capped the entire sweep at one source's share:
+        measured live, 319 candidates yielded four swept titles in the row.
+        Each query is a different neighbourhood and competes as one.
+        """
+        keywords = [token.split(":", 1)[1]
+                    for token in print_.top_features(
+                        FINGERPRINT_KEYWORD_QUERIES
+                        * FINGERPRINT_KEYWORDS_PER_QUERY, ("k",))]
+        people = [token.split(":", 1)[1]
+                  for token in print_.top_features(
+                      FINGERPRINT_PEOPLE_QUERIES, ("p",))]
+        # Sorting every sweep by popularity fills the row with whatever is
+        # biggest that month — a live run returned Bridgerton, Modern Family
+        # and two Harry Potters for a viewer whose taste is nature
+        # documentaries and animation. Alternating with a rating sort behind a
+        # vote floor reaches titles that match without being blockbusters.
+        def sort_for(index: int) -> dict:
+            if index % 2:
+                return {"sort_by": "vote_average.desc", "vote_count.gte": 200}
+            return {"sort_by": "popularity.desc"}
+
+        queries: list[tuple[str, dict]] = []
+        for index in range(0, len(keywords), FINGERPRINT_KEYWORDS_PER_QUERY):
+            group = keywords[index:index + FINGERPRINT_KEYWORDS_PER_QUERY]
+            if group:
+                queries.append(("keywords",
+                                {"with_keywords": "|".join(group),
+                                 **sort_for(len(queries))}))
+        for person in people:
+            queries.append(("person", {"with_people": person,
+                                       **sort_for(len(queries))}))
+        if not queries:
+            return []
+
+        share = self._movie_share()
+        out: list[tuple[str, list[dict]]] = []
+        for index, (label, params) in enumerate(queries):
+            # `with_people` is a movie-only filter on TMDB's discover; asking
+            # for it on /discover/tv silently returns an unfiltered popularity
+            # list, which is the opposite of a targeted sweep.
+            medias = ("movie",) if label == "person" else (
+                ("movie", "tv") if 0.15 < share < 0.85
+                else ("movie" if share >= 0.85 else "tv",))
+            for media in medias:
+                try:
+                    found = await self._resolve_discover(
+                        media, params, FINGERPRINT_PER_QUERY,
+                        pages=FINGERPRINT_DISCOVER_PAGES)
+                except Exception:
+                    logger.debug(f"[{self.token[:8]}] fingerprint sweep failed",
+                                 exc_info=True)
+                    continue
+                if found:
+                    out.append((f"fp-{label}-{index}-{media}", found))
+        return out
 
     async def _top_picks(self) -> dict | None:
         """The opening row, built from this viewer's own strongest titles.
@@ -1040,15 +1158,40 @@ class Generator:
             return None
         context = taste.CONTEXT_SOLO if self.kid_age is None else None
         affinity = self.taste.genre_affinity(context) if self.taste else {}
-        candidates: list[taste.Candidate] = []
-        seen: set[str] = set()
+        print_ = self.fingerprint
+
+        sources: list[tuple[str, float, list[dict]]] = []
         for seed, strength in seeds:
             try:
-                metas = await self._seed_similar(seed, TOP_PICKS_PER_SEED)
+                sources.append((seed.get("imdb") or str(seed.get("tmdb") or ""),
+                                strength,
+                                await self._seed_similar(seed, TOP_PICKS_PER_SEED)))
             except Exception:
                 logger.debug(f"[{self.token[:8]}] top-picks seed failed",
                              exc_info=True)
-                continue
+        swept_sources: set[str] = set()
+        if print_:
+            # A swept candidate answers to no seed, so it carries the median
+            # seed strength: it should neither inherit the best seed's
+            # authority nor be handicapped for having none. Its real claim on
+            # a slot is its lift.
+            strengths = sorted(s for _, s in seeds)
+            median = strengths[len(strengths) // 2] if strengths else 0.5
+            for label, found in await self._fingerprint_candidates(print_):
+                swept_sources.add(label)
+                sources.append((label, median, found))
+
+        features_wanted = {m.get("id") for _, _, metas in sources
+                           for m in metas if m.get("id")}
+        lifts: dict[str, float] = {}
+        if print_ and features_wanted:
+            store = await db.features_by_imdb(features_wanted)
+            lifts = {imdb_id: print_.lift(tokens)
+                     for imdb_id, tokens in store.items() if tokens}
+
+        candidates: list[taste.Candidate] = []
+        seen: set[str] = set()
+        for seed_id, strength, metas in sources:
             for position, meta in enumerate(metas):
                 imdb_id = meta.get("id")
                 if not imdb_id or imdb_id in seen:
@@ -1068,9 +1211,10 @@ class Generator:
                     imdb_id=imdb_id,
                     media_type=("movie" if meta.get("type") == "movie"
                                 else "series"),
-                    score=self._pick_score(meta, strength, order, affinity),
+                    score=self._pick_score(meta, strength, order, affinity,
+                                           lifts.get(imdb_id)),
                     genres=genres,
-                    seed_id=seed.get("imdb") or str(seed.get("tmdb") or ""),
+                    seed_id=seed_id,
                     meta=meta,
                 ))
         if len(candidates) < 5:
@@ -1082,9 +1226,12 @@ class Generator:
         if len(combined) < 5:
             return None
         contributing = len({c.seed_id for c in chosen})
+        swept_in = sum(1 for c in chosen if c.seed_id in swept_sources)
+        scored = sum(1 for c in chosen if c.imdb_id in lifts)
         logger.info(f"[{self.token[:8]}] top picks: {len(combined)} items from "
-                    f"{contributing}/{len(seeds)} seeds "
-                    f"({len(candidates)} candidates)")
+                    f"{contributing}/{len(sources)} sources "
+                    f"({len(candidates)} candidates; {swept_in} swept by "
+                    f"fingerprint, {scored} lift-scored)")
         self.used_imdb.update(m["id"] for m in combined)
         return {"id": TOP_PICKS_ID, "type": config.COMBINED_TYPE,
                 "name": "Top Picks", "metas": combined}
