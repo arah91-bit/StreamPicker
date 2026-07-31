@@ -712,12 +712,20 @@ async def taste_picks(token: str, body: TastePicks):
     return {"status": "saved"}
 
 
-@app.get("/{token}/taste/api/deck")
-async def taste_deck(token: str):
+class DeckRequest(BaseModel):
+    # Ids the phone is already holding. They exist nowhere on the server — a
+    # dealt-but-unanswered card is not a verdict — so without them the next
+    # deck happily deals the same titles again.
+    have: list[str] = []
+
+
+@app.post("/{token}/taste/api/deck")
+async def taste_deck(token: str, body: DeckRequest):
     user = await _require_user(token)
     from app.recs.profile_streaming import private_namespace_for_user
     seen = await bootstrap.already_known(token,
                                          private_namespace_for_user(user))
+    seen.update(i for i in body.have if i)
     cards = await bootstrap.deck(user, seen)
     return {"cards": cards, "progress": await bootstrap.progress(token)}
 
@@ -735,15 +743,29 @@ async def taste_verdict(token: str, body: Verdict):
         raise HTTPException(400, "unknown verdict")
     media_type = "movie" if body.type == "movie" else "series"
     await db.record_feedback(token, body.id, media_type, body.verdict)
-    return {"progress": await bootstrap.progress(token)}
+    state = await bootstrap.progress(token)
+    # Nobody presses "done" — they close the tab. So the rebuild has to happen
+    # on its own, at intervals, or a session's work would sit unused until the
+    # nightly run.
+    if bootstrap.should_rebuild(state["rated"]):
+        user = await db.get_user(token)
+        if user:
+            asyncio.create_task(
+                generate_for_user(user, trigger="taste-bootstrap"))
+            state["rebuilding"] = True
+    return {"progress": state}
 
 
 @app.post("/{token}/taste/api/done")
 async def taste_done(token: str):
-    """Finish a session: rebuild now so the result is visible immediately."""
+    """Best-effort end-of-session ping, sent by `navigator.sendBeacon` when the
+    page is hidden or closed. Never relied upon: a beacon can be dropped, and
+    the interval rebuild above is what actually guarantees the work lands."""
     user = await _require_user(token)
-    asyncio.create_task(generate_for_user(user, trigger="taste-bootstrap"))
-    return {"status": "refreshing", "progress": await bootstrap.progress(token)}
+    state = await bootstrap.progress(token)
+    if state["rated"]:
+        asyncio.create_task(generate_for_user(user, trigger="taste-bootstrap"))
+    return {"status": "ok", "progress": state}
 
 
 @app.get("/health")

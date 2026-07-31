@@ -65,50 +65,72 @@ def _slug_ids(slugs: list[str], media: str) -> str:
     return "|".join(sorted(ids))
 
 
+# How many differently-paged sweeps to try before giving up on filling a deck.
+# One pass is not enough once a session is a few decks deep: every request
+# picks a page at random, so two requests routinely landed on the same page
+# and dealt the same titles again.
+MAX_ATTEMPTS = 6
+
+
 async def deck(user: dict, seen: set[str], size: int = DECK_SIZE,
                rng: random.Random | None = None) -> list[dict]:
     """The next handful of cards for one viewer.
 
-    `seen` is every title they have already ruled on or played, so a session
-    never asks twice and never asks about something already in their history.
+    `seen` is every title already ruled on, played, or *dealt earlier in this
+    session* — the last one matters. A card sitting unanswered in the phone's
+    queue is not in the database anywhere, so a deck built only from stored
+    verdicts happily dealt it again.
+
+    Pages are tried until the deck fills rather than once, because a random
+    page that has already been exhausted otherwise returns a deck of nothing.
     """
     rng = rng or random.Random()
     genres, countries = db.bootstrap_taste(user)
     out: list[dict] = []
+    tried: set[tuple[str, int]] = set()
     medias = ["movie", "tv"]
     rng.shuffle(medias)
-    for media in medias:
-        params = {
-            "sort_by": "popularity.desc",
-            "vote_count.gte": MIN_VOTES,
-            "vote_average.gte": MIN_SCORE,
-            "include_adult": "false",
-            "page": rng.randint(1, MAX_PAGE),
-        }
-        picked = _slug_ids(genres, media)
-        if picked:
-            params["with_genres"] = picked
-        elif genres:
-            # They asked for something this medium does not have — TMDB's TV
-            # taxonomy carries no Horror or Romance, for instance. Skipping is
-            # the honest answer; sweeping unfiltered would quietly hand back
-            # generic popular television and call it their pick.
-            continue
-        if countries:
-            params["with_origin_country"] = "|".join(countries)
-        try:
-            results = await tmdb.discover(media, params)
-        except Exception:
-            logger.debug("bootstrap: discover failed", exc_info=True)
-            continue
-        rng.shuffle(results)
-        for item in results:
+    for attempt in range(MAX_ATTEMPTS):
+        if len(out) >= size:
+            break
+        for media in medias:
             if len(out) >= size:
                 break
-            meta = await _card(media, item, seen)
-            if meta:
-                out.append(meta)
-                seen.add(meta["id"])
+            page = rng.randint(1, MAX_PAGE)
+            if (media, page) in tried:
+                continue
+            tried.add((media, page))
+            params = {
+                "sort_by": "popularity.desc",
+                "vote_count.gte": MIN_VOTES,
+                "vote_average.gte": MIN_SCORE,
+                "include_adult": "false",
+                "page": page,
+            }
+            picked = _slug_ids(genres, media)
+            if picked:
+                params["with_genres"] = picked
+            elif genres:
+                # They asked for something this medium does not have — TMDB's
+                # TV taxonomy carries no Horror or Romance, for instance.
+                # Skipping is the honest answer; sweeping unfiltered would
+                # quietly hand back generic television and call it their pick.
+                continue
+            if countries:
+                params["with_origin_country"] = "|".join(countries)
+            try:
+                results = await tmdb.discover(media, params)
+            except Exception:
+                logger.debug("bootstrap: discover failed", exc_info=True)
+                continue
+            rng.shuffle(results)
+            for item in results:
+                if len(out) >= size:
+                    break
+                meta = await _card(media, item, seen)
+                if meta:
+                    out.append(meta)
+                    seen.add(meta["id"])
     return out[:size]
 
 
@@ -144,6 +166,19 @@ async def already_known(user_token: str, viewer_key: str) -> set[str]:
     return known
 
 
+# Enough directional verdicts to build a fingerprint from nothing else.
+ENOUGH_RATED = 12
+# Past that, rebuild every this-many further verdicts. There is no "done"
+# button — people close the tab — so the rebuild cannot wait to be asked for.
+# Stateless and deterministic on the count, which beats a timer that has to
+# survive a phone going to sleep mid-session.
+REBUILD_EVERY = 6
+
+
+def should_rebuild(rated: int) -> bool:
+    return rated >= ENOUGH_RATED and rated % REBUILD_EVERY == 0
+
+
 async def progress(user_token: str) -> dict:
     """Counts for the progress readout, and whether it is worth rebuilding."""
     counts = await db.feedback_counts(user_token)
@@ -153,8 +188,5 @@ async def progress(user_token: str) -> dict:
         "disliked": counts.get("disliked", 0),
         "seen": counts.get("seen", 0),
         "rated": rated,
-        # Enough to build a fingerprint from nothing else. Below this the
-        # session is still worth finishing; above it, a rebuild will produce
-        # something meaningfully different.
-        "enough": rated >= 12,
+        "enough": rated >= ENOUGH_RATED,
     }

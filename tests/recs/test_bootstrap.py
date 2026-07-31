@@ -51,7 +51,8 @@ class DeckTests(unittest.IsolatedAsyncioTestCase):
               patch.object(bootstrap.tmdb, "resolve_meta",
                            AsyncMock(return_value=self.resolved("tt1")))):
             await bootstrap.deck(self.user(["horror"]), set(), size=4)
-        self.assertEqual(["movie"], seen)
+        self.assertTrue(seen)
+        self.assertNotIn("tv", seen)
 
     async def test_the_deck_is_famous_by_construction(self):
         """A verdict on a title nobody recognises is a coin flip dressed as
@@ -90,6 +91,51 @@ class DeckTests(unittest.IsolatedAsyncioTestCase):
                            AsyncMock(return_value=self.resolved("tt1")))):
             cards = await bootstrap.deck(self.user(), set(), size=1)
         self.assertEqual(1, len(cards))
+
+    async def test_a_deck_never_repeats_a_title_the_phone_already_holds(self):
+        """A dealt-but-unanswered card is not a verdict, so it exists nowhere
+        on the server. Without the client sending back what it holds, the next
+        deck re-deals it — which is exactly what people saw."""
+        async def discover(media, params):
+            return [{"id": 1}, {"id": 2}]
+
+        metas = {1: self.resolved("tt-a"), 2: self.resolved("tt-b")}
+
+        async def resolve(media, tid, **kw):
+            return metas[tid]
+
+        with (patch.object(bootstrap.tmdb, "discover", discover),
+              patch.object(bootstrap.tmdb, "resolve_meta", resolve)):
+            cards = await bootstrap.deck(self.user(), {"tt-a"}, size=8)
+        self.assertEqual(["tt-b"], [c["id"] for c in cards])
+
+    async def test_a_single_deck_cannot_contain_a_duplicate(self):
+        async def discover(media, params):
+            return [{"id": 1}, {"id": 1}, {"id": 1}]
+
+        with (patch.object(bootstrap.tmdb, "discover", discover),
+              patch.object(bootstrap.tmdb, "resolve_meta",
+                           AsyncMock(return_value=self.resolved("tt-same")))):
+            cards = await bootstrap.deck(self.user(), set(), size=8)
+        self.assertEqual(1, len(cards))
+
+    async def test_an_exhausted_page_is_retried_elsewhere(self):
+        """Each request picks a page at random, so one attempt routinely
+        landed on a page already used up and returned an empty deck."""
+        pages = []
+
+        async def discover(media, params):
+            pages.append(params["page"])
+            # Only one page has anything left to offer.
+            return [{"id": 99}] if params["page"] == 3 else []
+
+        with (patch.object(bootstrap.tmdb, "discover", discover),
+              patch.object(bootstrap.tmdb, "resolve_meta",
+                           AsyncMock(return_value=self.resolved("tt-rare")))):
+            cards = await bootstrap.deck(
+                self.user(), set(), size=1, rng=__import__("random").Random(4))
+        self.assertGreater(len(pages), 1)
+        self.assertEqual(["tt-rare"], [c["id"] for c in cards])
 
     async def test_a_failing_lookup_does_not_end_the_session(self):
         async def discover(media, params):
@@ -236,6 +282,23 @@ class SeenItTests(unittest.IsolatedAsyncioTestCase):
                          set(seen_args["weights"]))
         self.assertEqual({f"tt-d{n}" for n in range(6)},
                          set(seen_args["disliked"]))
+
+
+class RebuildCadenceTests(unittest.TestCase):
+    """There is no "done" button — people close the tab — so the rebuild has
+    to fire on its own or a session's work waits for the nightly run."""
+
+    def test_nothing_is_rebuilt_before_there_is_enough_to_go_on(self):
+        for rated in range(bootstrap.ENOUGH_RATED):
+            self.assertFalse(bootstrap.should_rebuild(rated))
+
+    def test_it_fires_the_moment_there_is_enough(self):
+        self.assertTrue(bootstrap.should_rebuild(bootstrap.ENOUGH_RATED))
+
+    def test_it_keeps_up_with_a_long_session_without_firing_every_tap(self):
+        fired = [n for n in range(bootstrap.ENOUGH_RATED, 40)
+                 if bootstrap.should_rebuild(n)]
+        self.assertEqual([12, 18, 24, 30, 36], fired)
 
 
 class ProgressTests(unittest.IsolatedAsyncioTestCase):

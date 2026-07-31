@@ -40,11 +40,14 @@ button.primary{width:100%;padding:15px;border-radius:12px;border:0;
 button.primary:disabled{background:#30363d;color:var(--dim)}
 
 /* step 2 — the deck */
-.deck{position:relative;flex:1;min-height:56vh}
+.deck{position:relative;flex:1;min-height:0}
 .card{position:absolute;inset:0;background:var(--card);border:1px solid var(--line);
   border-radius:16px;overflow:hidden;display:flex;flex-direction:column}
-.card img{width:100%;height:auto;aspect-ratio:2/3;object-fit:cover;
-  background:#0b0e13;flex:0 1 auto;min-height:0}
+/* `contain`, not `cover`: a poster is the thing being judged, and cropping
+   the top and bottom off it cuts the title and the faces — the two things
+   somebody needs in order to know whether they have seen it. Letterboxing on
+   a narrow screen is the lesser cost. */
+.card img{flex:1;min-height:0;width:100%;object-fit:contain;background:#0b0e13}
 .info{padding:12px 14px 14px;display:flex;flex-direction:column;gap:5px}
 .t{font-weight:700;line-height:1.25}
 .sub{color:var(--dim);font-size:.85rem;display:flex;gap:8px;flex-wrap:wrap}
@@ -69,9 +72,7 @@ button.primary:disabled{background:#30363d;color:var(--dim)}
   transition:width .25s}
 .count{color:var(--dim);font-size:.85rem;display:flex;
   justify-content:space-between}
-.done{text-align:center;padding:32px 8px;display:flex;flex-direction:column;
-  gap:12px;align-items:center}
-.done .big{font-size:2.4rem}
+#saved{margin:0;text-align:center;font-size:.85rem}
 @media (prefers-reduced-motion:no-preference){
   .card{transition:transform .18s ease,opacity .18s ease}
   .card.out-left{transform:translateX(-32px) rotate(-4deg);opacity:0}
@@ -109,17 +110,8 @@ button.primary:disabled{background:#30363d;color:var(--dim)}
     <button class="yes" data-v="liked"><span class="em">👍</span>Liked it</button>
   </div>
   <button class="skip" data-v="unknown">🤷 Never seen it</button>
-  <div class="go"><button class="primary" id="finish">Done for now</button></div>
-</section>
-
-<section id="step-done" class="hide">
-  <div class="done">
-    <div class="big">✅</div>
-    <h1>Thanks — that helps a lot</h1>
-    <p class="hint" id="summary"></p>
-    <p class="hint">Your rows are rebuilding now. Open Nuvio in a minute or two.</p>
-    <button class="primary" id="again">Rate some more</button>
-  </div>
+  <p class="hint" id="saved">Every answer is saved as you tap — close this
+    whenever you like.</p>
 </section>
 
 </div>
@@ -171,10 +163,33 @@ $("start").onclick = async () => {
   render();
 };
 
-async function refill() {
-  const d = await (await fetch(base + "/deck")).json();
-  queue = queue.concat(d.cards || []);
-  progress = d.progress || progress;
+// Every id this session has ever put on screen. The server cannot know them —
+// a dealt-but-unanswered card is not a verdict and exists nowhere but here —
+// so without sending them back the next deck re-deals titles already queued.
+const dealt = new Set();
+let refilling = null;
+
+function refill() {
+  // Concurrent refills were their own duplicate source: running low fires one,
+  // the answer handler fires another, and both ask before either has added to
+  // `dealt`.
+  if (refilling) return refilling;
+  refilling = (async () => {
+    try {
+      const r = await fetch(base + "/deck", {
+        method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({have: [...dealt]})});
+      const d = await r.json();
+      for (const c of d.cards || []) {
+        if (dealt.has(c.id)) continue;
+        dealt.add(c.id);
+        queue.push(c);
+      }
+      progress = d.progress || progress;
+    } catch (e) { /* keep whatever is queued */ }
+    refilling = null;
+  })();
+  return refilling;
 }
 
 function render() {
@@ -216,6 +231,8 @@ function tally() {
   $("remain").textContent = p.enough ? "Enough to work with 🎉"
     : `${Math.max(0, 12 - p.rated)} more likes or dislikes`;
   $("fill").style.width = Math.min(100, (p.rated / 12) * 100) + "%";
+  if (p.rebuilding)
+    $("saved").textContent = "Saved — your rows are rebuilding now.";
 }
 
 async function answer(verdict) {
@@ -240,23 +257,19 @@ async function answer(verdict) {
 document.querySelectorAll("[data-v]").forEach(b =>
   b.onclick = () => answer(b.dataset.v));
 
-$("finish").onclick = async () => {
-  $("finish").disabled = true; $("finish").textContent = "Saving…";
-  const r = await fetch(base + "/done", {method: "POST"});
-  const d = await r.json();
-  const p = d.progress;
-  $("summary").textContent = `${p.liked} liked, ${p.disliked} ruled out`
-    + (p.seen ? `, ${p.seen} already seen.` : ".");
-  $("step-deck").classList.add("hide");
-  $("step-done").classList.remove("hide");
-};
-
-$("again").onclick = () => {
-  $("step-done").classList.add("hide");
-  $("step-deck").classList.remove("hide");
-  $("finish").disabled = false; $("finish").textContent = "Done for now";
-  render();
-};
+// There is no "done" — people close the tab. A beacon survives the page going
+// away where fetch does not, but it can still be dropped, so the server also
+// rebuilds on its own every few verdicts. This only makes the last few land
+// sooner.
+addEventListener("pagehide", () => {
+  if (progress.rated && navigator.sendBeacon)
+    navigator.sendBeacon(base + "/done");
+});
+addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden" && progress.rated
+      && navigator.sendBeacon)
+    navigator.sendBeacon(base + "/done");
+});
 
 boot();
 </script></body></html>
