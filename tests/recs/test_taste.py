@@ -15,18 +15,31 @@ DAY = 86400
 NOW = 1_800_000_000
 
 
+FILE_MB = 1000.0
+
+
 def play(imdb_id, *, media="series", season=1, episode=1, at=NOW,
-         pct=None, picker="fast"):
-    return {"imdb_id": imdb_id, "media_type": media, "season": season,
-            "episode": episode, "played_at": at, "position_pct": pct,
-            "picker": picker}
+         pct=None, secs=None, picker="fast"):
+    """One play. `pct` is the share of the file actually delivered — None
+    means unmeasured, which is what an imported row looks like."""
+    row = {"imdb_id": imdb_id, "media_type": media, "season": season,
+           "episode": episode, "played_at": at, "picker": picker,
+           "seconds": 0.0 if secs is None else secs}
+    if pct is not None:
+        row["total_bytes"] = int(FILE_MB * 1e6)
+        row["megabytes"] = FILE_MB * pct / 100.0
+        # Every real play also reports a position, and for most of them it
+        # reads ~100% because the player indexed the file. Present here on
+        # purpose: nothing in the model may depend on it.
+        row["position_pct"] = 100.0
+    return row
 
 
 def episodes(imdb_id, count, *, start=NOW, spacing=DAY, pct=100.0,
-             picker="fast"):
+             secs=1500.0, picker="fast"):
     """One episode per session, `spacing` apart."""
     return [play(imdb_id, episode=n + 1, at=start - n * spacing, pct=pct,
-                 picker=picker) for n in range(count)]
+                 secs=secs, picker=picker) for n in range(count)]
 
 
 class EngagementTests(unittest.TestCase):
@@ -56,12 +69,43 @@ class EngagementTests(unittest.TestCase):
         self.assertGreater(model.engagement_of("tt-fin"),
                            model.engagement_of("tt-part"))
 
-    def test_position_is_clamped_so_an_overrun_cannot_inflate_a_title(self):
-        """`position_pct` has been observed at 200: bytes delivered run past
-        the file when a player re-requests ranges."""
+    def test_delivery_is_clamped_so_an_overrun_cannot_inflate_a_title(self):
+        """Re-requested ranges can deliver more bytes than the file holds."""
         model = taste.build(episodes("tt-over", 3, pct=200.0), now=NOW)
         signal = model.signal_for("tt-over")
         self.assertEqual(100.0, signal.best_pct)
+
+    def test_a_players_index_read_is_not_a_completed_viewing(self):
+        """The mistake this model was built on. Every player reads the
+        container index at EOF before it can show a frame, which reports
+        ~100% position having moved 2 MB of a 5 GB file. `play()` sets that
+        position on every measured row; nothing may be fooled by it."""
+        indexed = [play("tt-idx", episode=n + 1, at=NOW - n * DAY,
+                        pct=0.04, secs=0.0) for n in range(10)]
+        model = taste.build(indexed, now=NOW)
+        signal = model.signal_for("tt-idx")
+        self.assertEqual(100.0, indexed[0]["position_pct"])
+        self.assertEqual(0, signal.finished)
+        self.assertEqual(0, signal.started_episodes)
+        self.assertFalse(model.may_seed(signal))
+
+    def test_failed_starts_do_not_count_against_a_series_that_was_finished(self):
+        """Retries and re-opens are not viewing decisions. Counting them in
+        the denominator scored a fully-watched series 0.51."""
+        watched = [play("tt-them", episode=n + 1, at=NOW - n * DAY, pct=100.0)
+                   for n in range(10)]
+        retries = [play("tt-them", episode=n + 1, at=NOW - n * DAY + 60, pct=0.4)
+                   for n in range(10)]
+        clean = taste.build(watched, now=NOW)
+        noisy = taste.build(watched + retries, now=NOW)
+        self.assertAlmostEqual(clean.engagement_of("tt-them"),
+                               noisy.engagement_of("tt-them"), places=2)
+
+    def test_a_title_only_ever_failed_to_start_earns_no_finish_credit(self):
+        model = taste.build([play("tt-dead", media="movie", at=NOW, pct=2.0),
+                             play("tt-dead", media="movie", at=NOW + 60,
+                                  pct=3.0)], now=NOW)
+        self.assertEqual(0, model.signal_for("tt-dead", "movie").started)
 
     def test_taste_fades_but_does_not_vanish(self):
         old = taste.build(episodes("tt-old", 6, start=NOW - 400 * DAY), now=NOW)
@@ -71,37 +115,69 @@ class EngagementTests(unittest.TestCase):
         self.assertGreater(old.engagement_of("tt-old"), 0)
 
 
-class BounceTests(unittest.TestCase):
-    """Dislike, which the previous model could not express at all."""
+class EvidenceTests(unittest.TestCase):
+    """What has to be true before a title may lead a row.
 
-    def test_repeatedly_opened_and_never_watched_scores_negative(self):
-        """Supergirl: two plays, 0.0% and 23.3%, and it was seed number one."""
-        model = taste.build([play("tt-bounce", media="movie", at=NOW, pct=0.0),
-                             play("tt-bounce", media="movie", at=NOW + 300,
-                                  pct=4.0)], now=NOW)
-        self.assertTrue(model.signal_for("tt-bounce", "movie").bounced)
-        self.assertLess(model.engagement_of("tt-bounce", "movie"), 0)
+    A title is disqualified from seeding by lack of evidence, never convicted
+    of being disliked: unwatched and unplayable look identical from here, and
+    guessing between them would let delivery failures delete a genre.
+    """
+
+    def test_a_series_only_ever_opened_cannot_seed_a_row(self):
+        """The case the viewer had to point out. `Them` was opened 37 times
+        across ten episodes while being used to test playback, and four
+        minutes were watched in total. It seeded eighteen of thirty slots."""
+        tested = [play("tt-them", episode=n % 10 + 1, at=NOW - n * 600,
+                       pct=0.5, secs=4.0) for n in range(37)]
+        model = taste.build(tested, now=NOW)
+        signal = model.signal_for("tt-them")
+        self.assertTrue(signal.unproven)
+        self.assertFalse(model.may_seed(signal))
+        self.assertEqual([], model.seed_order())
+
+    def test_being_unproven_is_not_the_same_as_being_disliked(self):
+        """It still scores positively and stays in the history — it just
+        cannot lead. A title that never streamed would look identical."""
+        model = taste.build([play("tt-x", media="movie", at=NOW, pct=1.0),
+                             play("tt-x", media="movie", at=NOW + 300,
+                                  pct=2.0)], now=NOW)
+        self.assertGreaterEqual(model.engagement_of("tt-x", "movie"), 0)
 
     def test_one_abandoned_play_is_not_evidence_of_anything(self):
         """A stream can fail. Two independent failures are a pattern; one is
         as likely to be our own delivery problem as a verdict."""
         model = taste.build([play("tt-once", media="movie", pct=1.0)], now=NOW)
-        self.assertFalse(model.signal_for("tt-once", "movie").bounced)
+        self.assertFalse(model.signal_for("tt-once", "movie").unproven)
 
-    def test_getting_going_and_stopping_is_not_a_bounce(self):
-        model = taste.build([play("tt-part", media="movie", at=NOW, pct=40.0),
-                             play("tt-part", media="movie", at=NOW + 300,
-                                  pct=55.0)], now=NOW)
-        self.assertFalse(model.signal_for("tt-part", "movie").bounced)
+    def test_two_minutes_of_playback_is_enough_to_count_as_watched(self):
+        """Byte share alone is not sufficient evidence either way: a long
+        episode of a nature series measured 30% of the file across two hours
+        of viewing. The clock settles it."""
+        model = taste.build([play("tt-doc", at=NOW, pct=3.0, secs=1800.0),
+                             play("tt-doc", at=NOW + DAY, pct=3.0, secs=1800.0)],
+                            now=NOW)
+        signal = model.signal_for("tt-doc")
+        self.assertFalse(signal.unproven)
+        self.assertTrue(model.may_seed(signal))
 
-    def test_imported_history_can_never_be_scored_badly(self):
-        """Trakt rows carry no position at all. Absence of evidence must not
-        become evidence of dislike — two thirds of this history is imported."""
+    def test_time_watched_raises_a_title_that_never_pulled_the_whole_file(self):
+        brief = taste.build(episodes("tt-brief", 3, pct=20.0, secs=90.0),
+                            now=NOW)
+        long = taste.build(episodes("tt-long", 3, pct=20.0, secs=2400.0),
+                           now=NOW)
+        self.assertGreater(long.engagement_of("tt-long"),
+                           brief.engagement_of("tt-brief"))
+
+    def test_imported_history_is_trusted_without_consumption_data(self):
+        """Trakt rows carry no bytes and no duration. Demanding evidence of
+        viewing from them would discard two thirds of this history."""
         rows = [play("tt-import", media="movie", at=NOW - n * DAY, pct=None,
                      picker=taste.IMPORT_PICKER) for n in range(4)]
         model = taste.build(rows, now=NOW)
-        self.assertFalse(model.signal_for("tt-import", "movie").bounced)
-        self.assertGreater(model.engagement_of("tt-import", "movie"), 0)
+        signal = model.signal_for("tt-import", "movie")
+        self.assertFalse(signal.unproven)
+        self.assertTrue(model.may_seed(signal))
+        self.assertGreater(signal.engagement, 0)
 
     def test_measured_history_carries_more_confidence_than_imported(self):
         model = taste.build(

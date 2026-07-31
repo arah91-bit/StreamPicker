@@ -12,11 +12,19 @@ That is why Top Picks collapsed onto whatever was watched most recently.
 
 Three things are done differently here.
 
-**Position, not bytes.** `played_titles` reads `watched_pct`, which is bytes
-delivered over file size and is wrecked by seeking and read-ahead: one title
-measured a maximum of 4% across 37 plays while `position_pct` on the same rows
-reached 100% eleven times. `position_pct` is monotonic in playback position, so
-it is the only column here that is allowed to mean "finished".
+**Consumption, not position.** `position_pct` looks like the right column and
+is a trap. It is the offset of the last range request plus what was delivered
+against it — and every player reads the container index at EOF before it can
+show a frame, which pins it at ~100% on the *first open*. Measured on a series
+the viewer confirmed they never watched: eleven readings of 100.0%, each one
+carrying 2.1 MB delivered against a 5 GB file and `seconds = 0`. It is the same
+trap `CLAUDE.md` documents for the byte cache — "never advance `e.head` from a
+tail probe" — reappearing in the telemetry path.
+
+So completion is measured from what was actually consumed: `seconds` of
+playback, corroborated by `megabytes` delivered over `total_bytes`. Neither can
+be forged by an index read. `position_pct` remains correct for what it was
+added for, which is knowing where to resume.
 
 **Sessions, not plays.** A play row is one file open, and openings are cheap:
 failed starts, re-opens and the picker's own retries all land in the table, so
@@ -24,12 +32,17 @@ failed starts, re-opens and the picker's own retries all land in the table, so
 `SESSION_GAP_SECONDS` starts a new one) and *coming back on another day* is
 weighted far above volume within a day.
 
-**Dislike is expressible.** Deliberately, and against the caution in
-`history`'s docstring — with reason. That caution is right that failing to
-finish something is ambiguous, so a bounce is only recorded when position data
-was actually observed across repeated attempts and never once got past
-`STARTED_PCT`. Absence of evidence stays neutral: rows imported from Trakt
-carry no position at all and can never be scored badly for it.
+**Evidence is required to lead, but never to convict.** A measured title has
+to show real consumption before it can seed a row, which is what keeps a
+series opened 37 times for playback testing — four minutes watched in total —
+out of the top of the list. What it does *not* do is score such a title
+negatively: a title that was never consumed is indistinguishable from one that
+never successfully streamed, and inferring dislike from our own delivery
+failures is the mistake `CLAUDE.md` describes as quietly retiring a shelf of
+perfectly good releases. Unconsumed means unproven, so it scores near zero and
+falls out on its own. Absence of evidence also stays neutral for imported
+history, which carries no consumption data at all and is trusted on Trakt's
+word that it was watched.
 
 Everything here is pure — plays in, model out, no I/O — so the scoring can be
 tested against fixed histories rather than against a live database.
@@ -46,21 +59,34 @@ from dataclasses import dataclass, field
 # "afternoon with the kids" from "after they went to bed".
 SESSION_GAP_SECONDS = 3 * 3600
 
-# Position thresholds, in percent of file. `position_pct` runs slightly ahead
-# of what was actually seen (the player buffers) and has been observed above
-# 100, so FINISHED sits well below the top and every reading is clamped.
-FINISHED_PCT = 80.0
-STARTED_PCT = 10.0
+# Consumption thresholds, as a share of the file's bytes actually delivered.
+# FINISHED sits well below the top because a player that skips recaps or
+# adapts bitrate never pulls the whole file: a comedy watched right through
+# measured 59%. Every reading is clamped — delivery can overrun on re-requests.
+FINISHED_PCT = 55.0
+STARTED_PCT = 5.0
+# Playback seconds that count as having genuinely watched something. Two
+# minutes clears a trailer, a false start, and the handful of seconds an index
+# read takes. Either signal alone is enough; they corroborate, not gate.
+STARTED_SECONDS = 120.0
 
 # Taste ages. A half-life rather than the original three-step recency ladder,
 # which jumped discontinuously at 90 days and again at a year.
 RECENCY_HALF_LIFE_DAYS = 120.0
 
-# Engagement mixes three independent questions: how much of it did they take
-# in, did they come back for more, and did they finish what they started.
-WEIGHT_BREADTH = 0.40
-WEIGHT_LOYALTY = 0.30
-WEIGHT_FINISH = 0.30
+# Engagement mixes four independent questions: how much of it did they take
+# in, did they come back for more, did they finish what they started, and how
+# long did they actually sit there. The last is the least forgeable of them —
+# an index read moves bytes and offsets but never the clock.
+WEIGHT_BREADTH = 0.30
+WEIGHT_LOYALTY = 0.25
+WEIGHT_FINISH = 0.20
+WEIGHT_TIME = 0.25
+
+# Minutes of playback at which time-spent saturates. Two hours is a film, or a
+# short run of episodes — enough to be sure, without letting one long binge
+# outweigh everything else a viewer has ever watched.
+TIME_FULL_MINUTES = 120.0
 
 # Recency scales the result rather than dominating it: a favourite from last
 # year should still outrank something bounced off this morning.
@@ -116,11 +142,25 @@ def genre_slug(name: str) -> str:
     return str(name or "").lower().replace(" ", "-")
 
 
-def _clamp_pct(value) -> float:
+def _number(value, default: float = 0.0) -> float:
     try:
-        return max(0.0, min(100.0, float(value)))
+        return float(value)
     except (TypeError, ValueError):
-        return 0.0
+        return default
+
+
+def _delivered_pct(row: dict) -> float | None:
+    """Share of the file this play actually pulled down, or None if unknown.
+
+    Deliberately not `position_pct` (an index read at EOF reports ~100% having
+    moved 2 MB) and not the stored `watched_pct` (present on only a quarter of
+    rows). Computed from `megabytes` against `total_bytes`, which are recorded
+    together and mean exactly what they say.
+    """
+    total = _number(row.get("total_bytes"))
+    if total <= 0:
+        return None
+    return max(0.0, min(100.0, 100.0 * _number(row.get("megabytes")) * 1e6 / total))
 
 
 @dataclass
@@ -132,18 +172,21 @@ class TitleSignal:
     genres: tuple[str, ...] = ()
     plays: int = 0
     observed_plays: int = 0          # plays the proxy watched, not imported
-    attempts: int = 0                # plays that reported a position at all
+    attempts: int = 0                # plays that reported consumption at all
+    started: int = 0                 # attempts that genuinely got going
     finished: int = 0                # attempts that reached FINISHED_PCT
-    episodes: int = 0                # distinct episodes touched
-    finished_episodes: int = 0       # distinct episodes actually completed
+    episodes: int = 0                # distinct episodes opened
+    started_episodes: int = 0        # distinct episodes actually watched into
+    finished_episodes: int = 0       # distinct episodes watched through
     sessions: int = 0
     first_played_at: int = 0
     last_played_at: int = 0
-    best_pct: float = 0.0
+    best_pct: float = 0.0            # most of the file ever delivered, 0..100
+    watch_seconds: float = 0.0       # playback observed, summed over plays
     engagement: float = 0.0
     confidence: float = 0.0
     context: str = CONTEXT_SOLO
-    bounced: bool = False
+    unproven: bool = False
 
     @property
     def key(self) -> tuple[str, str]:
@@ -168,12 +211,20 @@ def _breadth(signal: TitleSignal) -> float:
     if signal.media_type == "movie":
         if signal.finished:
             return 1.0
-        if signal.best_pct >= STARTED_PCT:
+        if signal.started:
             return 0.45
-        # Attendance-only: an imported play says they watched it, and says
-        # nothing about how much, so it sits mid-scale rather than at zero.
-        return 0.25 if not signal.attempts else 0.1
-    seen = signal.finished_episodes or signal.episodes
+        if not signal.attempts:
+            # Attendance-only: an imported play says they watched it, and says
+            # nothing about how much, so it sits mid-scale rather than at zero.
+            return 0.25
+        return 0.05
+    if signal.attempts:
+        # Episodes *watched into*, not episodes opened. Opening is what a
+        # playback test does, and one such series had 37 opens behind four
+        # minutes of viewing.
+        seen = signal.finished_episodes or signal.started_episodes
+    else:
+        seen = signal.episodes
     if not seen:
         return 0.0
     return min(1.0, math.log1p(seen) / math.log1p(BREADTH_FULL_EPISODES))
@@ -187,14 +238,38 @@ def _loyalty(signal: TitleSignal) -> float:
 
 
 def _finish_rate(signal: TitleSignal) -> float:
-    """Share of measured attempts that reached the end.
+    """Of the plays that actually got going, how many reached the end.
 
-    Returns a neutral 0.5 when nothing was measured. An imported title must not
+    The denominator is plays past `STARTED_PCT`, not every play with a
+    position, because a play that delivered ~0% is a failed start or a re-open
+    rather than a viewing decision — the same "openings are cheap" fact that
+    makes sessions a better unit than plays. Counting them punished a series
+    for our own delivery failures: one watched right through scored 0.51,
+    because 18 of its 37 measured plays never got past 10%.
+
+    Neutral 0.5 when nothing was measured at all. An imported title must not
     look like a failure merely because Trakt never told us where it stopped.
     """
     if signal.attempts < 1:
         return 0.5
-    return signal.finished / float(signal.attempts)
+    if signal.started < 1:
+        return 0.0
+    return min(1.0, signal.finished / float(signal.started))
+
+
+def _time_spent(signal: TitleSignal) -> float:
+    """Playback time observed, log-scaled to 0..1.
+
+    Neutral 0.5 when nothing was measured, on the same principle as the finish
+    rate: imported history never recorded a duration and must not be read as
+    having recorded a zero.
+    """
+    if not signal.attempts:
+        return 0.5
+    minutes = signal.watch_seconds / 60.0
+    if minutes <= 0:
+        return 0.0
+    return min(1.0, math.log1p(minutes) / math.log1p(TIME_FULL_MINUTES))
 
 
 def _recency(last_played_at: int, now: float) -> float:
@@ -205,15 +280,15 @@ def _recency(last_played_at: int, now: float) -> float:
     return RECENCY_FLOOR + (1.0 - RECENCY_FLOOR) * decay
 
 
-def _is_bounce(signal: TitleSignal) -> bool:
-    """Repeatedly opened, position observed every time, never got going.
+def _unproven(signal: TitleSignal) -> bool:
+    """Opened more than once, measured every time, and never actually watched.
 
-    The conjunction is the point. One abandoned play is ambiguous — a phone
-    rang, a stream failed — so this needs at least two measured attempts, none
-    of which reached even `STARTED_PCT`, and no episode ever finished.
+    Not "disliked" — we cannot tell that apart from a title that would not
+    stream, and guessing would let our own delivery failures delete a genre.
+    It only means there is no evidence anyone watched this, which is enough to
+    disqualify it from *leading* a row while leaving it in the history.
     """
-    return (signal.attempts >= 2 and signal.finished == 0
-            and signal.best_pct < STARTED_PCT)
+    return signal.attempts >= 2 and signal.started == 0
 
 
 def _classify_context(signal: TitleSignal) -> str:
@@ -302,11 +377,26 @@ class TasteModel:
         return signal.engagement * (
             (1.0 - CONFIDENCE_TILT) + CONFIDENCE_TILT * signal.confidence)
 
+    def may_seed(self, signal: TitleSignal) -> bool:
+        """Is there enough evidence for this title to lead a row?
+
+        A title we measured has to show that somebody actually watched it. A
+        title we only imported is trusted, because attendance is all Trakt
+        ever recorded and demanding more would discard two thirds of the
+        history.
+        """
+        if signal.engagement <= 0:
+            return False
+        if not signal.attempts:
+            return True
+        return not signal.unproven
+
     def seed_order(self, context: str = CONTEXT_SOLO,
                    limit: int = 20) -> list[TitleSignal]:
         """Strongest titles first — the seed pool for similarity rows."""
         pool = [s for s in self.signals.values()
-                if s.context == context and s.engagement > 0]
+                if (context is None or s.context == context)
+                and self.may_seed(s)]
         pool.sort(key=lambda s: (self.seed_rank(s), s.last_played_at),
                   reverse=True)
         return pool[:limit]
@@ -318,8 +408,10 @@ class TasteModel:
             "titles": len(self.signals),
             "solo_titles": len(solo),
             "family_titles": len(self.signals) - len(solo),
-            "bounced": sum(1 for s in self.signals.values() if s.bounced),
+            "unproven": sum(1 for s in self.signals.values() if s.unproven),
             "measured": sum(1 for s in self.signals.values() if s.attempts),
+            "watched_hours": round(
+                sum(s.watch_seconds for s in self.signals.values()) / 3600, 1),
             "movie_share": round(self.media_share(), 2),
         }
 
@@ -350,6 +442,7 @@ def build(plays: list[dict], genres_for=None,
             plays=len(rows),
         )
         episodes: set[tuple] = set()
+        started_episodes: set[tuple] = set()
         finished_episodes: set[tuple] = set()
         timestamps: list[int] = []
         for row in rows:
@@ -359,34 +452,34 @@ def build(plays: list[dict], genres_for=None,
                 signal.observed_plays += 1
             episode_key = (row.get("season"), row.get("episode"))
             episodes.add(episode_key)
-            position = row.get("position_pct")
-            if position is None:
+            seconds = _number(row.get("seconds"))
+            signal.watch_seconds += seconds
+            pct = _delivered_pct(row)
+            if pct is None:
                 continue
-            pct = _clamp_pct(position)
             signal.attempts += 1
             signal.best_pct = max(signal.best_pct, pct)
+            if pct >= STARTED_PCT or seconds >= STARTED_SECONDS:
+                signal.started += 1
+                started_episodes.add(episode_key)
             if pct >= FINISHED_PCT:
                 signal.finished += 1
                 finished_episodes.add(episode_key)
 
         signal.episodes = len(episodes)
+        signal.started_episodes = len(started_episodes)
         signal.finished_episodes = len(finished_episodes)
         signal.sessions = sessionise(timestamps)
         signal.first_played_at = min(timestamps) if timestamps else 0
         signal.last_played_at = max(timestamps) if timestamps else 0
-        signal.bounced = _is_bounce(signal)
+        signal.unproven = _unproven(signal)
         signal.context = _classify_context(signal)
 
         raw = (WEIGHT_BREADTH * _breadth(signal)
                + WEIGHT_LOYALTY * _loyalty(signal)
-               + WEIGHT_FINISH * _finish_rate(signal))
-        engagement = raw * _recency(signal.last_played_at, now)
-        if signal.bounced:
-            # Negative, not merely small: this has to be able to push a title
-            # below one never watched at all, or a repeatedly abandoned title
-            # keeps seeding rows on recency alone.
-            engagement = -abs(engagement)
-        signal.engagement = round(engagement, 4)
+               + WEIGHT_FINISH * _finish_rate(signal)
+               + WEIGHT_TIME * _time_spent(signal))
+        signal.engagement = round(raw * _recency(signal.last_played_at, now), 4)
 
         measured = signal.attempts / float(signal.plays) if signal.plays else 0.0
         signal.confidence = round(

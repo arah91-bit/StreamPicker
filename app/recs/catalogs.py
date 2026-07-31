@@ -976,10 +976,9 @@ class Generator:
             # filtering it lost four of Skylar's seven seeds.
             if self.kid_age is None and signal.context != taste.CONTEXT_SOLO:
                 continue
-            rank = self.taste.seed_rank(signal)
-            if rank <= 0:
+            if not self.taste.may_seed(signal):
                 continue
-            by_media[media_type].append((rank, seed))
+            by_media[media_type].append((self.taste.seed_rank(signal), seed))
         for ranked in by_media.values():
             ranked.sort(key=lambda item: item[0], reverse=True)
 
