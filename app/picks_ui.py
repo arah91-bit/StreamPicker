@@ -213,6 +213,34 @@ const SCALE = {json.dumps(_SCALE_HTML)};
 const api = p => "/setup/" + SETUP + "/api" + p;
 const $ = id => document.getElementById(id);
 
+// navigator.clipboard only exists in a secure context, and this dashboard is
+// LAN-only over plain HTTP — so on the machine it is actually used from, the
+// API is undefined and every copy button failed silently. Falls back to the
+// old execCommand path, and to selecting the text if even that is refused, so
+// the URL is always obtainable by some means.
+async function copyText(text) {{
+  try {{
+    if (navigator.clipboard && window.isSecureContext) {{
+      await navigator.clipboard.writeText(text);
+      return true;
+    }}
+  }} catch (e) {{ /* fall through */ }}
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.setAttribute("readonly", "");
+  ta.style.cssText = "position:fixed;top:0;left:0;opacity:0";
+  document.body.appendChild(ta);
+  let ok = false;
+  try {{
+    ta.select();
+    ta.setSelectionRange(0, ta.value.length);
+    ok = document.execCommand("copy");
+  }} catch (e) {{ ok = false; }}
+  ta.remove();
+  if (!ok) window.prompt("Copy this link:", text);
+  return ok;
+}}
+
 function ago(ts) {{
   if (!ts) return "never";
   const h = (Date.now() / 1000 - ts) / 3600;
@@ -333,6 +361,9 @@ async function load() {{
       <div class="rows"></div>
       <div class="lbl">Add-ons to install (each one is tracked to this viewer)</div>
       <div class="lanes"></div>
+      <div class="lanelbl">Taste setup — open this on a phone to rate a few
+        titles. Anyone with the link can shape this viewer's rows.</div>
+      <a class="url tasteurl" target="_blank" rel="noopener"></a>
       <div class="acts">
         <button class="taste">Copy taste-setup link</button>
         <button class="copy">Copy main add-on URL</button>
@@ -356,12 +387,13 @@ async function load() {{
       const a = wrap.querySelector("a.url");
       a.textContent = lane.url;
       a.href = lane.url;
-      a.onclick = ev => {{
+      a.onclick = async ev => {{
         if (ev.metaKey || ev.ctrlKey) return;
         ev.preventDefault();
-        navigator.clipboard.writeText(lane.url);
         const was = a.textContent;
-        a.textContent = "Copied — paste under Nuvio Add-ons";
+        const ok = await copyText(lane.url);
+        a.textContent = ok ? "Copied — paste under Nuvio Add-ons"
+                           : "Copy it from the box above";
         setTimeout(() => a.textContent = was, 1600);
       }};
       lanes.appendChild(wrap);
@@ -384,14 +416,17 @@ async function load() {{
 
     FAMILIES.forEach(spec => rows.appendChild(rowEl(u, spec, "·")));
 
-    card.querySelector(".copy").onclick = ev => {{
-      navigator.clipboard.writeText(u.manifest_url);
-      ev.target.textContent = "Copied";
-      setTimeout(() => ev.target.textContent = "Copy add-on URL", 1800);
+    card.querySelector(".copy").onclick = async ev => {{
+      const ok = await copyText(u.manifest_url);
+      ev.target.textContent = ok ? "Copied" : "Copy it from the box";
+      setTimeout(() => ev.target.textContent = "Copy main add-on URL", 1800);
     }};
     // Meant to be sent to a phone: a cold profile has nothing to recommend
     // from, and tapping through twenty familiar titles beats waiting weeks
     // for a history to accumulate from picks made without one.
+    const tasteUrl = card.querySelector("a.tasteurl");
+    tasteUrl.textContent = u.taste_url;
+    tasteUrl.href = u.taste_url;
     const taste = card.querySelector(".taste");
     const tasteLabel = u.taste_rated
       ? "Copy taste-setup link (" + u.taste_rated + " rated)"
@@ -399,9 +434,10 @@ async function load() {{
     taste.textContent = tasteLabel;
     taste.title = u.taste_url + "  —  open on a phone, mark titles liked or "
       + "not for you. Anyone with this link can shape " + u.name + "'s rows.";
-    taste.onclick = ev => {{
-      navigator.clipboard.writeText(u.taste_url);
-      ev.target.textContent = "Copied — send it to a phone";
+    taste.onclick = async ev => {{
+      const ok = await copyText(u.taste_url);
+      ev.target.textContent = ok ? "Copied — send it to a phone"
+                                 : "Copy it from the link above";
       setTimeout(() => ev.target.textContent = tasteLabel, 2200);
     }};
     const dl = card.querySelector(".dl");
