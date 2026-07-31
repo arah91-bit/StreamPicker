@@ -970,7 +970,11 @@ class Generator:
                 # No evidence is not evidence against.
                 by_media[media_type].append((UNMEASURED_SEED_RANK, seed))
                 continue
-            if signal.context != taste.CONTEXT_SOLO:
+            # Family context means "somebody else in the room chose this",
+            # which is only true on an adult's profile. On a child's own
+            # profile their children's television IS their taste, and
+            # filtering it lost four of Skylar's seven seeds.
+            if self.kid_age is None and signal.context != taste.CONTEXT_SOLO:
                 continue
             rank = self.taste.seed_rank(signal)
             if rank <= 0:
@@ -1035,7 +1039,8 @@ class Generator:
         seeds = self._ranked_seeds(TOP_PICKS_SEED_COUNT)
         if not seeds:
             return None
-        affinity = self.taste.genre_affinity() if self.taste else {}
+        context = taste.CONTEXT_SOLO if self.kid_age is None else None
+        affinity = self.taste.genre_affinity(context) if self.taste else {}
         candidates: list[taste.Candidate] = []
         seen: set[str] = set()
         for seed, strength in seeds:

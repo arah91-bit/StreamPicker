@@ -261,15 +261,21 @@ class TasteModel:
         return [s for s in self.signals.values() if s.context == CONTEXT_SOLO]
 
     # ── aggregate vectors ────────────────────────────────────────────────
-    def genre_affinity(self, context: str = CONTEXT_SOLO) -> dict[str, float]:
+    def genre_affinity(self, context: str | None = CONTEXT_SOLO) -> dict[str, float]:
         """Genre → 0..1 preference, from engagement rather than play counts.
 
         Weighted by engagement so a genre reached through one bounced title
         cannot outrank one reached through a series watched to the end.
+
+        `context=None` counts everything, which is what a child's own profile
+        wants: the family/solo split exists to keep other people's choices out
+        of an adult's taste, and on a kid profile there is no such split.
         """
         weights: dict[str, float] = {}
         for signal in self.signals.values():
-            if signal.context != context or signal.engagement <= 0:
+            if signal.engagement <= 0:
+                continue
+            if context is not None and signal.context != context:
                 continue
             for slug in signal.genres:
                 weights[slug] = weights.get(slug, 0.0) + signal.engagement

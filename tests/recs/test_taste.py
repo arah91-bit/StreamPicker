@@ -151,6 +151,13 @@ class ViewingContextTests(unittest.TestCase):
         self.assertNotIn("kids", model.genre_affinity())
         self.assertIn("horror", model.genre_affinity())
 
+    def test_a_kid_profile_counts_every_context(self):
+        """On a child's own profile there is nobody else's taste to exclude."""
+        model = taste.build(episodes("tt-kid", 30),
+                            genres_for=lambda _: ["Kids"], now=NOW)
+        self.assertEqual({}, model.genre_affinity())
+        self.assertIn("kids", model.genre_affinity(None))
+
 
 class SessionTests(unittest.TestCase):
     def test_plays_close_together_are_one_sitting(self):

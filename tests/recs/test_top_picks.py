@@ -63,6 +63,18 @@ class SeedSelectionTests(unittest.TestCase):
              signal("tt-own", engagement=0.2)])
         self.assertEqual(["tt-own"], [s["imdb"] for s, _ in gen._ranked_seeds(5)])
 
+    def test_a_child_keeps_their_own_childrens_television_as_a_seed(self):
+        """The family/solo split exists to keep other people's choices out of
+        an ADULT's taste. Applied to a kid profile it deleted most of their
+        history — one eleven-year-old lost four of seven seeds."""
+        gen = self.generator(
+            [seed("tt-kid"), seed("tt-other")],
+            [signal("tt-kid", engagement=0.9, context=taste.CONTEXT_FAMILY),
+             signal("tt-other", engagement=0.2)],
+            is_kid=1, kid_age=11)
+        self.assertEqual(["tt-kid", "tt-other"],
+                         [s["imdb"] for s, _ in gen._ranked_seeds(5)])
+
     def test_a_bounced_title_is_dropped_rather_than_demoted(self):
         """One seed is a dozen candidates. A negative one is a visible chunk
         of the row, not a rounding error."""
