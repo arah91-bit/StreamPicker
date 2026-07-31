@@ -16,7 +16,7 @@ import random
 import time
 from itertools import combinations
 
-from app.recs import config, db, preseed, tmdb
+from app.recs import config, db, preseed, taste, tmdb
 from app.recs.holidays import active_holiday
 from app.recs.kids import band_for_age, effective_kid_age
 from app.recs.profile import build_profile
@@ -56,6 +56,29 @@ SCORE_POPULAR = 30
 SCORE_DEPTH = 33
 
 KID_EXCLUDED_GENRES = {"horror", "war", "crime"}
+
+# Top Picks draws from many seeds rather than a handful, because the row is
+# assembled by competition now: a seed that returns weak similars simply loses
+# slots instead of blocking the seeds behind it. Ten seeds at twelve
+# candidates each gives the selector roughly four times the row to choose
+# from, which is what makes the diversity pressure meaningful.
+TOP_PICKS_SEED_COUNT = 10
+TOP_PICKS_PER_SEED = 12
+
+# What decides a candidate's place in Top Picks. Seed strength leads because
+# "similar to something you loved" is the row's premise; TMDB's own ordering
+# within a seed is the next most reliable signal; genre affinity generalises
+# across seeds; rating is a weak tiebreak and is weighted like one.
+PICK_WEIGHT_SEED = 0.40
+PICK_WEIGHT_ORDER = 0.20
+PICK_WEIGHT_GENRE = 0.25
+PICK_WEIGHT_RATING = 0.15
+
+# Strength for a seed the taste model has never seen — a hand-picked preseed
+# anchor for a viewer with too little history to learn from. Positive, so a
+# new viewer still gets the row, but below anything actually measured, so it
+# yields the moment real plays exist.
+UNMEASURED_SEED_RANK = 0.15
 
 # A kid age is more than a certification ceiling: it says which rows are worth
 # building at all. Both weights below drive tmdb.kid_age_appeal, so the same
@@ -142,6 +165,7 @@ class Generator:
         self.rng = random.Random(f"{self.token}:{today.isoformat()}")
         self.day = today.toordinal()
         self.rows: list[tuple[float, dict]] = []
+        self.taste: taste.TasteModel | None = None
         self.used_imdb: set[str] = set()
         self.recently_shown: dict[str, int] = {}
         self.pinned_rows = 0
@@ -765,16 +789,30 @@ class Generator:
         logger.info(f"[{self.token[:8]}] profile: {len(wm)} movies, {len(ws)} shows"
                     f" watched{f', kid age {self.kid_age}' if self.kid_age is not None else ''}")
 
+        # How much they liked each of those, and which of them were somebody
+        # else's choice. Cache-only, so a failure here costs ranking quality
+        # and never the build.
+        try:
+            self.taste = await taste.load(self.viewer_key)
+            logger.info(f"[{self.token[:8]}] taste: {self.taste.summary()}")
+        except Exception:
+            logger.exception(f"[{self.token[:8]}] taste model failed")
+            self.taste = None
+
         # thin history → blend in this user's hand-picked taste anchors and/or
         # real watch history pulled from elsewhere (e.g. Nuvio local history)
         if len(wm) + len(ws) < preseed.PRESEED_MAX_HISTORY:
             entries = preseed.load_for(self.user.get("name"))
-            taste = await preseed.taste_seeds(entries["taste"])
+            # Not `taste`: that name is the taste model module, and binding it
+            # locally here made every reference to it in this function an
+            # UnboundLocalError — including the model load above, which the
+            # try/except then swallowed into a silent fallback.
+            anchors = await preseed.taste_seeds(entries["taste"])
             history = await preseed.history_seeds(entries["history"])
-            if taste or history:
-                preseed.apply_to_profile(self.profile, taste + history)
-                logger.info(f"[{self.token[:8]}] preseeded with {len(taste)} taste"
-                            f" + {len(history)} history titles for"
+            if anchors or history:
+                preseed.apply_to_profile(self.profile, anchors + history)
+                logger.info(f"[{self.token[:8]}] preseeded with {len(anchors)} "
+                            f"taste + {len(history)} history titles for"
                             f" '{self.user.get('name')}'")
 
         # Build in approximately the same order the rows will be displayed so
@@ -899,37 +937,150 @@ class Generator:
         return {"id": f"nr-holiday-{holiday['id']}", "type": config.COMBINED_TYPE,
                 "name": holiday["name"], "metas": combined}
 
+    def _ranked_seeds(self, limit: int) -> list[tuple[dict, float]]:
+        """This viewer's strongest titles, as (profile seed, 0..1 strength).
+
+        The profile supplies the TMDB ids; the taste model supplies the order
+        and the veto. Seeds it scores at or below zero — repeatedly opened and
+        never watched — are dropped rather than merely demoted, because a
+        single seed contributes a dozen candidates and one bad one is a
+        visible chunk of the row.
+
+        Movies and series are ranked in separate lists and allocated slots by
+        the profile's own media share, because their engagement scores are not
+        comparable: a series accumulates breadth one episode at a time while a
+        film has only ever one thing to finish. Ranked together, series win
+        essentially every slot — a live run produced ten series seeds out of
+        ten, and therefore a row with no films in it at all.
+        """
+        pool = self.profile.get("seeds") or []
+        if not pool or not self.taste:
+            # No taste model means no plays to learn from; the profile's own
+            # recency ordering is all there is.
+            return [(seed, 0.5) for seed in pool[:limit]]
+        by_media: dict[str, list[tuple[float, dict]]] = {"movie": [], "series": []}
+        for seed in pool:
+            imdb_id = seed.get("imdb")
+            if not imdb_id:
+                continue
+            media_type = "movie" if seed.get("type") == "movie" else "series"
+            signal = self.taste.signal_for(imdb_id, media_type)
+            if signal is None:
+                # A preseed anchor, or a title played before history was kept.
+                # No evidence is not evidence against.
+                by_media[media_type].append((UNMEASURED_SEED_RANK, seed))
+                continue
+            if signal.context != taste.CONTEXT_SOLO:
+                continue
+            rank = self.taste.seed_rank(signal)
+            if rank <= 0:
+                continue
+            by_media[media_type].append((rank, seed))
+        for ranked in by_media.values():
+            ranked.sort(key=lambda item: item[0], reverse=True)
+
+        movie_slots = round(limit * self._movie_share())
+        if by_media["movie"] and movie_slots < 1:
+            movie_slots = 1
+        movie_slots = min(movie_slots, len(by_media["movie"]))
+        chosen = (by_media["movie"][:movie_slots]
+                  + by_media["series"][:limit - movie_slots])
+        if not chosen:
+            return []
+        # Slots are allocated per medium; strength is normalised globally. The
+        # two must stay separate. Normalising per medium as well was tried and
+        # inflated weak seeds: a film opened twice and abandoned at 23% scored
+        # 0.87 simply for being the third-best film, and got a seed's full
+        # dozen candidates. Now it earns a place in the row and nothing more —
+        # its candidates carry its real, low strength and win slots only if
+        # the medium is otherwise unrepresented.
+        top = max(rank for rank, _ in chosen) or 1.0
+        out = [(seed, rank / top) for rank, seed in chosen]
+        out.sort(key=lambda item: item[1], reverse=True)
+        return out
+
+    def _pick_score(self, meta: dict, seed_strength: float, order: float,
+                    affinity: dict[str, float]) -> float:
+        """A candidate's relevance to this viewer, 0..1."""
+        genres = [taste.genre_slug(g) for g in meta.get("genres") or ()]
+        genre_fit = max((affinity.get(slug, 0.0) for slug in genres),
+                        default=0.0)
+        try:
+            rating = float(meta.get("imdbRating") or 0) / 10.0
+        except (TypeError, ValueError):
+            rating = 0.0
+        return (PICK_WEIGHT_SEED * seed_strength
+                + PICK_WEIGHT_ORDER * order
+                + PICK_WEIGHT_GENRE * genre_fit
+                + PICK_WEIGHT_RATING * max(0.0, min(1.0, rating)))
+
     async def _top_picks(self) -> dict | None:
         """The opening row, built from this viewer's own strongest titles.
 
         This used to be Trakt's `/recommendations`, computed server-side from a
         connected account. With no account there is no such endpoint, so it is
-        assembled the same way the because-you-watched rows are: titles similar
-        to what this person actually finished and came back to, drawn from the
-        seeds the taste profile already ranks. Same shape, same id, same
-        position — different provenance.
+        assembled from titles similar to what this person actually watched.
+
+        The shape it replaced concatenated each seed's similars onto one list
+        and truncated: the first seed to return a full row won the whole row,
+        and every seed behind it was silently discarded. Observed live, two
+        seeds produced all thirty items — eighteen horror and twelve nature
+        documentaries — while four perfectly good seeds contributed nothing.
+
+        So seeds no longer take turns; they compete. Every seed's candidates
+        are scored on the same scale and then selected against soft diversity
+        quotas, which means a seed earns slots by the quality of what it
+        returns and no seed can run away with the row.
         """
-        seeds = (self.profile.get("loved") or [])[:6] \
-            or (self.profile.get("seeds") or [])[:6]
+        seeds = self._ranked_seeds(TOP_PICKS_SEED_COUNT)
         if not seeds:
             return None
-        movie_ids: list[dict] = []
-        series_ids: list[dict] = []
-        for seed in seeds:
+        affinity = self.taste.genre_affinity() if self.taste else {}
+        candidates: list[taste.Candidate] = []
+        seen: set[str] = set()
+        for seed, strength in seeds:
             try:
-                metas = await self._seed_similar(seed, ROW_TARGET_ITEMS)
+                metas = await self._seed_similar(seed, TOP_PICKS_PER_SEED)
             except Exception:
                 logger.debug(f"[{self.token[:8]}] top-picks seed failed",
                              exc_info=True)
                 continue
-            (movie_ids if seed["type"] == "movie" else series_ids).extend(metas)
-        # Seed order already carries the taste ranking: seeds arrive strongest
-        # first, and each one's similars are appended behind it.
-        movies = movie_ids[:ROW_TARGET_ITEMS]
-        series = series_ids[:ROW_TARGET_ITEMS]
-        combined = self._mix_media(movies, series)
+            for position, meta in enumerate(metas):
+                imdb_id = meta.get("id")
+                if not imdb_id or imdb_id in seen:
+                    continue
+                genres = tuple(taste.genre_slug(g)
+                               for g in meta.get("genres") or ())
+                # Keeping kids' titles out of the seeds is not enough: a seed
+                # an adult loves still recommends children's television
+                # through shared genres, and a live run surfaced Huckleberry
+                # Hound and a 1983 Dungeons & Dragons cartoon this way. Kid
+                # profiles obviously keep theirs.
+                if self.kid_age is None and taste.KIDS_GENRES & set(genres):
+                    continue
+                seen.add(imdb_id)
+                order = 1.0 - position / float(max(1, len(metas)))
+                candidates.append(taste.Candidate(
+                    imdb_id=imdb_id,
+                    media_type=("movie" if meta.get("type") == "movie"
+                                else "series"),
+                    score=self._pick_score(meta, strength, order, affinity),
+                    genres=genres,
+                    seed_id=seed.get("imdb") or str(seed.get("tmdb") or ""),
+                    meta=meta,
+                ))
+        if len(candidates) < 5:
+            return None
+        chosen = taste.select_diverse(candidates, ROW_TARGET_ITEMS,
+                                      rng=self.rng,
+                                      movie_share=self._movie_share())
+        combined = [c.meta for c in chosen]
         if len(combined) < 5:
             return None
+        contributing = len({c.seed_id for c in chosen})
+        logger.info(f"[{self.token[:8]}] top picks: {len(combined)} items from "
+                    f"{contributing}/{len(seeds)} seeds "
+                    f"({len(candidates)} candidates)")
         self.used_imdb.update(m["id"] for m in combined)
         return {"id": TOP_PICKS_ID, "type": config.COMBINED_TYPE,
                 "name": "Top Picks", "metas": combined}

@@ -1357,6 +1357,36 @@ async def cache_get_meta(tmdb_id: int, media_type: str) -> dict | None:
             "meta": json.loads(row["meta"]) if row["meta"] else None}
 
 
+async def cached_genres_by_imdb(imdb_ids: set[str]) -> dict[str, list[str]]:
+    """IMDb id → cached TMDB genre labels, for ids already resolved once.
+
+    Cache-only and deliberately so: the taste model runs over a viewer's whole
+    history, and letting it miss into TMDB would turn a local computation into
+    hundreds of API calls. A title nobody has resolved yet simply contributes
+    no genre vector.
+    """
+    wanted = {i for i in imdb_ids if i}
+    if not wanted:
+        return {}
+    out: dict[str, list[str]] = {}
+    async with conn().execute(
+        "SELECT imdb_id, meta FROM meta_cache WHERE imdb_id IS NOT NULL"
+    ) as cur:
+        rows = await cur.fetchall()
+    for row in rows:
+        imdb_id = row["imdb_id"]
+        if imdb_id not in wanted or imdb_id in out:
+            continue
+        try:
+            meta = json.loads(row["meta"]) if row["meta"] else None
+        except (TypeError, ValueError):
+            continue
+        genres = (meta or {}).get("genres")
+        if genres:
+            out[imdb_id] = list(genres)
+    return out
+
+
 async def cache_put_meta(tmdb_id: int, media_type: str, imdb_id: str | None,
                          meta: dict | None, cert: str | None = None,
                          home_release_date: str | None = None,
