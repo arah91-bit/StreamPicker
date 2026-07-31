@@ -91,9 +91,20 @@ CATALOG = [
     ("PROBE_HOST_BENCH", "fast", "num", "3", "",
      "Probe failures (with no pass) before a host is skipped for the rest of "
      "that pick. 0 disables."),
-    ("TOTAL_DEADLINE", "fast", "num", "55", _S,
-     "Player-safe outer ceiling on a fast request. Two to ten seconds is only "
-     "the target; the picker keeps waiting for a verified playable stream."),
+    ("TOTAL_DEADLINE", "fast", "num", "120", _S,
+     "Player-safe outer ceiling on a fast request. Under ten seconds is only "
+     "the target; the picker keeps waiting for a verified playable stream, "
+     "because hitting this ceiling means serving the 'Finding Best Stream' "
+     "placeholder — which an auto-playing player plays instead of a film. "
+     "Bounded by your player's own HTTP timeout, which is not measured: if "
+     "playback starts erroring instead of showing the placeholder, lower it."),
+    ("FAST_RACE_DEADLINE", "fast", "num", "120", _S,
+     "Second player-safety cap on the fast race. The effective limit is the "
+     "smaller of this and TOTAL_DEADLINE, so raise them together."),
+    ("FAST_4K_GRACE", "fast", "num", "4", _S,
+     "When a verified 1080p would end the fast race but a 2160p probe is still "
+     "running, wait this long for it. The 4K was probed first and is losing "
+     "only because it is bigger. No 4K in flight means no delay. 0 disables."),
     ("PROBE_TTFB_MAX", "fast", "num", "12", _S,
      "Max first-byte wait before a debrid probe is a failure."),
     ("TORBOX_MAX_DOWNLOADS", "fast", "num", "3", "",

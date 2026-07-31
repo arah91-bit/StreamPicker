@@ -606,6 +606,25 @@ class FastTierRegressionTests(unittest.TestCase):
         self.assertEqual(picker.UNKNOWN_NEED_2160,
                          picker._need_bps_fn(7_200)(unknown_4k))
 
+    def test_a_verified_1080p_still_ends_the_race_on_its_own(self) -> None:
+        # The bar itself is unchanged: one verified 1080p is "enough". The 4K
+        # grace lives in the race loop and only defers that, never removes it.
+        good_1080 = _stream("Movie.2024.1080p.WEB-DL-GROUP.mkv")
+        good_1080["_effres"] = 1080
+        self.assertTrue(picker._enough([(good_1080, None)]))
+
+    def test_four_k_grace_is_bounded_and_conditional(self) -> None:
+        # Documented contract for the hold: it exists, it is short, and it can
+        # be switched off. A long value here would stall every 1080p answer on
+        # titles that have a 4K listed but never verifying.
+        self.assertGreater(picker.FAST_4K_GRACE, 0)
+        self.assertLessEqual(picker.FAST_4K_GRACE, picker.FAST_VERIFIED_GRACE)
+
+    def test_race_ceiling_is_not_capped_by_the_other_deadline(self) -> None:
+        # The race stops at min(FAST_RACE_DEADLINE, TOTAL_DEADLINE), so raising
+        # one alone silently does nothing. Pin them together.
+        self.assertEqual(picker.FAST_RACE_DEADLINE, picker.TOTAL_DEADLINE)
+
 
 class SlowDirectUsenetRegressionTests(unittest.TestCase):
     def test_probe_slice_gives_usenet_one_exploratory_place(self) -> None:

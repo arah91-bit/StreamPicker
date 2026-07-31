@@ -71,11 +71,23 @@ ADDON_PUBLIC_URL = os.environ.get("ADDON_PUBLIC_URL",
 NOTICE_URL = os.environ.get("NOTICE_URL") or f"{ADDON_PUBLIC_URL}/notice.mp4"
 
 # The fast picker is completion-first, not clock-first: it returns immediately
-# when the first verified, language-eligible 1080p/4K source passes. Two to ten
+# when the first verified, language-eligible 1080p/4K source passes. Under ten
 # seconds is the user-facing target, not a stop condition. The only clock limit
 # is the player-safe outer ceiling; until then it keeps looking for one verified
 # playable source rather than falling back to an unverified candidate.
-TOTAL_DEADLINE = float(os.environ.get("TOTAL_DEADLINE", "55"))
+#
+# Raised from 55s deliberately. Hitting this ceiling does not mean "answer with
+# something worse" — it means the '⏳ Finding Best Stream' placeholder becomes
+# result #1, and a player that auto-plays #1 plays *that*, so the viewer sits on
+# a splash screen and has to retry. A title whose only source is a slow NZB
+# mount was routinely losing that race. Waiting longer for a real verified
+# stream beats answering promptly with a placeholder.
+#
+# The bound here is the *player's* HTTP timeout, which we do not control and
+# have not measured — waits around 55s are known good from live use, longer is
+# untested. If a player gives up first the viewer gets an error instead of the
+# placeholder, which is worse; drop this back toward 60 if that shows up.
+TOTAL_DEADLINE = float(os.environ.get("TOTAL_DEADLINE", "120"))
 # Metadata is important for identity/language, but cannot consume the whole fast
 # window before a byte probe even starts. Searches already run concurrently.
 FAST_METADATA_BUDGET = float(os.environ.get("FAST_METADATA_BUDGET", "4"))
@@ -114,6 +126,12 @@ ENOUGH_1080 = int(os.environ.get("FAST_ENOUGH_1080", "1"))
 # _enough); this only bounds the chase for unproven "HD" labels that may never
 # verify. The slow picker does the patient, thorough pass. Seconds.
 FAST_VERIFIED_GRACE = float(os.environ.get("FAST_VERIFIED_GRACE", "5"))
+# A verified 1080p normally ends the race at once. When a 2160p probe is still
+# running at that moment, wait this long for it before settling — the 4K was
+# probed first (quality order) and is losing only because it is bigger, so a
+# few seconds buys the materially better answer. Bounded and conditional: no
+# 4K in flight means no delay at all. 0 disables.
+FAST_4K_GRACE = float(os.environ.get("FAST_4K_GRACE", "4"))
 # Until the race holds its first verified stream (the grace timer can't start
 # without one), probe the fast-to-verify candidates first — direct debrid/HTTP
 # links that first-byte in ~1s — ahead of a same-or-better NZB that needs a
@@ -125,8 +143,10 @@ FAST_SPEED_FIRST = os.environ.get("FAST_SPEED_FIRST", "1").strip().lower() \
     not in ("0", "false", "no", "off", "")
 PROBE_BATCH = int(os.environ.get("FAST_PROBE_BATCH", "3"))
 # Player-safety cap only; the normal stop condition is the first good verified
-# source, however long that takes within the addon's request window.
-FAST_RACE_DEADLINE = float(os.environ.get("FAST_RACE_DEADLINE", "55"))
+# source, however long that takes within the addon's request window. The race
+# deadline is min(this, TOTAL_DEADLINE), so this has to move with it — left at
+# 55 it silently caps the whole change.
+FAST_RACE_DEADLINE = float(os.environ.get("FAST_RACE_DEADLINE", "120"))
 CACHE_TTL = float(os.environ.get("CACHE_TTL", str(6 * 3600)))
 # Release catalogs can live for hours, but a signed playback URL must not be
 # treated as freshly verified for that long. A result list holds for three
@@ -2177,8 +2197,24 @@ async def _race_fast(media: str, media_id: str, profile: dict, runtime: float,
     # so a guaranteed DVD copy is never held hostage to a page of unproven "HD"
     # scraper labels that may never verify. The slow picker and the background
     # finisher do the patient, thorough verification.
+    def _four_k_in_flight() -> bool:
+        """A 2160p candidate whose probe is running right now."""
+        return any(int(s.get("_effres") or _resolution(s)) >= 2160
+                   for s, _ in running_probes.values())
+
     def _sufficient() -> bool:
         if _enough(verified):
+            n4k, _ = _count_tiers(verified)
+            # Settling for 1080p while a 4K is *still being probed* throws away
+            # the better answer for a few seconds. Probing is best-quality-first
+            # so the 4K started earlier; it is simply bigger and slower to prove.
+            # Hold briefly — but only while one is genuinely in flight, so a
+            # title with no 4K at all is never delayed, and only once, so a
+            # queue of failing 4K probes cannot stall the answer indefinitely.
+            if (n4k == 0 and FAST_4K_GRACE > 0 and _four_k_in_flight()
+                    and first_verified_at is not None
+                    and time.monotonic() - first_verified_at < FAST_4K_GRACE):
+                return False
             return True
         return (first_verified_at is not None
                 and time.monotonic() - first_verified_at >= FAST_VERIFIED_GRACE)
