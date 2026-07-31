@@ -172,6 +172,7 @@ class TitleSignal:
     genres: tuple[str, ...] = ()
     plays: int = 0
     observed_plays: int = 0          # plays the proxy watched, not imported
+    imported_plays: int = 0          # attendance asserted by Trakt, unquantified
     attempts: int = 0                # plays that reported consumption at all
     started: int = 0                 # attempts that genuinely got going
     finished: int = 0                # attempts that reached FINISHED_PCT
@@ -247,29 +248,31 @@ def _finish_rate(signal: TitleSignal) -> float:
     for our own delivery failures: one watched right through scored 0.51,
     because 18 of its 37 measured plays never got past 10%.
 
-    Neutral 0.5 when nothing was measured at all. An imported title must not
-    look like a failure merely because Trakt never told us where it stopped.
+    Neutral 0.5 when nothing usable was measured. An imported title must not
+    look like a failure merely because Trakt never told us where it stopped —
+    and neither must a mostly-imported one whose few measured plays happen to
+    be index reads.
     """
-    if signal.attempts < 1:
-        return 0.5
-    if signal.started < 1:
+    if signal.started:
+        return min(1.0, signal.finished / float(signal.started))
+    if signal.attempts and not signal.imported_plays:
         return 0.0
-    return min(1.0, signal.finished / float(signal.started))
+    return 0.5
 
 
 def _time_spent(signal: TitleSignal) -> float:
     """Playback time observed, log-scaled to 0..1.
 
-    Neutral 0.5 when nothing was measured, on the same principle as the finish
-    rate: imported history never recorded a duration and must not be read as
+    Neutral 0.5 when no duration was recorded, on the same principle as the
+    finish rate: imported history never recorded one and must not be read as
     having recorded a zero.
     """
-    if not signal.attempts:
-        return 0.5
     minutes = signal.watch_seconds / 60.0
-    if minutes <= 0:
+    if minutes > 0:
+        return min(1.0, math.log1p(minutes) / math.log1p(TIME_FULL_MINUTES))
+    if signal.attempts and not signal.imported_plays:
         return 0.0
-    return min(1.0, math.log1p(minutes) / math.log1p(TIME_FULL_MINUTES))
+    return 0.5
 
 
 def _recency(last_played_at: int, now: float) -> float:
@@ -281,14 +284,22 @@ def _recency(last_played_at: int, now: float) -> float:
 
 
 def _unproven(signal: TitleSignal) -> bool:
-    """Opened more than once, measured every time, and never actually watched.
+    """Opened more than once, measured *every* time, and never once watched.
 
     Not "disliked" — we cannot tell that apart from a title that would not
     stream, and guessing would let our own delivery failures delete a genre.
     It only means there is no evidence anyone watched this, which is enough to
     disqualify it from *leading* a row while leaving it in the history.
+
+    "Every time" is load-bearing. A single imported play asserts that somebody
+    watched this, and no amount of unconsumed measured plays can contradict
+    that. Planet Earth III has three imported episodes and two measured plays
+    of a fourth, both of which delivered nothing — and it is a title the
+    viewer had watched a great deal of. Reading only the measured plays
+    disqualified it.
     """
-    return signal.attempts >= 2 and signal.started == 0
+    return (signal.imported_plays == 0
+            and signal.attempts >= 2 and signal.started == 0)
 
 
 def _classify_context(signal: TitleSignal) -> str:
@@ -448,10 +459,16 @@ def build(plays: list[dict], genres_for=None,
         for row in rows:
             played_at = int(row.get("played_at") or 0)
             timestamps.append(played_at)
-            if row.get("picker") != IMPORT_PICKER:
-                signal.observed_plays += 1
             episode_key = (row.get("season"), row.get("episode"))
             episodes.add(episode_key)
+            if row.get("picker") == IMPORT_PICKER:
+                # Trakt recorded this as watched and recorded nothing else.
+                # Take it at its word for breadth; it can say nothing about
+                # how far in they got, so it feeds no other component.
+                signal.imported_plays += 1
+                started_episodes.add(episode_key)
+                continue
+            signal.observed_plays += 1
             seconds = _number(row.get("seconds"))
             signal.watch_seconds += seconds
             pct = _delivered_pct(row)

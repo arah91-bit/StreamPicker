@@ -135,6 +135,31 @@ class EvidenceTests(unittest.TestCase):
         self.assertFalse(model.may_seed(signal))
         self.assertEqual([], model.seed_order())
 
+    def test_one_imported_play_outweighs_any_number_of_empty_measured_ones(self):
+        """Planet Earth III: three episodes imported from Trakt, then two
+        measured plays of a fourth that delivered nothing — one of them the
+        index read. Reading only the measured plays disqualified a title the
+        viewer had watched a great deal of. An import asserts viewing, and
+        unconsumed measured plays cannot contradict it."""
+        imported = [play("tt-planet", episode=n + 2, at=NOW - (10 - n) * DAY,
+                         pct=None, picker=taste.IMPORT_PICKER)
+                    for n in range(3)]
+        empty = [play("tt-planet", episode=5, at=NOW, pct=0.02, secs=0.0),
+                 play("tt-planet", episode=5, at=NOW + 5, pct=0.09, secs=0.0)]
+        model = taste.build(imported + empty, now=NOW)
+        signal = model.signal_for("tt-planet")
+        self.assertFalse(signal.unproven)
+        self.assertTrue(model.may_seed(signal))
+        self.assertEqual(3, signal.started_episodes)
+
+    def test_a_fully_measured_title_is_still_judged_on_what_it_delivered(self):
+        """The distinction that keeps the rule honest: no imported plays
+        means nothing is vouching for it, so the measurements stand."""
+        model = taste.build(
+            [play("tt-test", episode=n % 4 + 1, at=NOW - n * 600, pct=0.5,
+                  secs=3.0) for n in range(20)], now=NOW)
+        self.assertTrue(model.signal_for("tt-test").unproven)
+
     def test_being_unproven_is_not_the_same_as_being_disliked(self):
         """It still scores positively and stays in the history — it just
         cannot lead. A title that never streamed would look identical."""
