@@ -213,6 +213,55 @@ class NegativeFingerprintTests(unittest.TestCase):
         self.assertNotIn("disliked", plain.summary())
 
 
+class BootstrapWeightTests(unittest.TestCase):
+    """What a tap is worth beside something actually watched.
+
+    A flat per-tap weight did not survive a thorough person: one profile rated
+    114 titles in a sitting and, at full weight, that became 78% of their
+    fingerprint against 22% for seventy-five titles they had genuinely
+    watched. Their nature documentaries fell from 13.7 lift to 3.4. Stated
+    preference is cheap to give and cheap to be wrong about; watching
+    something is expensive and therefore honest.
+    """
+
+    def share(self, play_weight, likes):
+        total = fingerprint.bootstrap_weight(play_weight, likes) * likes
+        return total / (play_weight + total) if play_weight + total else 1.0
+
+    def test_a_viewer_with_no_history_is_carried_entirely_by_their_taps(self):
+        """The cold start is the whole point of asking; a proportional cap
+        would crush exactly the person it exists for."""
+        self.assertEqual(fingerprint.BOOTSTRAP_LIKE_WEIGHT,
+                         fingerprint.bootstrap_weight(0.0, 20))
+        self.assertEqual(1.0, self.share(0.0, 20))
+
+    def test_a_thin_history_is_still_led_by_the_session(self):
+        self.assertGreater(self.share(1.0, 20), 0.6)
+
+    def test_a_long_session_cannot_swamp_a_rich_history(self):
+        self.assertLessEqual(self.share(22.2, 114), 0.45)
+
+    def test_a_short_session_is_not_penalised_for_someone_elses_marathon(self):
+        """Ten deliberate answers should each count fully — the cap is about
+        volume drowning evidence, not about distrusting the mechanism."""
+        self.assertEqual(fingerprint.BOOTSTRAP_LIKE_WEIGHT,
+                         fingerprint.bootstrap_weight(22.2, 10))
+
+    def test_more_watching_earns_a_bigger_say_for_the_same_taps(self):
+        """The budget is proportional, so a heavy viewer's session is not
+        squeezed as hard as a light viewer's for the same number of taps."""
+        self.assertGreater(fingerprint.bootstrap_weight(60.0, 114),
+                           fingerprint.bootstrap_weight(22.2, 114))
+
+    def test_a_tap_never_outweighs_a_thoroughly_watched_title(self):
+        for play_weight in (0.0, 1.0, 22.2, 200.0):
+            self.assertLessEqual(fingerprint.bootstrap_weight(play_weight, 5),
+                                 fingerprint.BOOTSTRAP_LIKE_WEIGHT)
+
+    def test_no_likes_costs_nothing(self):
+        self.assertEqual(0.0, fingerprint.bootstrap_weight(10.0, 0))
+
+
 class SeenItTests(unittest.IsolatedAsyncioTestCase):
     """"It was fine" — watched, no opinion. A real answer with a real effect.
 

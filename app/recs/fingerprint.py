@@ -55,9 +55,40 @@ NEGATIVE_WEIGHT = 0.45
 # Below this many explicit dislikes the negative centroid is one person's
 # passing mood rather than a direction.
 MIN_NEGATIVE_TITLES = 3
-# An explicit "I liked this" is a statement, not an inference, so it enters the
-# positive centroid at a weight a well-watched title would have to earn.
+# Ceiling on what a single explicit "I liked this" is worth. A statement rather
+# than an inference, so a few of them count for as much as a well-watched
+# title — but only a few.
 BOOTSTRAP_LIKE_WEIGHT = 0.7
+
+# What the whole bootstrap session may be worth, relative to everything the
+# viewer has actually watched. 0.67 caps it at two fifths of the total.
+#
+# This exists because a flat per-tap weight does not survive contact with a
+# thorough person. One profile rated 114 titles in a sitting, and at full
+# weight that came to 78% of their fingerprint against 22% for seventy-five
+# titles they had genuinely watched — one half-second tap counting the same as
+# ninety minutes across nine evenings. Their nature documentaries, the thing
+# their viewing says loudest, fell from 13.7 lift to 3.4.
+#
+# Stated preference is cheap to give and cheap to be wrong about; watching
+# something is expensive and therefore honest. The two must not cost the same.
+BOOTSTRAP_BUDGET_RATIO = 0.67
+# ...but a viewer with little or no history is exactly who the bootstrapper is
+# for, and a proportional cap would crush it there. This floor keeps a session
+# decisive for them while the ratio restrains it for everybody else.
+BOOTSTRAP_MIN_BUDGET = 4.0
+
+
+def bootstrap_weight(play_weight: float, likes: int) -> float:
+    """What each explicit like is worth, given how much watching there is."""
+    if likes <= 0:
+        return 0.0
+    if play_weight <= 0:
+        # Nothing watched: the taps are the entire signal, and holding them
+        # back would defeat the point of asking.
+        return BOOTSTRAP_LIKE_WEIGHT
+    budget = max(play_weight * BOOTSTRAP_BUDGET_RATIO, BOOTSTRAP_MIN_BUDGET)
+    return min(BOOTSTRAP_LIKE_WEIGHT, budget / likes)
 
 
 class Fingerprint:
@@ -212,13 +243,20 @@ async def for_viewer(model, context: str | None, rng=None,
     }
     disliked: dict[str, float] = {}
     if user_token:
-        # A bootstrap "liked" is a deliberate statement rather than an
-        # inference, so it enters at full weight — a viewer who has rated
-        # twenty titles and watched nothing still gets a real fingerprint.
-        for imdb_id, entry in (await db.feedback_for(user_token)).items():
-            if entry["verdict"] == "liked":
-                weights.setdefault(imdb_id, BOOTSTRAP_LIKE_WEIGHT)
-            elif entry["verdict"] == "disliked":
+        feedback = await db.feedback_for(user_token)
+        # Sized against the viewing it is joining, so a long session refines a
+        # rich history instead of replacing it — and still carries a thin one
+        # on its own. See `bootstrap_weight`.
+        fresh_likes = [i for i, e in feedback.items()
+                       if e["verdict"] == "liked" and i not in weights
+                       and i in store]
+        played_weight = sum(w for i, w in weights.items()
+                            if w > 0 and i in store)
+        like_weight = bootstrap_weight(played_weight, len(fresh_likes))
+        for imdb_id in fresh_likes:
+            weights[imdb_id] = like_weight
+        for imdb_id, entry in feedback.items():
+            if entry["verdict"] == "disliked":
                 disliked[imdb_id] = 1.0
     if len(weights) < MIN_TITLES or not store:
         return None, store
