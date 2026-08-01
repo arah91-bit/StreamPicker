@@ -40,7 +40,12 @@ button.primary{width:100%;padding:15px;border-radius:12px;border:0;
 button.primary:disabled{background:#30363d;color:var(--dim)}
 
 /* step 2 — the deck */
-.deck{position:relative;flex:1;min-height:0}
+/* The floor is load-bearing. `flex:1` only hands out space that is left over,
+   and on a phone the header, buttons and labels already fill the viewport —
+   so with `min-height:0` this collapsed to nothing and the card, being
+   absolutely positioned inside it, rendered 0x0. The page looked empty while
+   the API was returning a full deck. */
+.deck{position:relative;flex:1;min-height:clamp(260px,52vh,460px)}
 .card{position:absolute;inset:0;background:var(--card);border:1px solid var(--line);
   border-radius:16px;overflow:hidden;display:flex;flex-direction:column}
 /* `contain`, not `cover`: a poster is the thing being judged, and cropping

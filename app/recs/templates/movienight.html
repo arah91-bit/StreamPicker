@@ -26,7 +26,10 @@ h1{margin:0;font-size:1.3rem;letter-spacing:-.01em}
 .peer{border:1px solid var(--line);border-radius:999px;padding:3px 9px;
   color:var(--dim)}
 .peer.here{border-color:#22562f;color:var(--yes)}
-.deck{position:relative;flex:1;min-height:0}
+/* Same trap as the taste page: `flex:1` only distributes leftover space, so
+   without a floor this collapses to nothing on a phone and the absolutely
+   positioned card renders 0x0. */
+.deck{position:relative;flex:1;min-height:clamp(260px,52vh,460px)}
 .card{position:absolute;inset:0;background:var(--card);border:1px solid var(--line);
   border-radius:16px;overflow:hidden;display:flex;flex-direction:column}
 /* Contained, not cropped — the title and the faces are what tell somebody
