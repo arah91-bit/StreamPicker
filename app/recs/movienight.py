@@ -1,12 +1,20 @@
 """Movie night: get a room to agree on something, then stop.
 
-Everybody opens their own link and votes yes or no on the *same* deck in the
-same order. The moment one film has a yes from every seat, the session ends
-for everybody at once and shows the winner. That shared ordering is the whole
-mechanism — independent decks would give people different films to like and
-there would be nothing to converge on.
+Everybody opens their own link and votes yes or no. The moment one film has a
+yes from every seat, the session ends for everybody at once and shows it.
 
-Two rules this must not break.
+The ordering is shared but not fixed. A static list cannot converge — it just
+runs out — so the queue is re-ranked from every vote cast so far, and the film
+shown next is whichever is currently most likely to get a yes from *everyone*.
+Shared is still essential: if people were served unrelated films they would
+never vote on the same thing and could never agree. So it is one ordering that
+moves, not one ordering per person.
+
+`rank` carries the argument for how it moves. The short version is that a film
+with a single no is arithmetically dead and leaves the queue at once, and that
+a film's score is whatever the least keen person in the room thinks of it.
+
+Two further rules this must not break.
 
 **A vote here is not taste.** "Not tonight, with these people" is a different
 claim from "not for me", and letting it reach a fingerprint would teach the
@@ -27,10 +35,11 @@ the evening — an average hides that, a minimum does not.
 from __future__ import annotations
 
 import logging
+import math
 import secrets
 import time
 
-from app.recs import db, fingerprint, taste, tmdb
+from app.recs import db, features, fingerprint, taste, tmdb
 
 logger = logging.getLogger("nuvio-recs")
 
@@ -39,12 +48,12 @@ logger = logging.getLogger("nuvio-recs")
 TTL_SECONDS = 12 * 3600
 MAX_SEATS = 12
 MIN_SEATS = 2
-PLAYLIST_SIZE = 60
+PLAYLIST_SIZE = 150
 # Recognisable, and worth agreeing on. A film nobody has heard of cannot get a
 # room to a yes.
 MIN_VOTES = 700
 MIN_SCORE = 6.2
-DISCOVER_PAGES = 5
+DISCOVER_PAGES = 10
 
 
 def new_session_id() -> str:
@@ -156,6 +165,111 @@ async def create(seats: list[dict], kid_age: int | None = None) -> dict:
             "playlist_size": len(playlist)}
 
 
+# How much a seat's votes *this evening* outweigh their standing taste. Their
+# fingerprint says what they usually like; a thumb tonight says what they want
+# tonight, which is the more useful of the two once there is any of it.
+SESSION_WEIGHT = 0.75
+# A no counts against a film's neighbours as well as itself, but not as hard
+# as a yes counts for them: rejecting one war film is not rejecting the genre.
+SESSION_NEGATIVE = 0.55
+
+
+def _centroid(vectors: list[dict[str, float]]) -> dict[str, float]:
+    if not vectors:
+        return {}
+    out: dict[str, float] = {}
+    for vector in vectors:
+        for token, value in vector.items():
+            out[token] = out.get(token, 0.0) + value
+    norm = math.sqrt(sum(v * v for v in out.values()))
+    return {t: v / norm for t, v in out.items()} if norm else {}
+
+
+def _affinity(candidate: dict[str, float], liked: dict[str, float],
+              disliked: dict[str, float]) -> float:
+    score = sum(liked.get(t, 0.0) * v for t, v in candidate.items())
+    if disliked:
+        score -= SESSION_NEGATIVE * sum(
+            disliked.get(t, 0.0) * v for t, v in candidate.items())
+    return score
+
+
+async def rank(session_id: str, playlist: list[dict], seat_count: int,
+               prints: dict[int, object] | None = None) -> list[dict]:
+    """Re-order the remaining films by what the room has said so far.
+
+    This is the difference between a deck and a matchmaker. A fixed list
+    cannot converge — it just runs out — so the ordering is recomputed from
+    every vote cast so far, and the film shown next is the one currently most
+    likely to get a yes from *everybody*.
+
+    Two rules do the work.
+
+    **Anything with a single no is dead.** Winning takes a unanimous yes, so a
+    film one person has already refused can never win. Leaving it in the queue
+    spends everyone else's attention on an outcome that is arithmetically
+    impossible.
+
+    **The least keen seat sets the score.** Same reason the initial deck used
+    a minimum: the room is limited by whoever is hardest to please, and a film
+    averaging well because one person adores it is exactly the film that will
+    not end the evening.
+    """
+    votes = await db.match_votes_for(session_id)
+    rejected = {imdb_id for seat_votes in votes.values()
+                for imdb_id, want in seat_votes.items() if not want}
+    alive = [m for m in playlist if m["id"] not in rejected]
+    if not alive:
+        return []
+
+    store = await db.features_by_imdb({m["id"] for m in alive}
+                                      | {i for v in votes.values() for i in v})
+    if not store:
+        return alive
+    vocab = await features.vocabulary()
+    vectors = {imdb_id: vocab.vector(tokens)
+               for imdb_id, tokens in store.items() if tokens}
+
+    seat_taste: dict[int, tuple[dict, dict]] = {}
+    for seat in range(seat_count):
+        seat_votes = votes.get(seat, {})
+        liked = _centroid([vectors[i] for i, want in seat_votes.items()
+                           if want and i in vectors])
+        disliked = _centroid([vectors[i] for i, want in seat_votes.items()
+                              if not want and i in vectors])
+        seat_taste[seat] = (liked, disliked)
+
+    scored: list[tuple[float, dict]] = []
+    for position, meta in enumerate(alive):
+        vector = vectors.get(meta["id"])
+        # Position in the opening deck is the standing-taste prior, and the
+        # only signal available for a seat that has not voted yet.
+        prior = 1.0 - position / max(1, len(alive))
+        if not vector:
+            scored.append((prior * 0.5, meta))
+            continue
+        worst = None
+        for seat in range(seat_count):
+            liked, disliked = seat_taste[seat]
+            if not liked and not disliked:
+                seat_score = prior
+            else:
+                session = _affinity(vector, liked, disliked)
+                # Centred on a half, not floored at zero. Clamping the low end
+                # made "looks like something they refused" and "looks like
+                # nothing they have seen" score identically, so a rejection
+                # could not push a film below an unrelated one and the opening
+                # order decided everything. A no has to be able to cost a film
+                # its place, not merely fail to help it.
+                seat_score = (
+                    SESSION_WEIGHT * max(0.0, min(1.0, 0.5 + session * 1.1))
+                    + (1 - SESSION_WEIGHT) * prior)
+            worst = seat_score if worst is None else min(worst, seat_score)
+        scored.append((worst if worst is not None else prior, meta))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return [meta for _, meta in scored]
+
+
 async def vote(seat_row: dict, imdb_id: str, want: bool) -> dict:
     """Record one vote and settle the session if the room has agreed."""
     session_id = seat_row["session_id"]
@@ -184,7 +298,9 @@ async def state(seat_row: dict) -> dict:
     winner = next((m for m in playlist if m["id"] == winner_id), None) \
         if winner_id else None
 
-    remaining = [m for m in playlist if m["id"] not in mine]
+    ranked = [] if winner else await rank(session_id, playlist,
+                                          seat_row["seat_count"])
+    remaining = [m for m in ranked if m["id"] not in mine]
     seats = await db.match_seats(session_id)
     now = int(time.time())
     return {
@@ -195,6 +311,7 @@ async def state(seat_row: dict) -> dict:
         "voted": len(mine),
         "wanted": sum(1 for v in mine.values() if v),
         "playlist_size": len(playlist),
+        "in_play": len(ranked),
         "next": remaining[:1],
         "exhausted": not remaining,
         "others": [{

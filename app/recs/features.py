@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import time
 
 logger = logging.getLogger("nuvio-recs")
 
@@ -166,9 +167,30 @@ class Vocabulary:
         return len(self.document_frequency)
 
 
-async def vocabulary() -> Vocabulary:
-    """Build the IDF vocabulary from the whole feature store."""
+# Document frequency is a full pass over tens of thousands of rows. That is
+# nothing once per nightly build and far too much per request, and movie night
+# reranks on every poll from every player. The corpus barely moves between
+# builds, so a short-lived shared copy is both cheap and honest.
+_VOCABULARY: tuple[float, Vocabulary] | None = None
+VOCABULARY_TTL = 600.0
+
+
+async def vocabulary(max_age: float = VOCABULARY_TTL) -> Vocabulary:
+    """The IDF vocabulary for the whole feature store, cached briefly."""
+    global _VOCABULARY
     from app.recs import db
 
+    now = time.monotonic()
+    if _VOCABULARY and now - _VOCABULARY[0] < max_age:
+        return _VOCABULARY[1]
     frequency, documents = await db.feature_document_frequency()
-    return Vocabulary(frequency, documents)
+    built = Vocabulary(frequency, documents)
+    _VOCABULARY = (now, built)
+    return built
+
+
+def forget_vocabulary() -> None:
+    """Drop the cached copy. For tests, and for anything that has just
+    rewritten the store wholesale."""
+    global _VOCABULARY
+    _VOCABULARY = None

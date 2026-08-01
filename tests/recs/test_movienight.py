@@ -5,10 +5,11 @@ taste model — "not tonight, with these people" is not "not for me" — and tha
 guest leaves nothing behind.
 """
 
+import contextlib
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from app.recs import movienight
+from app.recs import features, movienight
 
 
 class PlaylistTests(unittest.IsolatedAsyncioTestCase):
@@ -132,6 +133,93 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("known", known["user_token"])
 
 
+class DynamicRankingTests(unittest.IsolatedAsyncioTestCase):
+    """The queue re-ranks from the room's votes. A fixed list cannot converge —
+    it just runs out."""
+
+    def setUp(self):
+        # Two clusters. `war` films share tokens with each other, `funny`
+        # films with each other, and nothing crosses.
+        self.playlist = ([{"id": f"tt-war{n}"} for n in range(5)]
+                         + [{"id": f"tt-fun{n}"} for n in range(5)])
+        self.store = {f"tt-war{n}": ["k:war", f"k:w{n}"] for n in range(5)}
+        self.store.update({f"tt-fun{n}": ["k:funny", f"k:f{n}"]
+                           for n in range(5)})
+        frequency = {}
+        for doc in self.store.values():
+            for token in set(doc):
+                frequency[token] = frequency.get(token, 0) + 1
+        self.vocab = features.Vocabulary(frequency, len(self.store))
+
+    def patches(self, votes):
+        return (
+            patch.object(movienight.db, "match_votes_for",
+                         AsyncMock(return_value=votes)),
+            patch.object(movienight.db, "features_by_imdb",
+                         AsyncMock(return_value=self.store)),
+            patch.object(movienight.features, "vocabulary",
+                         AsyncMock(return_value=self.vocab)),
+        )
+
+    async def test_a_film_anybody_refused_leaves_the_queue(self):
+        """Winning takes a unanimous yes, so one no makes a film
+        arithmetically dead. Leaving it in spends everyone else's attention on
+        an impossible outcome."""
+        with contextlib.ExitStack() as stack:
+            for p in self.patches({1: {"tt-war0": 0}}):
+                stack.enter_context(p)
+            ranked = await movienight.rank("s", self.playlist, 3)
+        self.assertNotIn("tt-war0", [m["id"] for m in ranked])
+        self.assertEqual(9, len(ranked))
+
+    async def test_what_the_room_likes_rises(self):
+        """Two seats have said yes to comedies. Comedies should now lead."""
+        votes = {0: {"tt-fun0": 1}, 1: {"tt-fun1": 1}}
+        with contextlib.ExitStack() as stack:
+            for p in self.patches(votes):
+                stack.enter_context(p)
+            ranked = await movienight.rank("s", self.playlist, 2)
+        top = [m["id"] for m in ranked[:3]]
+        self.assertTrue(all(t.startswith("tt-fun") for t in top), top)
+
+    async def test_one_persons_enthusiasm_cannot_carry_a_film(self):
+        """Seat 0 loves war films, seat 1 has said no to one. The room is
+        limited by whoever is hardest to please, so comedy should lead
+        regardless of how keen seat 0 is."""
+        votes = {0: {"tt-war0": 1, "tt-war1": 1}, 1: {"tt-war2": 0}}
+        with contextlib.ExitStack() as stack:
+            for p in self.patches(votes):
+                stack.enter_context(p)
+            ranked = await movienight.rank("s", self.playlist, 2)
+        self.assertTrue(ranked[0]["id"].startswith("tt-fun"),
+                        [m["id"] for m in ranked[:4]])
+
+    async def test_with_no_votes_the_opening_order_is_kept(self):
+        with contextlib.ExitStack() as stack:
+            for p in self.patches({}):
+                stack.enter_context(p)
+            ranked = await movienight.rank("s", self.playlist, 3)
+        self.assertEqual([m["id"] for m in self.playlist],
+                         [m["id"] for m in ranked])
+
+    async def test_a_room_that_has_ruled_everything_out_ranks_empty(self):
+        votes = {0: {m["id"]: 0 for m in self.playlist}}
+        with contextlib.ExitStack() as stack:
+            for p in self.patches(votes):
+                stack.enter_context(p)
+            self.assertEqual([], await movienight.rank("s", self.playlist, 2))
+
+    async def test_titles_with_no_features_are_kept_not_dropped(self):
+        """A film we have no vectors for should fall down the order, never out
+        of it — it may still be the thing everyone agrees on."""
+        playlist = self.playlist + [{"id": "tt-unknown"}]
+        with contextlib.ExitStack() as stack:
+            for p in self.patches({0: {"tt-fun0": 1}}):
+                stack.enter_context(p)
+            ranked = await movienight.rank("s", playlist, 2)
+        self.assertIn("tt-unknown", [m["id"] for m in ranked])
+
+
 class AgreementTests(unittest.IsolatedAsyncioTestCase):
     """Ending the evening is the whole point."""
 
@@ -175,6 +263,9 @@ class AgreementTests(unittest.IsolatedAsyncioTestCase):
         with (patch.object(movienight.db, "touch_match_seat", AsyncMock()),
               patch.object(movienight.db, "match_votes_for",
                            AsyncMock(return_value={0: {"tt1": 1, "tt2": 0}})),
+              patch.object(movienight, "rank",
+                           AsyncMock(return_value=[{"id": "tt1"},
+                                                   {"id": "tt3"}])),
               patch.object(movienight.db, "match_by_seat_key",
                            AsyncMock(return_value=None)),
               patch.object(movienight.db, "match_seats",
@@ -190,6 +281,8 @@ class AgreementTests(unittest.IsolatedAsyncioTestCase):
         with (patch.object(movienight.db, "touch_match_seat", AsyncMock()),
               patch.object(movienight.db, "match_votes_for",
                            AsyncMock(return_value={0: {"tt1": 1}})),
+              patch.object(movienight, "rank",
+                           AsyncMock(return_value=[{"id": "tt1"}])),
               patch.object(movienight.db, "match_by_seat_key",
                            AsyncMock(return_value=None)),
               patch.object(movienight.db, "match_seats",

@@ -1646,19 +1646,36 @@ async def cache_put_features(tmdb_id: int, media_type: str,
 
 async def features_by_imdb(imdb_ids: set[str] | None = None
                            ) -> dict[str, list[str]]:
-    """IMDb id → feature tokens. Pass None for the whole store."""
+    """IMDb id → feature tokens. Pass None for the whole store.
+
+    Asking for a specific set queries for exactly those rows. It used to scan
+    and decode the whole table and then filter, which is fine once per nightly
+    build and ruinous somewhere like movie night, where it runs on every poll
+    from every player.
+    """
     from app.recs import features as feature_lib
 
-    async with conn().execute(
-        "SELECT imdb_id, features FROM title_features WHERE imdb_id IS NOT NULL"
-    ) as cur:
-        rows = await cur.fetchall()
-    wanted = None if imdb_ids is None else {i for i in imdb_ids if i}
+    wanted = None if imdb_ids is None else [i for i in imdb_ids if i]
     out: dict[str, list[str]] = {}
+    if wanted is None:
+        async with conn().execute(
+            "SELECT imdb_id, features FROM title_features"
+            " WHERE imdb_id IS NOT NULL") as cur:
+            rows = await cur.fetchall()
+    else:
+        if not wanted:
+            return {}
+        rows = []
+        # SQLite caps host parameters, so ask in batches.
+        for start in range(0, len(wanted), 400):
+            chunk = wanted[start:start + 400]
+            marks = ",".join("?" * len(chunk))
+            async with conn().execute(
+                f"SELECT imdb_id, features FROM title_features"
+                f" WHERE imdb_id IN ({marks})", chunk) as cur:
+                rows.extend(await cur.fetchall())
     for row in rows:
         imdb_id = row["imdb_id"]
-        if wanted is not None and imdb_id not in wanted:
-            continue
         if imdb_id in out:
             continue
         out[imdb_id] = feature_lib.decode(row["features"])

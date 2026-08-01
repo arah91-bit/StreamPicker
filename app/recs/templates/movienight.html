@@ -147,8 +147,10 @@ function paint(s) {
   el.querySelector(".gn").textContent = (card.genres || []).join(" · ");
   el.querySelector(".rt").textContent = card.rating ? "★ " + card.rating : "";
   deck.appendChild(el);
-  $("status").textContent = `${s.voted} of ${s.playlist_size} · `
-    + `${s.wanted} you'd watch`;
+  // `in_play` shrinks as films are ruled out by anybody, so it is the honest
+  // measure of how much is left to agree on — the full list never was.
+  $("status").textContent = `${s.voted} seen · ${s.wanted} you'd watch · `
+    + `${s.in_play} still in play`;
 }
 
 async function refresh() {
