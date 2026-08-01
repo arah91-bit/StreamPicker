@@ -38,6 +38,59 @@ class PlaylistTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(playlist)
         self.assertEqual(len(playlist), len({m["id"] for m in playlist}))
 
+    async def test_the_pool_spans_more_than_this_month(self):
+        """Sweeping only by popularity gave a room a wall of current
+        blockbusters and nothing to discover about itself, whatever anybody
+        voted."""
+        sorts, windows = set(), 0
+
+        async def discover(media, params):
+            nonlocal windows
+            sorts.add(params.get("sort_by"))
+            if "primary_release_date.lte" in params:
+                windows += 1
+            return self.films(6)
+
+        async def resolve(media, tid, **kw):
+            return self.meta(tid)
+
+        with (patch.object(movienight.tmdb, "discover", discover),
+              patch.object(movienight.tmdb, "resolve_meta", resolve),
+              patch.object(movienight, "_fingerprints",
+                           AsyncMock(return_value=[]))):
+            await movienight.build_playlist([])
+        self.assertIn("popularity.desc", sorts)
+        self.assertIn("vote_average.desc", sorts)
+        self.assertGreaterEqual(windows, 3)
+
+    async def test_a_room_with_regulars_is_swept_by_their_own_keywords(self):
+        """Otherwise picking a known viewer only reorders whatever the generic
+        sweeps happened to return."""
+        seen = []
+
+        class Print:
+            def top_features(self, limit=40, families=("k", "p")):
+                return [f"k:{n}" for n in range(limit)]
+
+            def lift(self, tokens):
+                return 1.0
+
+        async def discover(media, params):
+            seen.append(params)
+            return self.films(4)
+
+        async def resolve(media, tid, **kw):
+            return self.meta(tid)
+
+        with (patch.object(movienight.tmdb, "discover", discover),
+              patch.object(movienight.tmdb, "resolve_meta", resolve),
+              patch.object(movienight.db, "features_by_imdb",
+                           AsyncMock(return_value={})),
+              patch.object(movienight, "_fingerprints",
+                           AsyncMock(return_value=[Print()]))):
+            await movienight.build_playlist(["known"])
+        self.assertTrue([p for p in seen if "with_keywords" in p])
+
     async def test_the_least_keen_person_decides_the_order(self):
         """A film one person loves and another cannot stand is exactly the
         film that will not end the evening. An average hides that; the
@@ -151,7 +204,7 @@ class DynamicRankingTests(unittest.IsolatedAsyncioTestCase):
                 frequency[token] = frequency.get(token, 0) + 1
         self.vocab = features.Vocabulary(frequency, len(self.store))
 
-    def patches(self, votes):
+    def patches(self, votes, prints=None):
         return (
             patch.object(movienight.db, "match_votes_for",
                          AsyncMock(return_value=votes)),
@@ -159,6 +212,10 @@ class DynamicRankingTests(unittest.IsolatedAsyncioTestCase):
                          AsyncMock(return_value=self.store)),
             patch.object(movienight.features, "vocabulary",
                          AsyncMock(return_value=self.vocab)),
+            # Ranking consults each seat's standing taste now, so a case that
+            # is only about tonight's votes has to say there is none.
+            patch.object(movienight, "seat_prints",
+                         AsyncMock(return_value=prints or {})),
         )
 
     async def test_a_film_anybody_refused_leaves_the_queue(self):
@@ -173,8 +230,11 @@ class DynamicRankingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(9, len(ranked))
 
     async def test_what_the_room_likes_rises(self):
-        """Two seats have said yes to comedies. Comedies should now lead."""
-        votes = {0: {"tt-fun0": 1}, 1: {"tt-fun1": 1}}
+        """A few yeses each on comedies and comedies should lead. Three, not
+        one: a single vote is a third of a seat's weight by design, because
+        "they keep thumbing this down" is a pattern and not one tap."""
+        votes = {0: {"tt-fun0": 1, "tt-fun2": 1, "tt-fun3": 1},
+                 1: {"tt-fun1": 1, "tt-fun2": 1, "tt-fun4": 1}}
         with contextlib.ExitStack() as stack:
             for p in self.patches(votes):
                 stack.enter_context(p)
@@ -186,13 +246,58 @@ class DynamicRankingTests(unittest.IsolatedAsyncioTestCase):
         """Seat 0 loves war films, seat 1 has said no to one. The room is
         limited by whoever is hardest to please, so comedy should lead
         regardless of how keen seat 0 is."""
-        votes = {0: {"tt-war0": 1, "tt-war1": 1}, 1: {"tt-war2": 0}}
+        votes = {0: {"tt-war0": 1, "tt-war1": 1, "tt-war3": 1},
+                 1: {"tt-war2": 0, "tt-war4": 0, "tt-war0": 0}}
         with contextlib.ExitStack() as stack:
             for p in self.patches(votes):
                 stack.enter_context(p)
             ranked = await movienight.rank("s", self.playlist, 2)
         self.assertTrue(ranked[0]["id"].startswith("tt-fun"),
                         [m["id"] for m in ranked[:4]])
+
+    async def test_a_known_seats_own_taste_leads_before_they_vote(self):
+        """The reason picking a viewer for a seat is worth doing. Their
+        fingerprint used to touch only the opening pool order, which the first
+        few votes then overwrote — so choosing a known viewer bought almost
+        nothing."""
+        class Print:
+            def lift(self, tokens):
+                return 8.0 if "k:funny" in tokens else 0.1
+
+        with contextlib.ExitStack() as stack:
+            for p in self.patches({}):
+                stack.enter_context(p)
+            ranked = await movienight.rank("s", self.playlist, 2,
+                                           prints={0: Print()})
+        self.assertTrue(ranked[0]["id"].startswith("tt-fun"),
+                        [m["id"] for m in ranked[:4]])
+
+    async def test_tonights_thumbs_overrule_standing_taste(self):
+        """Someone who usually likes comedies but is refusing them tonight
+        should stop being shown comedies."""
+        class Print:
+            def lift(self, tokens):
+                return 8.0 if "k:funny" in tokens else 0.1
+
+        votes = {0: {f"tt-fun{n}": 0 for n in range(4)}}
+        with contextlib.ExitStack() as stack:
+            for p in self.patches(votes):
+                stack.enter_context(p)
+            ranked = await movienight.rank("s", self.playlist, 1,
+                                           prints={0: Print()})
+        self.assertTrue(ranked[0]["id"].startswith("tt-war"),
+                        [m["id"] for m in ranked[:4]])
+
+    async def test_a_guest_is_carried_entirely_by_their_thumbs(self):
+        """No fingerprint, so a room of strangers has only tonight to go on —
+        and must still converge."""
+        votes = {0: {"tt-fun0": 1, "tt-fun2": 1, "tt-fun3": 1},
+                 1: {"tt-fun1": 1, "tt-fun2": 1, "tt-fun4": 1}}
+        with contextlib.ExitStack() as stack:
+            for p in self.patches(votes):
+                stack.enter_context(p)
+            ranked = await movienight.rank("s", self.playlist, 2, prints={})
+        self.assertTrue(ranked[0]["id"].startswith("tt-fun"))
 
     async def test_with_no_votes_the_opening_order_is_kept(self):
         with contextlib.ExitStack() as stack:
