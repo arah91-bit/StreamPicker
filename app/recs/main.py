@@ -16,7 +16,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from app.recs import (bootstrap, config, db, dramas, kids_catalogs,
-                      playhistory, profile_streaming, watching)
+                      movienight, playhistory, profile_streaming,
+                      watching)
 from app.recs.catalogs import generate_for_user
 from app.recs.kids import birthdate_from_age, clamp_age, effective_kid_age
 from app.recs import scheduler
@@ -46,6 +47,7 @@ _watching_task: asyncio.Task | None = None
 _playhistory_task: asyncio.Task | None = None
 CONFIGURE_HTML = (Path(__file__).parent / "templates" / "configure.html").read_text()
 BOOTSTRAP_HTML = (Path(__file__).parent / "templates" / "bootstrap.html").read_text()
+MOVIE_NIGHT_HTML = (Path(__file__).parent / "templates" / "movienight.html").read_text()
 LANDING_HTML = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -766,6 +768,86 @@ async def taste_done(token: str):
     if state["rated"]:
         asyncio.create_task(generate_for_user(user, trigger="taste-bootstrap"))
     return {"status": "ok", "progress": state}
+
+
+# ── movie night ──────────────────────────────────────────────────────────
+#
+# Created from the admin page, then one link per person. Seat links carry
+# their own short-lived key rather than a viewer token: a guest gets no access
+# to anybody's profile, and a known viewer's seat cannot be used to read or
+# change their recommendations either.
+
+class MatchSeat(BaseModel):
+    label: str = ""
+    user_token: str | None = None
+
+
+class NewMatch(BaseModel):
+    seats: list[MatchSeat]
+
+
+@app.post("/setup/{secret}/api/movie-night")
+async def create_movie_night(secret: str, body: NewMatch):
+    _check_setup_secret(secret)
+    seats = []
+    youngest: int | None = None
+    for seat in body.seats:
+        token = (seat.user_token or "").strip() or None
+        label = seat.label.strip()
+        if token:
+            user = await db.get_user(token)
+            if not user:
+                raise HTTPException(400, "unknown viewer on a seat")
+            label = label or user["name"]
+            age = effective_kid_age(user)
+            if age is not None:
+                youngest = age if youngest is None else min(youngest, age)
+        seats.append({"label": label, "user_token": token})
+    try:
+        # A room containing a child is filtered to the youngest person in it.
+        created = await movienight.create(seats, kid_age=youngest)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc))
+    return {
+        "session_id": created["session_id"],
+        "playlist_size": created["playlist_size"],
+        "seats": [{
+            "seat": s["seat"], "label": s["label"],
+            "known": bool(s["user_token"]),
+            "url": f"{config.HOST_NAME}/night/{s['seat_key']}",
+        } for s in created["seats"]],
+    }
+
+
+async def _require_seat(seat_key: str) -> dict:
+    seat = await db.match_by_seat_key(seat_key)
+    if not seat:
+        raise HTTPException(404, "This movie night has finished or expired")
+    return seat
+
+
+@app.get("/night/{seat_key}", response_class=HTMLResponse)
+async def movie_night_page(seat_key: str):
+    seat = await _require_seat(seat_key)
+    return MOVIE_NIGHT_HTML.replace("__WHO__", html.escape(seat["label"]))
+
+
+@app.get("/night/{seat_key}/state")
+async def movie_night_state(seat_key: str):
+    return await movienight.state(await _require_seat(seat_key))
+
+
+class MatchVote(BaseModel):
+    id: str
+    want: bool
+
+
+@app.post("/night/{seat_key}/vote")
+async def movie_night_vote(seat_key: str, body: MatchVote):
+    seat = await _require_seat(seat_key)
+    return await movienight.vote(seat, body.id, body.want)
 
 
 @app.get("/health")

@@ -200,6 +200,20 @@ def render(setup_secret: str) -> str:
     <div class="acts"><button id="connect">Add viewer</button></div>
     <div class="mut" id="pstat"></div>
   </div>
+</div>
+
+<div class="card" id="night">
+  <h2>Movie night</h2>
+  <p class="mut">Everyone votes on the same list at the same time, and it stops
+    the moment one film has a yes from all of you. Nothing here touches
+    anyone's taste — a no means "not tonight", which is not the same as "not
+    for me", so none of it is remembered.</p>
+  <div class="field"><label for="nseats">How many people?</label>
+    <input id="nseats" type="number" min="2" max="12" value="3"></div>
+  <div id="seatrows"></div>
+  <div class="acts"><button id="mknight">Create links</button></div>
+  <div class="mut" id="nstat"></div>
+  <div id="nlinks"></div>
 </div>"""
 
     scripts = f"""<script>
@@ -336,6 +350,9 @@ async function load() {{
   let users;
   try {{
     users = (await (await fetch(api("/users"))).json()).users;
+    // Kept for the movie-night seat pickers, which need to offer the same
+    // people this page lists.
+    VIEWERS = users.map(u => ({{token: u.token, name: u.name}}));
   }} catch (e) {{
     out.innerHTML = '<p class="mut">Could not reach the Daily Picks API.</p>';
     return;
@@ -499,7 +516,83 @@ $("connect").onclick = async () => {{
   $("connect").disabled = false;
 }};
 
-load();
+// ── movie night ────────────────────────────────────────────────────────
+// One seat per person. A seat can be pinned to a viewer we know, which lets
+// the deck be ranked against their taste; unknown seats are guests and no
+// record of them is kept anywhere.
+let VIEWERS = [];
+
+function seatRows() {{
+  const n = Math.max(2, Math.min(12, parseInt($("nseats").value || "2", 10)));
+  const wrap = $("seatrows");
+  wrap.innerHTML = "";
+  for (let i = 0; i < n; i++) {{
+    const row = document.createElement("div");
+    row.className = "row";
+    row.innerHTML = `<span class="pos">${{i + 1}}</span>
+      <span class="info"><input class="lb" type="text" placeholder="Name (optional)"></span>
+      <select class="vw"><option value="">Guest</option></select>`;
+    const sel = row.querySelector("select.vw");
+    for (const v of VIEWERS) {{
+      const o = document.createElement("option");
+      o.value = v.token; o.textContent = v.name;
+      sel.appendChild(o);
+    }}
+    // Picking a viewer supplies the name, so the free-text box is only for
+    // guests. Leaving both empty is fine — they become "Guest 2" and so on.
+    sel.onchange = () => {{
+      const lb = row.querySelector("input.lb");
+      const v = VIEWERS.find(x => x.token === sel.value);
+      lb.value = v ? v.name : "";
+      lb.disabled = !!v;
+    }};
+    wrap.appendChild(row);
+  }}
+}}
+
+$("nseats").oninput = seatRows;
+
+$("mknight").onclick = async ev => {{
+  ev.target.disabled = true;
+  $("nstat").textContent = "Building a list everyone might agree on…";
+  $("nlinks").innerHTML = "";
+  const seats = [...document.querySelectorAll("#seatrows .row")].map(r => ({{
+    label: r.querySelector("input.lb").value.trim(),
+    user_token: r.querySelector("select.vw").value || null,
+  }}));
+  try {{
+    const r = await fetch(api("/movie-night"), {{
+      method: "POST", headers: {{"Content-Type": "application/json"}},
+      body: JSON.stringify({{seats}})}});
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || "could not start it");
+    $("nstat").textContent =
+      d.playlist_size + " films queued — send one link to each person.";
+    for (const s of d.seats) {{
+      const el = document.createElement("div");
+      el.innerHTML = `<div class="lanelbl"></div>
+        <a class="url" target="_blank" rel="noopener"></a>`;
+      el.querySelector(".lanelbl").textContent =
+        s.label + (s.known ? " · using their taste" : " · guest");
+      const a = el.querySelector("a.url");
+      a.textContent = s.url; a.href = s.url;
+      a.onclick = async e => {{
+        if (e.metaKey || e.ctrlKey) return;
+        e.preventDefault();
+        const was = a.textContent;
+        a.textContent = (await copyText(s.url)) ? "Copied — send it to them"
+                                               : "Select it above to copy";
+        setTimeout(() => a.textContent = was, 1600);
+      }};
+      $("nlinks").appendChild(el);
+    }}
+  }} catch (e) {{
+    $("nstat").textContent = e.message;
+  }}
+  ev.target.disabled = false;
+}};
+
+load().then(() => {{ seatRows(); }});
 </script>"""
 
     return uitheme.shell(title="Catalog builder", name=ADDON_NAME,

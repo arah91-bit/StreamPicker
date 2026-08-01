@@ -123,6 +123,43 @@ CREATE TABLE IF NOT EXISTS taste_feedback (
 CREATE INDEX IF NOT EXISTS idx_taste_feedback_user
     ON taste_feedback (user_token, verdict);
 
+-- Movie night. A shared deck several people vote on at once, ending the
+-- moment one title has a yes from everybody.
+--
+-- Deliberately separate from taste_feedback and deliberately disposable: a
+-- vote here says "not tonight, with these people", which is a different claim
+-- from "not for me" and must never reach anybody's taste model. Guest seats
+-- store no identity at all, and whole sessions are dropped once they expire.
+CREATE TABLE IF NOT EXISTS match_sessions (
+    id TEXT PRIMARY KEY,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    seats INTEGER NOT NULL,
+    playlist TEXT NOT NULL,
+    winner_imdb TEXT,
+    winner_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS match_seats (
+    session_id TEXT NOT NULL,
+    seat INTEGER NOT NULL,
+    seat_key TEXT NOT NULL,
+    user_token TEXT,
+    label TEXT NOT NULL,
+    last_seen_at INTEGER,
+    PRIMARY KEY (session_id, seat)
+);
+CREATE INDEX IF NOT EXISTS idx_match_seats_key ON match_seats (seat_key);
+CREATE TABLE IF NOT EXISTS match_votes (
+    session_id TEXT NOT NULL,
+    seat INTEGER NOT NULL,
+    imdb_id TEXT NOT NULL,
+    want INTEGER NOT NULL,
+    voted_at INTEGER NOT NULL,
+    PRIMARY KEY (session_id, seat, imdb_id)
+);
+CREATE INDEX IF NOT EXISTS idx_match_votes_title
+    ON match_votes (session_id, imdb_id, want);
+
 CREATE TABLE IF NOT EXISTS storage_migrations (
     id TEXT PRIMARY KEY,
     applied_at INTEGER NOT NULL
@@ -1482,6 +1519,111 @@ def bootstrap_taste(user: dict) -> tuple[list[str], list[str]]:
 
     return (load(user.get("bootstrap_genres")),
             load(user.get("bootstrap_countries")))
+
+
+# ── movie night (disposable session state, never taste) ─────────────────
+
+async def create_match(session_id: str, seats: list[dict], playlist: list[dict],
+                       ttl_seconds: int) -> None:
+    now = int(time.time())
+    await conn().execute(
+        "INSERT INTO match_sessions"
+        " (id, created_at, expires_at, seats, playlist) VALUES (?,?,?,?,?)",
+        (session_id, now, now + ttl_seconds, len(seats), json.dumps(playlist)))
+    for seat in seats:
+        await conn().execute(
+            "INSERT INTO match_seats"
+            " (session_id, seat, seat_key, user_token, label)"
+            " VALUES (?,?,?,?,?)",
+            (session_id, seat["seat"], seat["seat_key"],
+             seat.get("user_token"), seat["label"]))
+    await conn().commit()
+
+
+async def match_by_seat_key(seat_key: str) -> dict | None:
+    """The session and seat a participant link addresses, if still live."""
+    async with conn().execute(
+        "SELECT s.*, m.created_at, m.expires_at, m.seats AS seat_count,"
+        " m.playlist, m.winner_imdb, m.winner_at"
+        " FROM match_seats s JOIN match_sessions m ON m.id = s.session_id"
+        " WHERE s.seat_key=?", (seat_key,)) as cur:
+        row = await cur.fetchone()
+    if not row or row["expires_at"] < time.time():
+        return None
+    return dict(row)
+
+
+async def match_seats(session_id: str) -> list[dict]:
+    async with conn().execute(
+        "SELECT seat, user_token, label, last_seen_at FROM match_seats"
+        " WHERE session_id=? ORDER BY seat", (session_id,)) as cur:
+        return [dict(r) for r in await cur.fetchall()]
+
+
+async def touch_match_seat(session_id: str, seat: int) -> None:
+    await conn().execute(
+        "UPDATE match_seats SET last_seen_at=? WHERE session_id=? AND seat=?",
+        (int(time.time()), session_id, seat))
+    await conn().commit()
+
+
+async def record_match_vote(session_id: str, seat: int, imdb_id: str,
+                            want: bool) -> None:
+    await conn().execute(
+        "INSERT OR REPLACE INTO match_votes"
+        " (session_id, seat, imdb_id, want, voted_at) VALUES (?,?,?,?,?)",
+        (session_id, seat, imdb_id, 1 if want else 0, int(time.time())))
+    await conn().commit()
+
+
+async def match_unanimous(session_id: str, seats: int) -> str | None:
+    """The first title everybody wants, in playlist order, or None."""
+    async with conn().execute(
+        "SELECT imdb_id, MIN(voted_at) AS settled FROM match_votes"
+        " WHERE session_id=? AND want=1"
+        " GROUP BY imdb_id HAVING COUNT(DISTINCT seat) >= ?"
+        " ORDER BY settled", (session_id, seats)) as cur:
+        row = await cur.fetchone()
+    return row["imdb_id"] if row else None
+
+
+async def set_match_winner(session_id: str, imdb_id: str) -> None:
+    """Recorded once. A later unanimous title must not move the goalposts
+    after everyone has been told what they are watching."""
+    await conn().execute(
+        "UPDATE match_sessions SET winner_imdb=?, winner_at=?"
+        " WHERE id=? AND winner_imdb IS NULL",
+        (imdb_id, int(time.time()), session_id))
+    await conn().commit()
+
+
+async def match_votes_for(session_id: str) -> dict[int, dict[str, int]]:
+    async with conn().execute(
+        "SELECT seat, imdb_id, want FROM match_votes WHERE session_id=?",
+        (session_id,)) as cur:
+        rows = await cur.fetchall()
+    out: dict[int, dict[str, int]] = {}
+    for row in rows:
+        out.setdefault(row["seat"], {})[row["imdb_id"]] = row["want"]
+    return out
+
+
+async def purge_expired_matches() -> int:
+    """Sessions are disposable by design; nothing here is worth keeping."""
+    now = int(time.time())
+    async with conn().execute(
+        "SELECT id FROM match_sessions WHERE expires_at < ?", (now,)) as cur:
+        stale = [r["id"] for r in await cur.fetchall()]
+    for session_id in stale:
+        await conn().execute("DELETE FROM match_votes WHERE session_id=?",
+                             (session_id,))
+        await conn().execute("DELETE FROM match_seats WHERE session_id=?",
+                             (session_id,))
+        await conn().execute("DELETE FROM match_sessions WHERE id=?",
+                             (session_id,))
+    if stale:
+        await conn().commit()
+    return len(stale)
 
 
 # ── title features (shared, content only — the fingerprint vocabulary) ──
