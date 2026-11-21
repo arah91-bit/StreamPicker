@@ -348,8 +348,11 @@ def _prune(conn: sqlite3.Connection) -> None:
     pages = conn.execute("PRAGMA page_count").fetchone()[0]
     free = conn.execute("PRAGMA freelist_count").fetchone()[0]
     if (pages - free) * page > _MAX_BYTES:
+        # A prune chunk can exceed the number of retained rows on a small
+        # database. Keep the newest event even when one row exceeds the cap.
         conn.execute("DELETE FROM events WHERE id IN (SELECT id FROM events "
-                     "ORDER BY ts LIMIT ?)", (_PRUNE_CHUNK,))
+                     "WHERE id != (SELECT id FROM events ORDER BY ts DESC, id DESC LIMIT 1) "
+                     "ORDER BY ts, id LIMIT ?)", (_PRUNE_CHUNK,))
     conn.execute("PRAGMA incremental_vacuum(4096)")
 
 

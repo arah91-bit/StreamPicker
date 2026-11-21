@@ -104,6 +104,14 @@ class StoreTests(_StoreCase):
         self.assertLess(len(got), 2000)
         self.assertEqual(1999, got[-1]["n"])
 
+    def test_prune_keeps_newest_event_even_when_one_row_exceeds_budget(self):
+        with patch.object(telemetry, "_MAX_BYTES", 1), \
+                patch.object(telemetry, "_PRUNE_EVERY", 1):
+            self.write({"kind": "probe", "ts": 10, "n": 1},
+                       {"kind": "probe", "ts": 10, "n": 2},
+                       {"kind": "probe", "ts": 9, "n": 3})
+        self.assertEqual([2], [r["n"] for r in telemetry.load()])
+
     def test_dashboard_default_leaves_identity_out(self):
         self.write({"kind": "identity"}, {"kind": "probe"})
         self.assertNotIn("identity", telemetry.DASHBOARD_KINDS)
