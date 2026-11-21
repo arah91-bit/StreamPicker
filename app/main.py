@@ -735,10 +735,13 @@ async def nzb_indexer_clear(request: Request, name: str):
     return RedirectResponse(url="/health/sources", status_code=303)
 
 
+_BOOT_ID = secrets.token_hex(16)
+
+
 @app.get("/api/settings/status.json")
 async def settings_status(request: Request):
     await _admin(request)
-    return {"playing": proxy.active_streams(),
+    return {"playing": proxy.active_streams(), "boot_id": _BOOT_ID,
             "restart_pending": config.restart_pending()}
 
 

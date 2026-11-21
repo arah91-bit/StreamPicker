@@ -335,28 +335,34 @@ async function doSave(){
    if(el.dataset.secret){el.dataset.init='';el.placeholder='kept · just saved';el.value='';}
    else el.dataset.init=ctlValue(el);});
   $$('.savebar').forEach(b=>b.dataset.restart=res.restart_needed?'1':'0');
- }catch(e){$$('.savebar .err').forEach(el=>el.textContent=e.message);}
+ }catch(e){$$('.savebar .err').forEach(el=>el.textContent=
+  'Not saved: '+e.message+'. Check the values and persistent storage, then retry; inspect container logs if it continues.');}
  saves.forEach(b=>b.disabled=false);refreshBar();
 }
 $$('.savebar .savebtn').forEach(b=>b.addEventListener('click',doSave));
 
 async function doRestart(){
- let playing=0;
- try{playing=(await(await fetch('/api/settings/status.json')).json()).playing}catch(e){}
+ let playing=0,before;
+ try{before=await(await fetch('/api/settings/status.json',{cache:'no-store'})).json();playing=before.playing}
+ catch(e){$$('.savebar .err').forEach(el=>el.textContent='Cannot check restart status. Check the connection and retry.');return;}
  const q=playing>0
   ?`${playing} stream${playing>1?'s':''} playing right now will be cut off. Restart anyway?`
   :'Restart the addon now? It comes back in a few seconds.';
  if(!confirm(q))return;
  $$('.savebar .restartbtn').forEach(b=>b.disabled=true);
  $$('.savebar .msg').forEach(m=>m.textContent='Restarting…');
- try{await post('/api/settings/restart')}catch(e){}
+ try{await post('/api/settings/restart')}catch(e){
+  $$('.savebar .err').forEach(el=>el.textContent='Restart failed: '+e.message+' Fix the settings and retry.');
+  $$('.savebar .restartbtn').forEach(b=>b.disabled=false);refreshBar();return;}
  const t0=Date.now();
  (async function poll(){
   if(Date.now()-t0>45000){$$('.savebar .msg').forEach(m=>m.textContent=
-   'Still down — check the container logs.');return;}
+   'Restart was not confirmed — check the container logs and retry.');
+   $$('.savebar .restartbtn').forEach(b=>b.disabled=false);return;}
   await new Promise(r=>setTimeout(r,1200));
-  try{const r=await fetch('/health',{cache:'no-store'});
-   if(r.ok)return location.reload();}catch(e){}
+  try{const r=await fetch('/health/ready',{cache:'no-store'});
+   if(r.ok){const status=await(await fetch('/api/settings/status.json',{cache:'no-store'})).json();
+    if(status.boot_id!==before.boot_id&&!status.restart_pending)return location.reload();}}catch(e){}
   poll();})();
 }
 $$('.savebar .restartbtn').forEach(b=>b.addEventListener('click',doRestart));
