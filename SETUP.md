@@ -324,7 +324,7 @@ autostream.example.com {
 ```
 
 Then set `ADDON_PUBLIC_URL=https://autostream.example.com` in `.env` and
-restart. The dashboard stays invisible from the internet — only the
+run `docker compose up -d` to recreate the container. The dashboard stays invisible from the internet — only the
 secret-gated addon URLs are reachable. A connected Jellyfin server does **not**
 need its own public address.
 
@@ -339,8 +339,10 @@ need its own public address.
   HTTPS in front of it.
 - **Player can't play the stream** — `ADDON_PUBLIC_URL` must be reachable *from
   the player's device*; it's baked into the playback links.
-- **I changed a setting and nothing happened** — settings apply on **restart**.
-  Use the dashboard's Restart button, or `docker compose restart`.
+- **I changed a setting and nothing happened** — dashboard settings apply after
+  its Restart button or `docker compose restart`. For `.env` or Compose
+  environment changes, run `docker compose up -d` to recreate the container.
+  A saved dashboard override still takes precedence over `.env`.
 - **Jellyfin logs in but won't play** — the *container* must be able to reach
   `JELLYFIN_URL`, and the user needs playback permission on that library. Your
   player never talks to Jellyfin directly.
@@ -391,7 +393,8 @@ Everything is file- and API-driven, so no clicking is required:
   AES-256-GCM before `config.json` is written and are redacted on export. Do not
   put `JELLYFIN_PASSWORD` in plaintext `.env` for a normal deployment.
 - **Precedence:** stored config (`data/config.json`) overrides `.env`, which
-  overrides code defaults. Changes apply on **restart**.
+  overrides code defaults. Restart for saved dashboard settings; recreate with
+  `docker compose up -d` after `.env` or Compose environment changes.
 - **Verify programmatically:** `GET /health/ready` → `{"ok":true,…}`; open a
   title's stream endpoint `GET /<secret>/stream/movie/<imdb-id>.json` and
   confirm the `streams` array is non-empty.

@@ -8,7 +8,7 @@ them:
    on, paste keys, hit *Set up my streams* (or use **Settings** for the full
    list). This is documented in [README.md](README.md) and [SETUP.md](SETUP.md).
 2. **Config files** — for automation, including an AI. Everything the dashboard
-   can set, you can set by editing a file and restarting. **This document is
+   can set, you can set through the supported configuration interfaces and applying the change. **This document is
    the guide for that path.**
 
 Neither path is "underneath" the other. Anything you set here shows up in the
@@ -37,9 +37,9 @@ read-only at `/run/secrets/stream_picker_config_key` and sets
 repository, mode `0600`, and back it up with the encrypted config; losing or
 replacing it makes existing ciphertext intentionally unreadable.
 
-Both are read **only at startup**, so a config change takes effect on the
-**next restart**, never live. That is by design and is the one rule you must
-not forget.
+Both are read **only at startup**. Restart for mounted `config.json` changes;
+recreate the Compose container after `.env` or Compose environment changes,
+because a restart retains the existing container environment.
 
 The **authoritative, always-current list of every key** — with its default and
 a one-line description — is the committed file **[`.env.reference`](.env.reference)**.
@@ -107,15 +107,23 @@ non-sensitive deployment seeds. `.env` is ignored by this repository but is
 still plaintext on disk, so save `JELLYFIN_PASSWORD` through the dashboard/API
 instead. See `.env.reference` for the annotated menu.
 
-### Then: restart
+### Apply the change
 
-```
-docker compose restart stream-picker      # or: docker compose up -d
+After validation, restart to load a changed mounted `data/config.json`:
+
+```sh
+docker compose restart stream-picker
 ```
 
-The change lands on the way back up. To confirm a running instance has a
-change *pending* a restart, `GET /api/settings/status.json` returns
-`{"restart_pending": true|false}`.
+For `.env`, Compose interpolation, or `environment:` changes, recreate instead:
+
+```sh
+docker compose up -d
+```
+
+Compose recreates the container when its configuration changes. Verify the
+intended value after either operation; an override in `config.json` still wins.
+`GET /api/settings/status.json` reports whether saved settings await a restart.
 
 ### Validate *before* you restart — don't rely on the safety net
 
@@ -148,6 +156,38 @@ clear message instead of quarantining:
 Only after that succeeds do you restart to apply.
 
 ---
+
+## Unattended fresh installation and verification
+
+1. Obtain from the user the chosen source and its credentials, the address
+   reachable by the player (and by the addon when proxy URLs are probed), and
+   any desired deployment constraints. Derive a random `ADDON_SECRET` and
+   32-byte encryption key locally; do not disclose either. Follow the Compose
+   startup steps in [README.md](README.md), keeping `secrets/stream-picker-config.key`
+   with the installation and backing it up securely alongside `data`. A lost
+   or replaced key cannot decrypt existing settings. Use a fresh data directory
+   for an independent installation. Set the player-reachable `ADDON_PUBLIC_URL`.
+2. Start Compose. Supply sensitive source credentials using `config.save` in
+   the container or the authenticated settings API below, never by manually
+   writing them into `config.json`. For an in-container script, call
+   `config.apply_env()` before `config.save(values)`, then
+   `config.validate_pending()`; pass credentials through a protected input
+   channel, not command arguments or logs. `save` validates the complete merged
+   configuration and encrypts sensitive settings. Fix any validation error
+   before applying; do not print submitted values or the returned effective map.
+   Test a real connection using the supported connection check below where possible.
+3. Apply the change as described above. Check `/health/ready` returns 200 and
+   check the intended setting took effect. Readiness does not prove a source
+   works. The authenticated `export.env` redacts secrets; do not publish the
+   addon secret or a manifest URL containing it.
+4. Request `/<ADDON_SECRET>/manifest.json`, then
+   `/<ADDON_SECRET>/stream/movie/<IMDB_ID>.json` for a title available from the
+   source. Confirm the stream list is nonempty; retry while asynchronous
+   verification finishes if necessary. Request a byte range from a returned URL
+   and confirm media bytes are readable. Report these separately from readiness
+   and from actual player playback. Use a title and source authorized by the
+   user. For a reproducible isolated run, follow
+   [the synthetic fixture instructions](tests/fixture/README.md).
 
 ## Common recipes
 
