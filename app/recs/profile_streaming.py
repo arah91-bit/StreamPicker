@@ -88,14 +88,48 @@ def _slug(value: str) -> str:
 # before anything is served.
 _targets: list[str] = []
 
+# {profile id: [provider id, …]} for viewers who have unticked at least one
+# service. A profile absent from this map has expressed no preference and gets
+# every provider — see providers_for_user().
+_provider_prefs: dict[str, list[str]] = {}
+
+
+def parse_provider_ids(raw: str | None) -> list[str] | None:
+    """Decode the stored CSV into known provider ids, preserving catalogue order.
+
+    `None` in, `None` out: no preference recorded, so every provider applies.
+    Unknown ids are dropped rather than carried, so retiring a service from
+    PROVIDERS cannot leave a viewer pinned to a provider that no longer builds.
+    """
+    if raw is None:
+        return None
+    wanted = {part.strip() for part in str(raw).split(",") if part.strip()}
+    return [p["id"] for p in kids_catalogs.PROVIDERS if p["id"] in wanted]
+
+
+def providers_for_user(user: dict) -> list[dict]:
+    """The streaming services one viewer's rows and collection cover."""
+    allowed = parse_provider_ids(user.get("streaming_providers"))
+    if allowed is None:
+        return list(kids_catalogs.PROVIDERS)
+    return [p for p in kids_catalogs.PROVIDERS if p["id"] in set(allowed)]
+
+
+def _providers_for_profile(profile: dict) -> list[dict]:
+    """Same filter, reached from the build, which is keyed by profile not user."""
+    allowed = _provider_prefs.get(profile["id"])
+    if allowed is None:
+        return list(kids_catalogs.PROVIDERS)
+    return [p for p in kids_catalogs.PROVIDERS if p["id"] in set(allowed)]
+
 
 async def refresh_targets() -> list[str]:
-    """Re-read who has streaming catalogs switched on.
+    """Re-read who has streaming catalogs switched on, and which services.
 
     Called at startup, before each build, and after the admin toggles someone,
     so a tick in the catalog builder takes effect without a restart.
     """
-    global _targets
+    global _targets, _provider_prefs
     try:
         users = await db.users_with_row("streaming_catalogs_row")
     except Exception:
@@ -104,6 +138,13 @@ async def refresh_targets() -> list[str]:
         return _targets
     _targets = [str(u.get("name") or "").strip() for u in users
                 if str(u.get("name") or "").strip()]
+    prefs: dict[str, list[str]] = {}
+    for user in users:
+        name = str(user.get("name") or "").strip()
+        allowed = parse_provider_ids(user.get("streaming_providers"))
+        if name and allowed is not None:
+            prefs[_slug(name)] = allowed
+    _provider_prefs = prefs
     return _targets
 
 
@@ -487,7 +528,7 @@ async def _discover_row(
 def _diversify_profile_rows(
         profile: dict, rows: dict[str, list[dict]], specs: list[dict],
         seed_date: str) -> None:
-    for provider in kids_catalogs.PROVIDERS:
+    for provider in _providers_for_profile(profile):
         first_seen: dict[str, dict[str, int]] = {"movie": {}, "series": {}}
         top_seen: dict[str, dict[str, int]] = {"movie": {}, "series": {}}
         for spec in specs:
@@ -538,7 +579,9 @@ def catalog_defs_for_user(user: dict) -> list[dict]:
     specs = _profile_specs(profile)
     namespace = private_namespace_for_user(user)
     defs = []
-    for provider in kids_catalogs.PROVIDERS:
+    # Filtered here as well as at build time so unticking a service takes it
+    # out of the manifest on the next fetch, rather than at the next build.
+    for provider in providers_for_user(user):
         for spec in specs:
             internal_id = _catalog_id(profile, provider, spec)
             # A stable collection slot must survive a temporarily empty daily
@@ -616,7 +659,8 @@ def collection_export(profile_id: str, *,
                       addon_id: str = config.PROFILE_STREAMING_ADDON_ID,
                       private_ids: bool = False,
                       private_namespace: str | None = None,
-                      collection_title: str | None = None) -> list[dict]:
+                      collection_title: str | None = None,
+                      providers: list[dict] | None = None) -> list[dict]:
     profile = _profile_for_id(profile_id)
     if not profile:
         return []
@@ -626,7 +670,8 @@ def collection_export(profile_id: str, *,
     if private_ids and not private_namespace:
         raise ValueError("private collection exports require a namespace")
     folders = []
-    for provider in kids_catalogs.PROVIDERS:
+    for provider in (providers if providers is not None
+                     else _providers_for_profile(profile)):
         sources = []
         for spec in specs:
             internal_id = _catalog_id(profile, provider, spec)
@@ -691,6 +736,7 @@ def collection_export_for_user(user: dict) -> list[dict]:
         private_ids=True,
         private_namespace=namespace,
         collection_title=f"{display_name} Streaming" if display_name else None,
+        providers=providers_for_user(user),
     )
 
 
@@ -779,7 +825,9 @@ async def build_profile(profile: dict) -> None:
     max_age = _profile_max_age(profile, taste)
 
     rows: dict[str, list[dict]] = {}
-    for provider in kids_catalogs.PROVIDERS:
+    # Unticked services are not discovered at all: the whole point of the
+    # switch is to stop spending TMDB calls on a service nobody subscribes to.
+    for provider in _providers_for_profile(profile):
         discovered = await asyncio.gather(
             *(_discover_row(provider, spec, taste, seed, max_age) for spec in specs))
         for spec, row in zip(specs, discovered):
@@ -849,7 +897,7 @@ def get_metas_for_user(user: dict, ctype: str,
     rows = ((state.get("profiles") or {}).get(profile_id) or {}).get("rows") or {}
     specs = _profile_specs(profile)
     namespace = private_namespace_for_user(user)
-    for provider in kids_catalogs.PROVIDERS:
+    for provider in providers_for_user(user):
         for spec in specs:
             current_id = _private_catalog_id(namespace, provider, spec, specs)
             legacy_id = _legacy_private_catalog_id(provider, spec, specs)

@@ -1,9 +1,9 @@
 import asyncio
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
-from app import picker, probe, sources
+from app import content_identity, picker, probe, sources
 
 
 def _stream(name, url):
@@ -17,7 +17,10 @@ def _sd_stream(name, url):
 
 
 class FastRaceTests(unittest.IsolatedAsyncioTestCase):
-    async def test_no_verified_fallback_exposes_no_unverified_candidates(self):
+    async def test_no_verified_fallback_exposes_nothing_at_all(self):
+        """Nuvio auto-plays the first thing it gets, so with nothing verified
+        the answer is no streams — not an unverified candidate, and not a
+        placeholder that would be played instead of the film."""
         candidate = _stream("UNVERIFIED", "https://unknown.example/video")
         background = {}
 
@@ -25,15 +28,16 @@ class FastRaceTests(unittest.IsolatedAsyncioTestCase):
             return None
 
         with (patch.object(picker, "_background", background),
-              patch.object(picker, "_finish_in_background", side_effect=finish)):
-            streams = picker._fast_checking_notice(
+              patch.object(picker, "_finish_in_background", side_effect=finish),
+              patch("app.picker.private_trackers.enabled", return_value=False)):
+            streams = await picker._fast_no_verified(
                 "full:movie:tt1234567", "movie", "tt1234567",
                 picker.PROFILES["full"], 7_200, [candidate])
+            self.assertIn("full:movie:tt1234567", background,
+                          "the finisher must keep verifying for the retry")
             await asyncio.gather(*background.values())
 
-        self.assertEqual(1, len(streams))
-        self.assertEqual("checking", streams[0][picker._NOTICE_STATE_KEY])
-        self.assertNotEqual(candidate["url"], streams[0]["url"])
+        self.assertEqual([], streams)
 
     async def test_fast_metadata_stage_leaves_time_for_byte_probe(self):
         race_started = asyncio.Event()
@@ -61,7 +65,8 @@ class FastRaceTests(unittest.IsolatedAsyncioTestCase):
               patch.object(picker, "_runtime_seconds",
                            side_effect=slow_metadata),
               patch.object(picker, "_race_fast", side_effect=race),
-              patch.object(picker, "_fast_checking_notice", return_value=[]),
+              patch.object(picker, "_fast_no_verified",
+                           new=AsyncMock(return_value=[])),
               patch.object(picker, "FAST_METADATA_BUDGET", 0.06),
               patch.object(picker, "TOTAL_DEADLINE", 0.25),
               patch.object(picker, "FAST_RACE_DEADLINE", 0.25)):
@@ -329,6 +334,38 @@ class FastRaceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(hd["url"], verified[0][0]["url"])
         self.assertLess(time.monotonic() - started, 1.0)   # did not wait 5s
 
+    async def test_a_lane_still_searching_can_still_beat_an_early_sd(self):
+        """Give slower lanes time to improve on a sub-1080p candidate."""
+        sd = _sd_stream("EARLY", "https://fast.example/sd")
+        hd = _stream("LATER", "https://slow.example/hd")
+
+        async def get(source, *_a, **_k):
+            if source == sources.EASYNEWS:
+                return [sd]
+            await asyncio.sleep(0.3)               # the debrid lane, a beat behind
+            return [hd]
+
+        async def fake_probe_race(candidates, *_a, outcomes=None, **_k):
+            return [(candidates[0], probe.ProbeResult(True, ttfb=0.05,
+                                                      speed_bps=20_000_000))]
+
+        started = time.monotonic()
+        with (patch("app.picker.sources.search_all",
+                    return_value=[sources.EASYNEWS, sources.FAST]),
+              patch("app.sources.get", side_effect=get),
+              patch("app.sources.peek", return_value=[]),
+              patch("app.picker.nzb_lane.in_progress", return_value=False),
+              patch("app.probe.probe_race", side_effect=fake_probe_race),
+              patch("app.reputation.blocked", return_value=False),
+              patch.object(picker, "FAST_VERIFIED_GRACE", 5)):
+            verified, _ = await picker._race_fast(
+                "movie", "tt1234567", picker.PROFILES["full"], 7200,
+                lambda _s: 1_000_000, started)
+
+        self.assertEqual(hd["url"], verified[0][0]["url"])
+        self.assertLess(time.monotonic() - started, 2.0,
+                        "the 1080p ends the race the moment it verifies")
+
     async def test_lone_low_res_source_is_served_without_burning_the_grace(self):
         """Plenty of older titles only ever have a 720p or an SD copy. That copy
         is the answer, not a consolation prize — with nothing better left to
@@ -360,62 +397,152 @@ class FastRaceTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(time.monotonic() - started, 1.0)
 
 
-class NothingFoundNoticeTests(unittest.IsolatedAsyncioTestCase):
-    """'Re-open in a few seconds' is a promise. Only make it when a retry can
-    actually deliver — otherwise say plainly that nothing exists."""
+class LateIdentityMetadataTests(unittest.IsolatedAsyncioTestCase):
+    """Dark S01E01: metadata missed the fast picker's 4 s budget, the lookup
+    was cancelled with it, and the request ran on the fail-closed profile —
+    dozens of good copies probed fine and none was allowed to lead, for 70+ s.
+    The lookup now survives the budget and the race adopts it on arrival."""
 
-    def _notice(self, pool, *, nzb=False, srcs=False, priv_running=False,
-                priv_enabled=False, priv_outcome=None):
-        # Plain callables, not AsyncMocks: with create_task stubbed out an
-        # AsyncMock's coroutine is never awaited and warns.
+    async def test_a_late_profile_verifies_what_already_played(self):
+        release = "DARK.S01E01.Secrets.2160p.NF.WEBRip.DDP5.1.x264-NTb.mkv"
+        good = {"name": "[TB⚡] Comet 2160p", "title": release,
+                "url": "https://dark.example/1",
+                "behaviorHints": {"filename": release}}
+        real = content_identity.IdentityProfile(
+            media="series", imdb_id="tt5753856", aliases=("Dark",),
+            years=frozenset({2017}), season=1, episode=1)
+
+        async def slow_metadata(media, media_id):
+            await asyncio.sleep(0.3)
+            return real
+
+        async def fake_probe_race(candidates, *_a, outcomes=None, **_k):
+            return [(candidates[0], probe.ProbeResult(
+                True, ttfb=0.01, speed_bps=20_000_000))]
+
+        with (patch.object(picker, "_profile_tasks", {}),
+              patch("app.picker.meta.identity_profile", side_effect=slow_metadata),
+              patch("app.picker.sources.search_all",
+                    return_value=[sources.FAST]),
+              patch("app.sources.get", return_value=[dict(good)]),
+              patch("app.sources.peek", return_value=[]),
+              patch("app.picker.nzb_lane.in_progress", return_value=False),
+              patch("app.probe.probe_race", side_effect=fake_probe_race),
+              patch("app.reputation.blocked", return_value=False),
+              patch("app.picker._set_anime_expectation", new=AsyncMock())):
+            started = time.monotonic()
+            await picker._resolve_identity_profile(
+                "series", "tt5753856:1:1", timeout=0.05)
+            self.assertEqual((), picker._identity_profile_ctx.get().aliases,
+                             "the budget lapsed: fail-closed stand-in first")
+            verified, _ = await picker._race_fast(
+                "series", "tt5753856:1:1", picker.PROFILES["full"], 3200,
+                lambda _s: 1_000_000, started)
+
+        self.assertEqual(good["url"], verified[0][0]["url"])
+        self.assertLess(time.monotonic() - started, 5)
+
+
+class NothingVerifiedAnswerTests(unittest.IsolatedAsyncioTestCase):
+    """What the fast lane says when nothing verified in its window. Nuvio
+    auto-plays the first thing either addon returns, so the only placeholder
+    allowed is a settled "nothing found" — everything else is silence until a
+    real stream exists, or the private trackers as the last option."""
+
+    async def _answer(self, pool, *, nzb=False, srcs=False, priv_running=False,
+                      priv_enabled=False, priv_outcome=None, priv_rows=()):
+        async def finish(*_a, **_k):
+            return None
+
+        async def last_resort(*_a, **_k):
+            return list(priv_rows)
+
+        async def found(*_a, **_k):
+            return []
+
         with (patch.object(picker, "_background", {}),
-              patch("app.picker._finish_in_background", lambda *a, **k: None),
+              patch.object(picker, "_cache", {}),
+              patch("app.picker._finish_in_background", side_effect=finish),
               patch("app.picker.nzb_lane.in_progress", return_value=nzb),
               patch("app.picker.sources.in_progress", return_value=srcs),
               patch("app.picker.private_trackers.search_in_progress",
                     return_value=priv_running),
               patch("app.picker.private_trackers.enabled",
                     return_value=priv_enabled),
-              patch("app.picker.private_trackers.candidates",
-                    lambda *a, **k: None),
+              patch("app.picker.private_trackers.candidates", side_effect=found),
               patch("app.picker.private_trackers.search_outcome",
                     lambda *a, **k: dict(priv_outcome or {})),
-              patch("asyncio.create_task", lambda *a, **k: None)):
-            rows = picker._fast_checking_notice(
+              patch("app.picker._private_last_resort", side_effect=last_resort)):
+            return await picker._fast_no_verified(
                 "k", "movie", "tt1", picker.PROFILES["full"], 7200, pool)
-        return rows[0][picker._NOTICE_STATE_KEY]
 
     async def test_says_nothing_found_when_every_lane_is_empty_and_idle(self):
-        self.assertEqual("not_found", self._notice([]))
+        rows = await self._answer([])
+        self.assertEqual("not_found", rows[0][picker._NOTICE_STATE_KEY])
 
-    async def test_says_checking_while_candidates_await_verification(self):
-        self.assertEqual("checking", self._notice([_stream("HD", "https://x/1")]))
+    async def test_silent_while_candidates_await_verification(self):
+        self.assertEqual([], await self._answer([_stream("HD", "https://x/1")]))
 
-    async def test_says_checking_while_a_usenet_mount_is_still_running(self):
-        self.assertEqual("checking", self._notice([], nzb=True))
+    async def test_silent_while_a_usenet_mount_is_still_running(self):
+        self.assertEqual([], await self._answer([], nzb=True))
 
-    async def test_says_checking_while_a_source_search_is_still_running(self):
-        self.assertEqual("checking", self._notice([], srcs=True))
+    async def test_silent_while_a_source_search_is_still_running(self):
+        self.assertEqual([], await self._answer([], srcs=True))
 
-    async def test_says_checking_while_private_trackers_are_searching(self):
-        self.assertEqual("checking", self._notice([], priv_running=True))
+    async def test_silent_while_private_trackers_are_searching(self):
+        self.assertEqual([], await self._answer(
+            [], priv_enabled=True, priv_running=True))
 
     async def test_empty_public_result_consults_private_before_giving_up(self):
-        # Private is enabled and nothing public exists: search it and keep the
-        # viewer on 'checking' rather than declaring failure untried.
-        self.assertEqual("checking", self._notice([], priv_enabled=True))
+        self.assertEqual([], await self._answer([], priv_enabled=True))
 
-    async def test_private_already_answered_empty_stops_the_checking_loop(self):
-        # The retry case. Re-launching a search that already answered would pin
-        # the title on 'checking' forever — the exact lie being removed.
-        for state in ("empty", "failed"):
-            with self.subTest(state=state):
-                self.assertEqual("not_found", self._notice(
-                    [], priv_enabled=True, priv_outcome={"state": state}))
+    async def test_private_empty_is_a_settled_nothing_found(self):
+        rows = await self._answer([], priv_enabled=True,
+                                  priv_outcome={"state": "empty"})
+        self.assertEqual("not_found", rows[0][picker._NOTICE_STATE_KEY])
 
-    async def test_private_that_found_releases_keeps_checking(self):
-        self.assertEqual("checking", self._notice(
-            [], priv_enabled=True, priv_outcome={"state": "ok", "count": 3}))
+    async def test_a_failed_private_search_is_not_an_answer(self):
+        self.assertEqual([], await self._answer(
+            [], priv_enabled=True, priv_outcome={"state": "failed"}))
+
+    async def test_private_releases_are_the_last_available_option(self):
+        row = {"name": "🔒 X · 1080p · Click to Download & Stream",
+               "url": "https://addon/private/t", "_private_tracker": True,
+               "_private_action": True}
+        rows = await self._answer([], priv_enabled=True,
+                                  priv_outcome={"state": "ok", "count": 1},
+                                  priv_rows=[row])
+        self.assertEqual([row], rows)
+
+    async def test_private_rows_never_jump_live_public_candidates(self):
+        row = {"name": "🔒", "url": "https://addon/private/t",
+               "_private_tracker": True}
+        self.assertEqual([], await self._answer(
+            [_stream("HD", "https://x/1")], priv_enabled=True,
+            priv_outcome={"state": "ok"}, priv_rows=[row]))
+
+
+class DisplayGateTests(unittest.TestCase):
+    """The single rule at the boundary: what may reach a player that
+    auto-plays whatever comes first."""
+
+    def _gate(self, streams, pending=False):
+        with patch.object(picker, "_work_pending", return_value=pending):
+            return picker._display_gate("k", "movie", "tt1", streams)
+
+    def test_transient_placeholders_never_leave_the_picker(self):
+        for kind in ("checking", "private_failed"):
+            with self.subTest(kind=kind):
+                self.assertEqual([], self._gate([picker._notice_stream(kind)]))
+
+    def test_settled_outcomes_are_reported(self):
+        for kind in ("not_found", "theatrical", "private_empty"):
+            with self.subTest(kind=kind):
+                rows = self._gate([picker._notice_stream(kind)])
+                self.assertEqual(kind, rows[0][picker._NOTICE_STATE_KEY])
+
+    def test_unverified_candidates_are_never_a_leader(self):
+        self.assertEqual([], self._gate([_stream("U", "https://x/u")]))
 
 
 class SufficiencyRuleTests(unittest.TestCase):

@@ -79,10 +79,26 @@ def _save() -> None:
         logger.debug("decode-health save failed", exc_info=True)
 
 
-def _keys(acodecs, vcodec) -> list[str]:
-    keys = [f"a:{a.lower()}" for a in (acodecs or []) if a]
+# One APK now runs on several televisions, and what they can decode differs.
+# A Shield refuses 10-bit AVC that an LG panel plays, so a strike learned on
+# one must not blind the others — the whole point of learning is to serve each
+# screen what it can actually show. Device-scoped records are therefore stored
+# under a prefixed key, and the unprefixed keys stay exactly what they were:
+# the shared record, used for players that identify themselves as nothing.
+#
+# Nothing is copied between the two. A shared strike is evidence about players
+# in general and a device strike is evidence about one box; merging them would
+# let a single bad television quietly retire a codec for the household.
+def _scope(device: str = "") -> str:
+    device = (device or "").strip().lower()[:64]
+    return f"d:{device}|" if device else ""
+
+
+def _keys(acodecs, vcodec, device: str = "") -> list[str]:
+    p = _scope(device)
+    keys = [f"{p}a:{a.lower()}" for a in (acodecs or []) if a]
     if vcodec:
-        keys.append(f"v:{vcodec.lower()}")
+        keys.append(f"{p}v:{vcodec.lower()}")
     return keys
 
 
@@ -99,11 +115,15 @@ def _bump(key: str, field: str, label: str = "") -> dict:
     return e
 
 
-def record_reject(acodecs, vcodec, label: str = "") -> None:
-    """A player-rejected file carried these codecs: strike each of them."""
+def record_reject(acodecs, vcodec, label: str = "", device: str = "") -> None:
+    """A player-rejected file carried these codecs: strike each of them.
+
+    `device` scopes the strike to one television. Omitted, it lands in the
+    shared record as before.
+    """
     with _lock:
         newly_bad = []
-        for k in _keys(acodecs, vcodec):
+        for k in _keys(acodecs, vcodec, device):
             e = _bump(k, "rejects", label)
             if e["rejects"] == BAD_REJECTS and not e.get("plays"):
                 newly_bad.append(k)
@@ -114,10 +134,14 @@ def record_reject(acodecs, vcodec, label: str = "") -> None:
                     f"— matching releases will rank below clean ones")
 
 
-def record_play(acodecs, vcodec) -> None:
-    """A file with these codecs reached real playback: credit each of them."""
+def record_play(acodecs, vcodec, device: str = "") -> None:
+    """A file with these codecs reached real playback: credit each of them.
+
+    A play is the only thing that clears a strike, so this is what lets a
+    device recover when a decoder is fixed or the earlier verdict was wrong.
+    """
     with _lock:
-        for k in _keys(acodecs, vcodec):
+        for k in _keys(acodecs, vcodec, device):
             _bump(k, "plays")
         _save()
 
@@ -136,15 +160,27 @@ def declared_keys(text: str) -> set[str]:
     return {key for rx, key in _DECLARED if rx.search(text or "")}
 
 
-def suspect(text: str, acodecs=(), vcodec: str = "") -> bool:
+def suspect(text: str, acodecs=(), vcodec: str = "", device: str = "") -> bool:
     """True when a stream carries a learned-undecodable attribute — by probe
-    sniff when available (authoritative), else by explicit name declaration."""
+    sniff when available (authoritative), else by explicit name declaration.
+
+    A known device is judged on its own record *and* the shared one: the shared
+    record is what every player contributed before device reporting existed,
+    and a codec no player has ever managed is not suddenly a good bet on a
+    television that has not tried it yet.
+    """
     bad = bad_keys()
     if not bad:
         return False
+    scopes = [""] if not device else ["", _scope(device)]
     if acodecs or vcodec:
-        return bool(set(_keys(acodecs, vcodec)) & bad)
-    return bool(declared_keys(text) & bad)
+        for scope in scopes:
+            keys = {f"{scope}{k}" for k in _keys(acodecs, vcodec)}
+            if keys & bad:
+                return True
+        return False
+    declared = declared_keys(text)
+    return any({f"{scope}{k}" for k in declared} & bad for scope in scopes)
 
 
 def clear(key: str) -> None:

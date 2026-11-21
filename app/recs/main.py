@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import datetime
 import html
 import json
 import logging
@@ -9,16 +10,16 @@ import time
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from app.recs import (bootstrap, config, db, dramas, kids_catalogs,
-                      movienight, playhistory, profile_streaming,
-                      watching)
-from app.recs.catalogs import generate_for_user
+from app.recs import (ai_search, bootstrap, config, db, dramas,
+                      kids_catalogs, movienight, playhistory,
+                      profile_streaming, trailers, watching, watchlist)
+from app.recs.catalogs import TOP_PICKS_ID, generate_for_user
 from app.recs.kids import birthdate_from_age, clamp_age, effective_kid_age
 from app.recs import scheduler
 
@@ -38,6 +39,12 @@ app.mount("/catalogs/kids-thumbnails",
           StaticFiles(directory=str(config.CATALOGS_DIR / "Kids Thumbnails"),
                       check_dir=False),
           name="kids-thumbnails")
+# Country flags and focus GIFs for the Asian Dramas collection. They came over
+# with the standalone service but its hostname did not, so nothing served them
+# between the fold-in and now.
+app.mount(dramas.STATIC_ROUTE,
+          StaticFiles(directory=str(dramas.config.STATIC_DIR), check_dir=False),
+          name="dramas-static")
 
 _scheduler_task: asyncio.Task | None = None
 _kids_task: asyncio.Task | None = None
@@ -45,9 +52,33 @@ _profile_streaming_task: asyncio.Task | None = None
 _dramas_task: asyncio.Task | None = None
 _watching_task: asyncio.Task | None = None
 _playhistory_task: asyncio.Task | None = None
+# Rebuilds started from request handlers. asyncio holds only a weak reference to
+# a running task, so one nobody keeps can be collected mid-build, and its
+# exception is otherwise reported at garbage collection, if at all.
+_background: set[asyncio.Task] = set()
+
+
+def _spawn(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _background.add(task)
+    task.add_done_callback(_reaped)
+    return task
+
+
+def _reaped(task: asyncio.Task) -> None:
+    _background.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        logger.error("recs: background task failed",
+                     exc_info=task.exception())
 CONFIGURE_HTML = (Path(__file__).parent / "templates" / "configure.html").read_text()
-BOOTSTRAP_HTML = (Path(__file__).parent / "templates" / "bootstrap.html").read_text()
-MOVIE_NIGHT_HTML = (Path(__file__).parent / "templates" / "movienight.html").read_text()
+# Trailer playback is identical on both card pages and is the one thing on them
+# that must not drift, so it lives once and is folded into each. See the
+# fragment's own header for why these pages stay single documents.
+_TRAILER_HTML = (Path(__file__).parent / "templates" / "_trailer.html").read_text()
+BOOTSTRAP_HTML = (Path(__file__).parent / "templates" / "bootstrap.html"
+                  ).read_text().replace("__TRAILER__", _TRAILER_HTML)
+MOVIE_NIGHT_HTML = (Path(__file__).parent / "templates" / "movienight.html"
+                    ).read_text().replace("__TRAILER__", _TRAILER_HTML)
 LANDING_HTML = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -74,6 +105,8 @@ async def startup() -> None:
     _watching_task = asyncio.create_task(watching.run())
     playhistory.install()
     _playhistory_task = asyncio.create_task(playhistory.run())
+    if config.AI_SEARCH_ENABLED:
+        _spawn(ai_search.warm_up())
 
 
 @app.on_event("shutdown")
@@ -115,10 +148,23 @@ def _check_setup_secret(secret: str) -> None:
         raise HTTPException(404)
 
 
-def _streaming_collection_url(user: dict) -> str | None:
-    if not profile_streaming.catalog_defs_for_user(user):
+def _collection_export(user: dict) -> list[dict]:
+    """Every Nuvio collection this viewer can import, in one file.
+
+    Streaming and dramas are separate opt-ins but they land in the same
+    download: they are all backed by the one private Daily Picks addon, so
+    splitting them would only mean importing two files that name the same
+    manifest id.
+    """
+    return (profile_streaming.collection_export_for_user(user)
+            + dramas.collection_export_for_user(
+                user, profile_streaming.private_addon_id_for_user(user)))
+
+
+def _collection_url(user: dict) -> str | None:
+    if not _collection_export(user):
         return None
-    return f"{config.HOST_NAME}/{user['token']}/streaming-collection.json"
+    return f"{config.HOST_NAME}/{user['token']}/collections.json"
 
 
 def _lane_urls(token: str) -> list[dict]:
@@ -156,7 +202,7 @@ def _queue_profile_streaming_build(user: dict) -> bool:
     profile_id = profile_streaming.profile_id_for_user(user)
     if not profile_id:
         return False
-    asyncio.create_task(profile_streaming.build(profile_id))
+    _spawn(profile_streaming.build(profile_id))
     return True
 
 
@@ -204,14 +250,14 @@ async def create_viewer(secret: str, body: NewViewerBody):
     await db.update_preferences(
         token, preferred_media, max(0, min(100, body.adventurousness)))
     user = await db.get_user(token)
-    asyncio.create_task(generate_for_user(user, trigger="signup"))
+    _spawn(generate_for_user(user, trigger="signup"))
     _queue_profile_streaming_build(user)
     logger.info(f"new viewer '{name}' -> token {token[:8]}…")
     return {
         "status": "ok",
         "token": token,
         "manifest_url": _manifest_url(token),
-        "streaming_collection_url": _streaming_collection_url(user),
+        "collection_url": _collection_url(user),
         "collection_filename": collection_filename(user),
         "streaming_profile_configured": bool(
             profile_streaming.profile_id_for_user(user)),
@@ -240,8 +286,18 @@ async def list_users(secret: str):
             "adventurousness": u.get("adventurousness", 30),
             "continue_watching_row": bool(u.get("continue_watching_row")),
             "watch_history_row": bool(u.get("watch_history_row")),
+            "watchlist_row": bool(u.get(watchlist.WATCHLIST_FLAG)),
             "streaming_catalogs_row": bool(u.get("streaming_catalogs_row")),
             "asian_dramas_row": bool(u.get("asian_dramas_row")),
+            # Every service the catalogue knows, each marked on or off for this
+            # viewer, so the builder can draw the switches without duplicating
+            # the provider list client-side.
+            "streaming_providers": [
+                {"id": p["id"], "title": p["title"],
+                 "on": p["id"] in {q["id"]
+                                   for q in profile_streaming.providers_for_user(u)}}
+                for p in kids_catalogs.PROVIDERS
+            ],
             "catalogs": len(defs),
             "last_generated_at": u["last_generated_at"],
             "last_served_at": u.get("last_served_at"),
@@ -253,14 +309,12 @@ async def list_users(secret: str):
             "manifest_url": _manifest_url(u["token"]),
             "streaming_catalogs": len(streaming_defs),
             "streaming_profile_configured": streaming_configured,
-            "streaming_collection_url": (
-                f"{config.HOST_NAME}/{u['token']}/streaming-collection.json"
-                if streaming_defs else None
-            ),
+            "collection_url": _collection_url(u),
             "collection_filename": collection_filename(u),
             "lane_urls": _lane_urls(u["token"]),
             "taste_url": f"{config.HOST_NAME}/{u['token']}/taste",
             "taste_rated": verdicts.get("liked", 0) + verdicts.get("disliked", 0),
+            "taste_saved": await db.watchlist_count(u["token"]),
         })
     return {"users": out}
 
@@ -285,6 +339,7 @@ class WatchingBody(BaseModel):
 # families that used to be separate addons or an env list.
 ROW_FAMILIES = {
     **{row_id: column for row_id, (_name, column) in watching.ROWS.items()},
+    watchlist.WATCHLIST_ID: watchlist.WATCHLIST_FLAG,
     "streaming-catalogs": "streaming_catalogs_row",
     "asian-dramas": "asian_dramas_row",
 }
@@ -302,6 +357,7 @@ async def admin_update_watching(secret: str, token: str, body: WatchingBody):
     # refetches the manifest, so drop any built rows rather than leaving a
     # disabled user's data cached.
     watching.invalidate(token)
+    watchlist.invalidate(token)
     user = await db.get_user(token)
     if column == "streaming_catalogs_row":
         # This one has prebuilt per-viewer rows behind it, so a fresh tick has
@@ -311,6 +367,35 @@ async def admin_update_watching(secret: str, token: str, body: WatchingBody):
             _queue_profile_streaming_build(user)
     return {"status": "ok", "row": body.row, "enabled": body.enabled,
             "manifest_url": _manifest_url(user["token"])}
+
+
+class StreamingProviderBody(BaseModel):
+    provider: str
+    enabled: bool
+
+
+@app.post("/setup/{secret}/api/streaming-provider/{token}")
+async def admin_update_streaming_provider(secret: str, token: str,
+                                          body: StreamingProviderBody):
+    _check_setup_secret(secret)
+    user = await _require_user(token)
+    known = {p["id"] for p in kids_catalogs.PROVIDERS}
+    if body.provider not in known:
+        raise HTTPException(422, f"unknown streaming provider: {body.provider}")
+    current = {p["id"] for p in profile_streaming.providers_for_user(user)}
+    current.add(body.provider) if body.enabled else current.discard(body.provider)
+    # Store the full list even when it happens to be everything: a viewer who
+    # has touched the switches has a preference, and should not silently gain a
+    # service that gets added to the catalogue later.
+    await db.update_streaming_providers(
+        token, [p["id"] for p in kids_catalogs.PROVIDERS if p["id"] in current])
+    user = await db.get_user(token)
+    await profile_streaming.refresh_targets()
+    # Newly ticked services have no rows built for them yet; already-built ones
+    # are left alone, so unticking is instant and costs nothing.
+    if body.enabled:
+        _queue_profile_streaming_build(user)
+    return {"status": "ok", "provider": body.provider, "enabled": body.enabled}
 
 
 @app.post("/setup/{secret}/api/kid/{token}")
@@ -330,7 +415,7 @@ async def admin_update_kid(secret: str, token: str, body: KidBody):
         await db.update_kid(token, body.is_kid, None, None)
     user = await db.get_user(token)
     # filtering changed, so rebuild this user's catalogs right away
-    asyncio.create_task(generate_for_user(user, trigger="kid-settings"))
+    _spawn(generate_for_user(user, trigger="kid-settings"))
     _queue_profile_streaming_build(user)
     return {"status": "ok", "is_kid": bool(user["is_kid"]),
             "kid_age": effective_kid_age(user)}
@@ -346,7 +431,7 @@ async def admin_update_preferences(secret: str, token: str, body: PreferenceBody
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
     user = await db.get_user(token)
-    asyncio.create_task(generate_for_user(user, trigger="taste-settings"))
+    _spawn(generate_for_user(user, trigger="taste-settings"))
     return {
         "status": "ok",
         "preferred_media": user["preferred_media"],
@@ -358,7 +443,7 @@ async def admin_update_preferences(secret: str, token: str, body: PreferenceBody
 async def admin_refresh(secret: str, token: str):
     _check_setup_secret(secret)
     user = await _require_user(token)
-    asyncio.create_task(generate_for_user(user, trigger="admin-refresh"))
+    _spawn(generate_for_user(user, trigger="admin-refresh"))
     _queue_profile_streaming_build(user)
     return {"status": "refreshing"}
 
@@ -396,10 +481,7 @@ async def status(token: str):
         "last_error": user["last_error"],
         "streaming_catalogs": len(streaming_defs),
         "streaming_profile_configured": streaming_configured,
-        "streaming_collection_url": (
-            f"{config.HOST_NAME}/{token}/streaming-collection.json"
-            if streaming_defs else None
-        ),
+        "collection_url": _collection_url(user),
         "collection_filename": collection_filename(user),
     }
 
@@ -459,7 +541,7 @@ async def kids_collection():
 @app.post("/kids/refresh")
 @app.get("/kids/refresh")
 async def kids_refresh():
-    asyncio.create_task(kids_catalogs.build())
+    _spawn(kids_catalogs.build())
     return {"status": "rebuilding"}
 
 
@@ -537,12 +619,13 @@ def _attachment(payload: dict, filename: str) -> Response:
     )
 
 
-@app.get("/{token}/streaming-collection.json")
-async def private_streaming_collection(token: str):
+@app.get("/{token}/collections.json")
+@app.get("/{token}/streaming-collection.json")   # pre-dramas name, still linked
+async def private_collections(token: str):
     user = await _require_user(token)
-    payload = profile_streaming.collection_export_for_user(user)
+    payload = _collection_export(user)
     if not payload:
-        raise HTTPException(404, "Streaming collection is not ready for this user")
+        raise HTTPException(404, "No collections are ready for this user")
     return _attachment(payload, collection_filename(user))
 
 
@@ -560,15 +643,18 @@ async def manifest(token: str):
         }
         for catalog in home_catalogs
     ]
-    # Continue Watching, then Watch History, then the nightly slate. These are
-    # pinned in the serving layer rather than the builder because they are
-    # rebuilt per request, so they can never be part of a stored generation.
-    catalogs = watching.catalog_defs(user) + catalogs
+    # Continue Watching, then Watch History, then Want to Watch, then the
+    # nightly slate. These are pinned in the serving layer rather than the
+    # builder because they are rebuilt per request, so they can never be part
+    # of a stored generation.
+    catalogs = (watching.catalog_defs(user) + watchlist.catalog_defs(user)
+                + catalogs)
     # Nuvio resolves Collection sources through descriptors on the installed
     # addon's manifest. TV honors showInHome=false; Mobile uses the descriptor's
     # required one-value genre extra. The private definitions carry both guards.
     catalogs.extend(profile_streaming.catalog_defs_for_user(user))
     catalogs.extend(dramas.catalog_defs_for_user(user))
+    catalogs.extend(ai_search.catalog_defs(user))
     # The combined type leads because it is this addon's primary content type:
     # the opening rows are all mixed movie+series. Note this does NOT control
     # where rows land on the home screen — that was tested and disproved, since
@@ -593,9 +679,67 @@ async def manifest(token: str):
     }
 
 
+# Profiles whose slate is being rebuilt because their viewer opened the app.
+_open_refreshing: set[str] = set()
+
+
+def _refresh_if_stale(user: dict) -> None:
+    """Rebuild a stale slate in the background when its viewer shows up.
+
+    The nightly job skips profiles nobody opened (see scheduler), so this is
+    how an occasional viewer's picks catch up: the request that noticed is
+    answered from the slate already stored, and the rebuild lands for the
+    next visit. One rebuild per profile at a time.
+    """
+    token = user["token"]
+    generated = user.get("last_generated_at") or 0
+    if token in _open_refreshing:
+        return
+    if time.time() - generated < config.OPEN_REFRESH_AFTER_HOURS * 3600:
+        return
+    _open_refreshing.add(token)
+
+    async def rebuild():
+        try:
+            await generate_for_user(user, trigger="open-stale")
+        finally:
+            _open_refreshing.discard(token)
+
+    _spawn(rebuild())
+
+
+async def _note_top_picks_seen(token: str, page: list[dict]) -> None:
+    """Count today as a viewing day for the cards at the front of the page.
+
+    Measurement: it must never make serving fail.
+    """
+    seen = [m.get("id") for m in page[:config.TOP_PICKS_SEEN_POSITIONS]
+            if m.get("id")]
+    try:
+        rested = await db.record_top_picks_seen(
+            token, seen, day=datetime.date.today().isoformat(),
+            turn_days=config.TOP_PICKS_TURN_DAYS,
+            rest_days=config.TOP_PICKS_REST_DAYS)
+    except Exception as exc:
+        logger.warning("top picks turn ledger failed: %s", exc)
+        return
+    if rested:
+        logger.info("[%s] top picks: %d title(s) finished their turn and rest "
+                    "for %d days", token[:8], len(rested),
+                    config.TOP_PICKS_REST_DAYS)
+
+
 async def _serve_catalog(token: str, ctype: str, catalog_id: str,
-                         skip: int = 0, genre: str | None = None):
+                         skip: int = 0, genre: str | None = None,
+                         search: str | None = None):
     user = await _require_user(token)
+    if ai_search.is_ai_search_catalog_id(catalog_id):
+        if not search:
+            return {"metas": []}
+        metas = await ai_search.search(
+            token, search, kid_age=effective_kid_age(user))
+        return {"metas": metas[skip:skip + max(1, config.CATALOG_PAGE_SIZE)]}
+    _refresh_if_stale(user)
     page_size = max(1, config.CATALOG_PAGE_SIZE)
     if watching.is_watching_catalog_id(catalog_id):
         # Built live, so it is never in the stored catalogs table. Deliberately
@@ -603,6 +747,14 @@ async def _serve_catalog(token: str, ctype: str, catalog_id: str,
         # backlog, and counting a resume as an assisted discovery would make
         # the recommendation measurements flatter.
         metas = await watching.get_metas(user, catalog_id)
+        return {"metas": metas[skip:skip + page_size]}
+
+    if watchlist.is_watchlist_catalog_id(catalog_id):
+        # Live for the same reason, and outside the outcome ledger for the same
+        # reason: a viewer opening the shelf they stocked themselves is not an
+        # assisted discovery, and counting it as one would flatter every
+        # recommendation measurement.
+        metas = await watchlist.get_metas(user)
         return {"metas": metas[skip:skip + page_size]}
 
     if dramas.is_drama_catalog_id(catalog_id):
@@ -625,6 +777,10 @@ async def _serve_catalog(token: str, ctype: str, catalog_id: str,
     metas = await db.get_catalog_metas(token, ctype, catalog_id)
     if metas is None:
         return {"metas": []}
+    if catalog_id == TOP_PICKS_ID:
+        # Served whole: the row was made longer so that more is there, and a
+        # second page only arrives if the player asks for one.
+        page_size = max(page_size, len(metas))
     page = metas[skip:skip + page_size]
     # Record row delivery without claiming that Nuvio's prefetch means the user
     # actually saw every card. An empty pagination probe is not a delivery and
@@ -637,6 +793,8 @@ async def _serve_catalog(token: str, ctype: str, catalog_id: str,
             logger.warning("delivery ledger failed for %s/%s: %s",
                            ctype, catalog_id, exc)
             await db.mark_served(token)
+        if catalog_id == TOP_PICKS_ID and skip == 0:
+            await _note_top_picks_seen(token, page)
     return {"metas": page}
 
 
@@ -656,14 +814,16 @@ async def catalog_extra(token: str, ctype: str, catalog_id: str, extra: str):
     # which is how they stay hidden from the home screen while remaining
     # reachable from an imported collection.
     genre = (params.get("genre") or [None])[0]
-    return await _serve_catalog(token, ctype, catalog_id, skip=skip, genre=genre)
+    search = (params.get("search") or [None])[0]
+    return await _serve_catalog(
+        token, ctype, catalog_id, skip=skip, genre=genre, search=search)
 
 
 @app.post("/{token}/refresh")
 @app.get("/{token}/refresh")
 async def refresh(token: str):
     user = await _require_user(token)
-    asyncio.create_task(generate_for_user(user, trigger="manual-refresh"))
+    _spawn(generate_for_user(user, trigger="manual-refresh"))
     _queue_profile_streaming_build(user)
     return {"status": "refreshing"}
 
@@ -729,7 +889,72 @@ async def taste_deck(token: str, body: DeckRequest):
                                          private_namespace_for_user(user))
     seen.update(i for i in body.have if i)
     cards = await bootstrap.deck(user, seen)
+    # Recorded as they go out, not as they are answered. Most of a deck is
+    # never answered — people close the tab — and those are exactly the cards
+    # that were being dealt again on the next visit.
+    try:
+        await db.record_dealt(token, [c["id"] for c in cards])
+    except Exception:
+        logger.exception("could not record dealt cards for %s", token[:8])
     return {"cards": cards, "progress": await bootstrap.progress(token)}
+
+
+@app.get("/{token}/taste/api/trailer/{media}/{tmdb_id}")
+async def taste_trailer(token: str, media: str, tmdb_id: int):
+    """Whether this title has a trailer, and where to play it from.
+
+    Resolved on tap rather than dealt with the card: a deck is 24 cards and
+    this is a TMDB round trip each, so doing it up front would cost every
+    session 24 requests to answer a question about the two or three posters
+    anybody actually presses.
+    """
+    await _require_user(token)
+    key = await trailers.key_for(media, tmdb_id)
+    if not key:
+        return {"trailer": None}
+    return {"trailer": f"/{token}/taste/api/trailer-video/{key}.mp4"}
+
+
+async def _trailer_response(key: str, request: Request) -> StreamingResponse:
+    """The trailer itself, as a plain MP4 this service serves.
+
+    Not a redirect: the extracted URL is locked to *this machine's* address, so
+    handing it to a phone is a 403 as soon as the phone is on mobile data. See
+    `app/recs/trailers.py` for why it is not an embed either.
+
+    Shared by the taste page and movie night, which authenticate differently
+    and must go on doing so — a movie-night seat is deliberately not a viewer
+    token. Only the byte-shifting is common.
+    """
+    if not trailers.KEY_RE.match(key):
+        raise HTTPException(400, "not a video id")
+    upstream, client = await trailers.open_stream(key, dict(request.headers))
+    if not upstream:
+        raise HTTPException(502, "trailer unavailable")
+
+    async def body():
+        try:
+            async for chunk in upstream.aiter_raw():
+                yield chunk
+        finally:
+            await upstream.aclose()
+            await client.aclose()
+
+    return StreamingResponse(
+        body(), status_code=upstream.status_code,
+        headers=trailers.response_headers(upstream),
+        media_type=upstream.headers.get("content-type", "video/mp4"))
+
+
+# A path of its own rather than a child of the route above. Sharing a prefix
+# made `/trailer/<key>/video.mp4` match `/trailer/{media}/{tmdb_id}` first, so
+# every playback request was a 422 from trying to read "video.mp4" as an
+# integer. Route order would fix it and would go on being one edit away from
+# breaking again.
+@app.get("/{token}/taste/api/trailer-video/{key}.mp4")
+async def taste_trailer_video(token: str, key: str, request: Request):
+    await _require_user(token)
+    return await _trailer_response(key, request)
 
 
 class Verdict(BaseModel):
@@ -741,10 +966,18 @@ class Verdict(BaseModel):
 @app.post("/{token}/taste/api/verdict")
 async def taste_verdict(token: str, body: Verdict):
     await _require_user(token)
-    if body.verdict not in db.VERDICTS:
+    if body.verdict not in db.VERDICTS and body.verdict != bootstrap.SAVE_VERDICT:
         raise HTTPException(400, "unknown verdict")
     media_type = "movie" if body.type == "movie" else "series"
-    await db.record_feedback(token, body.id, media_type, body.verdict)
+    if body.verdict == bootstrap.SAVE_VERDICT:
+        # Not a verdict, and deliberately not written as one: `taste_feedback`
+        # replaces on conflict and every reader of it treats a row as "already
+        # seen, keep it out of the rows". A save has to survive being rated
+        # later, and has to stay recommendable. See `taste_watchlist`.
+        await db.add_to_watchlist(token, body.id, media_type)
+        watchlist.invalidate(token)
+    else:
+        await db.record_feedback(token, body.id, media_type, body.verdict)
     state = await bootstrap.progress(token)
     # Nobody presses "done" — they close the tab. So the rebuild has to happen
     # on its own, at intervals, or a session's work would sit unused until the
@@ -752,7 +985,7 @@ async def taste_verdict(token: str, body: Verdict):
     if bootstrap.should_rebuild(state["rated"]):
         user = await db.get_user(token)
         if user:
-            asyncio.create_task(
+            _spawn(
                 generate_for_user(user, trigger="taste-bootstrap"))
             state["rebuilding"] = True
     return {"progress": state}
@@ -766,7 +999,7 @@ async def taste_done(token: str):
     user = await _require_user(token)
     state = await bootstrap.progress(token)
     if state["rated"]:
-        asyncio.create_task(generate_for_user(user, trigger="taste-bootstrap"))
+        _spawn(generate_for_user(user, trigger="taste-bootstrap"))
     return {"status": "ok", "progress": state}
 
 
@@ -848,6 +1081,24 @@ class MatchVote(BaseModel):
 async def movie_night_vote(seat_key: str, body: MatchVote):
     seat = await _require_seat(seat_key)
     return await movienight.vote(seat, body.id, body.want)
+
+
+# Trailers on the seat's own authority. A seat key is deliberately not a viewer
+# token — a guest gets no access to anybody's profile — so these cannot reuse
+# the taste page's routes, and holding a seat must not become a way in.
+@app.get("/night/{seat_key}/trailer/{media}/{tmdb_id}")
+async def movie_night_trailer(seat_key: str, media: str, tmdb_id: int):
+    await _require_seat(seat_key)
+    key = await trailers.key_for(media, tmdb_id)
+    if not key:
+        return {"trailer": None}
+    return {"trailer": f"/night/{seat_key}/trailer-video/{key}.mp4"}
+
+
+@app.get("/night/{seat_key}/trailer-video/{key}.mp4")
+async def movie_night_trailer_video(seat_key: str, key: str, request: Request):
+    await _require_seat(seat_key)
+    return await _trailer_response(key, request)
 
 
 @app.get("/health")

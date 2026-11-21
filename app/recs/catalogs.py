@@ -106,8 +106,19 @@ EXPLORE_ROW_PAGES = 3
 # slots instead of blocking the seeds behind it. Ten seeds at twelve
 # candidates each gives the selector roughly four times the row to choose
 # from, which is what makes the diversity pressure meaningful.
-TOP_PICKS_SEED_COUNT = 10
-TOP_PICKS_PER_SEED = 12
+# Sized for a 50-card row that rests titles after their turn: ten seeds of
+# twelve filled a 30-card row with nothing held back.
+TOP_PICKS_SEED_COUNT = 14
+TOP_PICKS_PER_SEED = 18
+# A title partway through its turn steps back this much per day already seen,
+# so a card nobody has picked yet moves ahead of one shown twice. Every play
+# credited to Top Picks so far came on day one or two of a title's stretch.
+TOP_PICKS_NOVELTY_STEP = 0.06
+# The genres a variety card may come from: ones this viewer has watched with
+# at least this share of their favourite genre's engagement, outside the top
+# TOP_PICKS_CORE_GENRES.
+TOP_PICKS_VARIETY_MIN_AFFINITY = 0.15
+TOP_PICKS_CORE_GENRES = 3
 
 # Candidate generation from the fingerprint. Seeds can only reach what TMDB
 # already lists as similar to something watched; these sweep the catalogue by
@@ -251,6 +262,10 @@ class Generator:
         self.rated_titles: set[str] = set()
         self.used_imdb: set[str] = set()
         self.recently_shown: dict[str, int] = {}
+        # Top Picks turns (db.top_picks_turns): titles resting until a time,
+        # and titles partway through a turn with the days already seen.
+        self.top_picks_resting: dict[str, int] = {}
+        self.top_picks_seen: dict[str, int] = {}
         self.pinned_rows = 0
         # Opaque per-viewer key that play_history is written under.
         from app.recs.profile_streaming import private_namespace_for_user
@@ -897,6 +912,11 @@ class Generator:
     async def run(self) -> None:
         self.recently_shown = await db.get_recently_shown(self.token)
         try:
+            self.top_picks_resting, self.top_picks_seen = \
+                await db.top_picks_turns(self.token)
+        except Exception:
+            logger.exception(f"[{self.token[:8]}] top picks turns unreadable")
+        try:
             self.rated_titles = {
                 imdb_id for imdb_id, entry in
                 (await db.feedback_for(self.token)).items()
@@ -1148,7 +1168,9 @@ class Generator:
                 continue
             if not self.taste.may_seed(signal):
                 continue
-            by_media[media_type].append((self.taste.seed_rank(signal), seed))
+            by_media[media_type].append(
+                (self.taste.seed_rank(signal) * self._seed_recency(signal),
+                 seed))
         for ranked in by_media.values():
             ranked.sort(key=lambda item: item[0], reverse=True)
 
@@ -1171,6 +1193,37 @@ class Generator:
         out = [(seed, rank / top) for rank, seed in chosen]
         out.sort(key=lambda item: item[1], reverse=True)
         return out
+
+    def _seed_recency(self, signal) -> float:
+        """How much a seed's recency counts for, SEED_RECENCY_FLOOR..1.
+
+        What someone is watching now says more about their next click than
+        what they finished a year ago — but only as a tilt on engagement,
+        never instead of it: recency alone was the old rule, and it built the
+        row out of whatever had last been opened, however little of it was
+        watched. Age is measured from the viewer's own latest play, so an
+        occasional visitor's last visit is their recent past rather than all
+        of it looking equally stale.
+        """
+        latest = self._latest_play_at()
+        if not latest:
+            return 1.0
+        played = getattr(signal, "last_played_at", 0) or 0
+        floor = config.SEED_RECENCY_FLOOR
+        if not played:
+            return floor
+        age_days = max(0.0, (latest - played) / 86400.0)
+        half_life = max(1.0, config.SEED_RECENCY_HALF_LIFE_DAYS)
+        return floor + (1.0 - floor) * 0.5 ** (age_days / half_life)
+
+    def _latest_play_at(self) -> int:
+        cached = getattr(self, "_latest_play_cache", None)
+        if cached is None:
+            signals = getattr(self.taste, "signals", None) or {}
+            cached = max((getattr(s, "last_played_at", 0) or 0
+                          for s in signals.values()), default=0)
+            self._latest_play_cache = cached
+        return cached
 
     def _pick_score(self, meta: dict, seed_strength: float, order: float,
                     affinity: dict[str, float],
@@ -1421,6 +1474,10 @@ class Generator:
                      if self.feature_store.get(imdb_id)}
 
         candidates: list[taste.Candidate] = []
+        # Titles resting after a turn (see config.TOP_PICKS_TURN_DAYS). Held
+        # out of the row, and used only if it cannot otherwise be filled —
+        # and then last, behind every card that counts as seen.
+        resting: list[taste.Candidate] = []
         seen: set[str] = set()
         for seed_id, strength, metas in sources:
             for position, meta in enumerate(metas):
@@ -1438,42 +1495,93 @@ class Generator:
                     continue
                 seen.add(imdb_id)
                 order = 1.0 - position / float(max(1, len(metas)))
-                candidates.append(taste.Candidate(
+                score = self._pick_score(meta, strength, order, affinity,
+                                         lifts.get(imdb_id))
+                days_seen = self.top_picks_seen.get(imdb_id, 0)
+                score *= max(0.0, 1.0 - TOP_PICKS_NOVELTY_STEP * days_seen)
+                candidate = taste.Candidate(
                     imdb_id=imdb_id,
                     media_type=("movie" if meta.get("type") == "movie"
                                 else "series"),
-                    score=self._pick_score(meta, strength, order, affinity,
-                                           lifts.get(imdb_id)),
+                    score=score,
                     genres=genres,
                     seed_id=seed_id,
                     meta=meta,
                     explore_score=self._explore_score(meta, lifts.get(imdb_id)),
-                ))
-        if len(candidates) < 5:
+                )
+                if imdb_id in self.top_picks_resting:
+                    resting.append(candidate)
+                else:
+                    candidates.append(candidate)
+        if len(candidates) + len(resting) < 5:
             return None
         # No exploration budget here. Departures used to be mixed into this
         # row and it was the wrong container: unlabelled, a Godfather sitting
         # at position 25 between two anime reads as the ranker being wrong
         # rather than as an offer. They live in their own named row now, which
         # costs one flick to skip and says what it is.
+        limit = config.TOP_PICKS_ITEMS
+        core, variety = self._variety_genres(affinity)
         chosen = taste.select_diverse(
-            candidates, ROW_TARGET_ITEMS, rng=self.rng,
+            candidates, limit, rng=self.rng,
             movie_share=self._movie_share(),
-            target_genres=self.taste.genre_target(context) if self.taste else None)
-        combined = [c.meta for c in chosen]
-        if len(combined) < 5:
+            target_genres=self.taste.genre_target(context) if self.taste else None,
+            variety_every=config.TOP_PICKS_VARIETY_EVERY,
+            variety_genres=variety, core_genres=core)
+        backfilled = 0
+        if len(chosen) < limit and resting:
+            resting.sort(key=lambda c: c.score, reverse=True)
+            backfill = resting[:limit - len(chosen)]
+            backfilled = len(backfill)
+            chosen = chosen + backfill
+        if len(chosen) < 5:
             return None
+        combined = []
+        for c in chosen:
+            # A copy: resolved metas can be shared through the metadata cache,
+            # and provenance belongs to this build alone. The ledger reads it;
+            # serving strips it (db._served_meta).
+            meta = dict(c.meta)
+            meta["_measurement"] = {
+                "seed_content_id": c.seed_id or None,
+                "rank_score": round(c.score, 4),
+                "score_components": {
+                    "lift": (round(lifts[c.imdb_id], 3)
+                             if c.imdb_id in lifts else None),
+                    "days_seen": self.top_picks_seen.get(c.imdb_id, 0),
+                    "variety": c.variety,
+                    "resting": c.imdb_id in self.top_picks_resting,
+                },
+            }
+            combined.append(meta)
         contributing = len({c.seed_id for c in chosen})
         swept_in = sum(1 for c in chosen if c.seed_id in swept_sources)
         scored = sum(1 for c in chosen if c.imdb_id in lifts)
-        explored = sum(1 for c in chosen if c.explore_score > 0)
+        varied = sum(1 for c in chosen if c.variety)
         logger.info(f"[{self.token[:8]}] top picks: {len(combined)} items from "
                     f"{contributing}/{len(sources)} sources "
-                    f"({len(candidates)} candidates; {swept_in} swept by "
-                    f"fingerprint, {scored} lift-scored, {explored} exploratory)")
+                    f"({len(candidates)} candidates, {len(resting)} resting"
+                    f"{f', {backfilled} backfilled' if backfilled else ''}; "
+                    f"{swept_in} swept by fingerprint, {scored} lift-scored, "
+                    f"{varied} variety)")
         self.used_imdb.update(m["id"] for m in combined)
         return {"id": TOP_PICKS_ID, "type": config.COMBINED_TYPE,
                 "name": "Top Picks", "metas": combined}
+
+    @staticmethod
+    def _variety_genres(affinity: dict[str, float]) -> tuple[set[str], set[str]]:
+        """(core genres, genres a variety card may come from).
+
+        Core is the viewer's top few genres by engagement. A variety card comes
+        from the next ones down — genres they have genuinely watched, just not
+        most — which is what keeps it a likely click rather than a departure.
+        Departures have their own named row (the explore row).
+        """
+        ranked = sorted(affinity.items(), key=lambda kv: kv[1], reverse=True)
+        core = {slug for slug, _ in ranked[:TOP_PICKS_CORE_GENRES]}
+        variety = {slug for slug, value in ranked[TOP_PICKS_CORE_GENRES:]
+                   if value >= TOP_PICKS_VARIETY_MIN_AFFINITY}
+        return core, variety
 
     async def _because_you_watched(self) -> None:
         seeds = [s for s in self.profile["seeds"] if s.get("tmdb")]

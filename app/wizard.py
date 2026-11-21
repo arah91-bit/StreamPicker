@@ -179,7 +179,7 @@ def stremthru_url(debrids: list[tuple[str, str]],
     cfg = {"indexers": None, "stores": stores, "cached": True}
     b64 = (base64.urlsafe_b64encode(
         json.dumps(cfg, separators=(",", ":")).encode())
-        .decode().rstrip("="))
+        .decode())        # padded: StremThru rejects unpadded (see debrid)
     return f"{base.rstrip('/')}/stremio/torz/{b64}"
 
 

@@ -50,8 +50,8 @@ from urllib.parse import urlsplit
 import httpx
 
 from app import (acquire, anime, candidate_health, content_identity,
-                 decode_health, library, meta, private_trackers, probe,
-                 reputation, source_health, sources, tbcache, telemetry,
+                 decode_health, display_caps, library, meta, private_trackers,
+                 probe, reputation, source_health, sources, tbcache, telemetry,
                  usenet as nzb_lane, vprobe)
 
 logger = logging.getLogger("stream-picker")
@@ -76,18 +76,14 @@ NOTICE_URL = os.environ.get("NOTICE_URL") or f"{ADDON_PUBLIC_URL}/notice.mp4"
 # is the player-safe outer ceiling; until then it keeps looking for one verified
 # playable source rather than falling back to an unverified candidate.
 #
-# Raised from 55s deliberately. Hitting this ceiling does not mean "answer with
-# something worse" — it means the '⏳ Finding Best Stream' placeholder becomes
-# result #1, and a player that auto-plays #1 plays *that*, so the viewer sits on
-# a splash screen and has to retry. A title whose only source is a slow NZB
-# mount was routinely losing that race. Waiting longer for a real verified
-# stream beats answering promptly with a placeholder.
-#
-# The bound here is the *player's* HTTP timeout, which we do not control and
-# have not measured — waits around 55s are known good from live use, longer is
-# untested. If a player gives up first the viewer gets an error instead of the
-# placeholder, which is worse; drop this back toward 60 if that shows up.
-TOTAL_DEADLINE = float(os.environ.get("TOTAL_DEADLINE", "120"))
+# The bound is the player's, and it is now measured: Nuvio's addon client times
+# out after 60 s of silence and its auto-play gives up at 60 s
+# (DIRECT_AUTOPLAY_HARD_TIMEOUT_MS). An answer after that reaches nobody, so the
+# ceiling sits safely inside it. It was briefly 120 s, on the theory that
+# waiting beat answering with the '⏳ Finding Best Stream' placeholder; the
+# placeholder is gone now (a lane answers with verified streams or nothing, and
+# a retry joins the background work), so the ceiling only has to be honest.
+TOTAL_DEADLINE = float(os.environ.get("TOTAL_DEADLINE", "55"))
 # Metadata is important for identity/language, but cannot consume the whole fast
 # window before a byte probe even starts. Searches already run concurrently.
 FAST_METADATA_BUDGET = float(os.environ.get("FAST_METADATA_BUDGET", "4"))
@@ -144,9 +140,8 @@ FAST_SPEED_FIRST = os.environ.get("FAST_SPEED_FIRST", "1").strip().lower() \
 PROBE_BATCH = int(os.environ.get("FAST_PROBE_BATCH", "3"))
 # Player-safety cap only; the normal stop condition is the first good verified
 # source, however long that takes within the addon's request window. The race
-# deadline is min(this, TOTAL_DEADLINE), so this has to move with it — left at
-# 55 it silently caps the whole change.
-FAST_RACE_DEADLINE = float(os.environ.get("FAST_RACE_DEADLINE", "120"))
+# deadline is min(this, TOTAL_DEADLINE), so the two move together.
+FAST_RACE_DEADLINE = float(os.environ.get("FAST_RACE_DEADLINE", "55"))
 CACHE_TTL = float(os.environ.get("CACHE_TTL", str(6 * 3600)))
 # Release catalogs can live for hours, but a signed playback URL must not be
 # treated as freshly verified for that long. A result list holds for three
@@ -215,12 +210,6 @@ SLOW_FINISH_TTFB_MAX = float(os.environ.get("SLOW_FINISH_TTFB_MAX", "120"))
 # "being added" notice fast on retries for this long (the library check still
 # overrides it the moment the download lands).
 NOTICE_TTL = float(os.environ.get("NOTICE_TTL_SECONDS", str(20 * 60)))
-# The "finding best stream" notice is shown only while the background finisher is
-# still verifying, so its window is short: long enough to keep rapid re-opens
-# cheap (no re-running the foreground probe each poll), short enough that if the
-# finisher dies silently a later open re-checks from scratch. A cached verified
-# result always overrides it sooner.
-CHECKING_NOTICE_TTL = float(os.environ.get("CHECKING_NOTICE_TTL", "180"))
 ACQUIRE_FOREGROUND_WAIT = float(os.environ.get("ACQUIRE_FOREGROUND_WAIT", "3"))
 
 # Files some of the household's players can't decode. 10-bit is fine.
@@ -247,6 +236,35 @@ PROFILES = {
     # phones/tablets on cell data: 1080p cap, file bitrate <= ~12 Mbps
     "mobile": {"max_res": 1080, "max_bps": _cap_bps(1_500_000)},
 }
+
+def _result_key(profile_name: str, media: str, media_id: str,
+                slow: bool = False) -> str:
+    """The cache key for one picker's answer, for the display being served.
+
+    Every reader and writer of `_cache` goes through here. Hand-built keys
+    without the caps tag are how the next-episode prefetch came to store its
+    answers where no caps-reporting player would ever look."""
+    return (f"{'slow:' if slow else ''}{_caps_tag()}"
+            f"{profile_name}:{media}:{media_id}")
+
+
+def _caps_tag() -> str:
+    """Cache-key prefix isolating one display's ranking from another's.
+
+    The projector wants SDR first and the OLED wants the HDR remux; served the
+    same cached list, one of them is wrong. The tag covers exactly the reported
+    facts that move the ranking, so displays that would be ranked for
+    identically still share the work.
+
+    A *prefix*, not a suffix, and that is load-bearing: seven call sites
+    invalidate by `key.endswith(f":{media_id}")`, and the slow picker finds the
+    fast picker's verified links by stripping a leading `"slow:"`. Both keep
+    working in front; neither does behind.
+    """
+    caps = display_caps.current()
+    token = caps.cache_token() if caps is not None else ""
+    return f"{token}|" if token else ""
+
 
 _client = httpx.AsyncClient(timeout=None, headers={"User-Agent": "Stremio"})
 
@@ -515,12 +533,82 @@ _HDR_BASE_RE = re.compile(r"hdr10\+|hdr10|\bhdr\b", re.I)
 
 
 def _dv_rejected(text: str) -> bool:
-    """True when a Dolby Vision stream should be dropped for non-DV displays."""
-    if DV_REJECT == "off" or not _DV_RE.search(text):
+    """True when a Dolby Vision stream should be dropped for non-DV displays.
+
+    A player that reports its display outranks the configured guess in both
+    directions: a chain that can decode DV is shown DV even where the operator
+    left the guard on, and one that cannot gets the guard even where they left
+    it off. `DV_REJECT` remains the answer for every player that says nothing —
+    which is nearly all of them, and is why its "bare" default still stands.
+    """
+    caps = display_caps.current()
+    mode = DV_REJECT
+    if caps is not None and caps.dv is not None:
+        # "all" is an operator escalation for players that tint even on Profile
+        # 8, so it survives a display that merely says "no DV"; nothing else does.
+        mode = "off" if caps.dv else ("all" if mode == "all" else "bare")
+    if mode == "off" or not _DV_RE.search(text):
         return False
-    if DV_REJECT == "all":
+    if mode == "all":
         return True
     return not _HDR_BASE_RE.search(text)  # "bare": keep DV that falls back to HDR10
+
+
+# ── display compatibility ───────────────────────────────────────────────────
+# A separate axis from DV_REJECT, which only ever answered the *tint* failure
+# (bare Profile 5 on a non-DV screen). This answers the *luminance* one: HDR is
+# graded for 1000+ nits, and a display that cannot get near that renders the
+# mid-tones dark and flat. ExoPlayer makes it worse by not
+# avoiding HDR tracks on displays that can't show them (androidx/media#1074),
+# so nothing downstream corrects it either.
+#
+# This is a *demotion*, never a filter: an HDR-only title still plays, it just
+# sorts under every SDR alternative — the same contract as _decode_ok and the
+# hardsub gate, and for the same reason. "off" restores HDR-preferred ranking
+# for a household whose screens can actually render it.
+# Defaults to "off" — stock behaviour — because most installs watch on a real
+# HDR display and demoting HDR there would be a regression. This is a per-
+# household fact about the screen, so it is opted into from the dashboard
+# rather than shipped on. Unlike DV_REJECT, whose "bare" default is defensible
+# everywhere (bare Profile 5 tints on any non-DV screen, and most screens are).
+HDR_DEMOTE = os.environ.get("HDR_DEMOTE", "off").strip().lower()
+_HDR_NAME_RE = re.compile(r"hdr10\+|hdr10plus|hdr10|\bhdr\b|\bpq\b|\bhlg\b"
+                          r"|\b(dv|dovi|dolby[\s._-]?vision)\b", re.I)
+
+
+def _is_hdr(s: dict) -> bool:
+    """Whether this release needs an HDR display.
+
+    Prefers the probe's measured transfer function over the release name:
+    `_transfer` is ffprobe reading the actual bitstream, while "HDR" in a
+    filename is a claim that is wrong in both directions often enough to
+    matter. Falls back to the name only when nothing was sniffed.
+    """
+    measured = s.get("_transfer")
+    if measured:                       # "pq" / "hlg" — measured, authoritative
+        return True
+    if measured == "":
+        # Distinguish "sniffed and it was SDR" from "never sniffed": only the
+        # probe sets this key at all, so its presence is the evidence.
+        if "_transfer" in s:
+            return False
+    return bool(_HDR_NAME_RE.search(_stream_text(s)))
+
+
+def _display_ok(s: dict) -> int:
+    """0 when this release needs more display than the viewer's screen has.
+
+    A reported display decides for itself; `HDR_DEMOTE` answers for every player
+    that reports nothing. So one server can rank correctly for the projector and
+    for a real HDR screen at the same time, which a single env var cannot.
+    """
+    caps = display_caps.current()
+    demote = caps.demotes_hdr() if caps is not None else None
+    if demote is None:
+        demote = HDR_DEMOTE != "off"
+    if not demote:
+        return 1
+    return 0 if _is_hdr(s) else 1
 
 _AUDIO_RES = [
     # TRaSH "Audio Advanced" default scores, best-first (order matters:
@@ -563,6 +651,35 @@ _HEVC_RE = re.compile(r"\bx265\b|\bhevc\b|\bh\.?265\b", re.I)
 _AV1_RE = re.compile(r"\bav1\b", re.I)
 
 
+# Which _AUDIO_RES tiers need a receiver that can take them. TrueHD/Atmos scores
+# 5000 and DTS-X 4500 against AC3's 1000, so a lossless track can pull a whole
+# tie-break on its own — worth every point into a capable chain, and worth
+# nothing into one that downmixes it to stereo before it reaches a speaker.
+_PASSTHROUGH_RES = [
+    (re.compile(r"true[\s._-]?hd", re.I), "truehd"),
+    (re.compile(r"\bdts[\s._-]?x\b|dts[\s._-]?hd[\s._-]?x", re.I), "dtsx"),
+    (re.compile(r"dts[\s._-]?hd", re.I), "dtshd"),
+    (re.compile(r"\batmos\b", re.I), "atmos"),
+]
+# What the track is worth once downmixed: still real audio, just not the reason
+# to prefer this release. Above AC3's 1000 because a lossless source downmixes
+# better than a lossy one, well below the premium tiers.
+_DOWNMIXED_SCORE = 1100
+
+
+def _audio_worth(score: int, text: str) -> int:
+    """Discount audio the viewer's chain cannot actually pass through."""
+    caps = display_caps.current()
+    if caps is None or score <= _DOWNMIXED_SCORE:
+        return score
+    for rx, codec in _PASSTHROUGH_RES:
+        if rx.search(text):
+            if caps.passes_through(codec) is False:
+                return _DOWNMIXED_SCORE
+            break
+    return score
+
+
 def _cf_score(s: dict) -> int:
     """Sum of TRaSH-style custom-format scores: HDR + audio + group tier +
     repack, minus 'unwanted' penalties. Used only to break ties within the
@@ -575,7 +692,7 @@ def _cf_score(s: dict) -> int:
             break
     for rx, val in _AUDIO_RES:
         if rx.search(text):
-            score += val
+            score += _audio_worth(val, text)
             break
     if _GOOD_GROUPS.search(text):
         score += 300
@@ -688,6 +805,11 @@ def _annotate_quality(streams: list[dict], runtime: float) -> None:
         s["_prior_success"] = candidate_health.prior_success(s)
         s["_qbps"] = _video_bps(s, runtime) or 0
         s["_effres"] = _effective_resolution(s, runtime)
+        # Carried to the proxy: a candidate whose size no addon declared has
+        # no bitrate here (`_qbps` 0), so the play-time start gate could not
+        # judge its speed. The upstream's Content-Range gives the size at play
+        # time; with the runtime the gate can work out what the file needs.
+        s["_runtime"] = runtime
 
 
 def _apply_probe_quality(s: dict, r, runtime: float) -> None:
@@ -703,9 +825,17 @@ def _apply_probe_quality(s: dict, r, runtime: float) -> None:
     audio_langs = getattr(r, "audio_langs", ()) or ()
     vcodec = (getattr(r, "vcodec", "") or "").lower()
     content_kind = getattr(r, "content_kind", "") or ""
+    transfer = getattr(r, "transfer", None)
+    sub_langs = getattr(r, "sub_langs", None)
     if not bps and not height and not acodecs and not audio_langs and not vcodec \
-            and not content_kind:
+            and not content_kind and transfer is None and sub_langs is None:
         return
+    if transfer is not None and vcodec:
+        # Recorded even when it is "" (SDR): the *presence* of the key is what
+        # tells _is_hdr the bitstream was actually read, so it can stop
+        # trusting the release name. Gated on vcodec so a probe that sniffed
+        # nothing at all doesn't claim an SDR verdict it never measured.
+        s["_transfer"] = transfer
     if bps:
         # Declared BANDWIDTH is *peak* video+audio — biased high, so it only
         # demotes clear fakes, never a marginal honest encode.
@@ -720,6 +850,10 @@ def _apply_probe_quality(s: dict, r, runtime: float) -> None:
         s["_acodecs"] = list(acodecs)
     if audio_langs:
         s["_audio_langs"] = list(audio_langs)
+    if sub_langs is not None:
+        # Stored even when empty: a measured "no subtitle tracks" is the
+        # evidence _clean_level acts on; an absent key means never measured.
+        s["_subs"] = list(sub_langs)
     if vcodec:
         s["_vcodec_real"] = vcodec
     if content_kind:
@@ -813,8 +947,11 @@ _anime_ctx: ContextVar["anime.Expectation | None"] = \
 # an upstream addon's JSON response.  Raw streams are still scrubbed at every
 # ingestion boundary so even a same-named private field cannot linger.
 _VERIFIED_SENTINEL = object()
+_TRANSPORT_OK_KEY = "_transport_ok"
 _INTERNAL_KEYS = ("_effres", "_vbitrate", "_vheight", "_vcodec", "_vcodec_real",
-                  "_acodecs", "_audio_langs", "_content_kind", "_qbps",
+                  _TRANSPORT_OK_KEY,
+                  "_acodecs", "_audio_langs", "_subs", "_transfer", "_runtime",
+                  "_content_kind", "_qbps",
                   "_speed", "_ttfb", "_prior_success",
                   _VERIFIED_STATE_KEY, _NOTICE_STATE_KEY,
                   _IDENTITY_STATE_KEY, _IDENTITY_RANK_KEY,
@@ -829,6 +966,7 @@ def _ingested_stream(s: dict) -> dict:
     """Copy an upstream stream while discarding picker-owned trust state."""
     out = dict(s)
     out.pop(_VERIFIED_STATE_KEY, None)
+    out.pop(_TRANSPORT_OK_KEY, None)
     out.pop(_NOTICE_STATE_KEY, None)
     out.pop(content_identity._AUTO_ELIGIBLE_KEY, None)
     return out
@@ -849,6 +987,36 @@ def clean_output(streams: list[dict]) -> list[dict]:
     """Strip internal ranking annotations from streams at the HTTP boundary, so
     they never leak to Nuvio but survive internal re-sorts and caching."""
     return [_strip_internal(s) for s in streams]
+
+
+def binge_groups(streams: list[dict], picker_label: str) -> list[dict]:
+    """The answer's bingeGroups, rewritten so binge-watching follows the pick.
+
+    A player remembers the bingeGroup of the stream it played and, for the next
+    episode, auto-plays the first stream carrying the same group — ahead of
+    list order (Nuvio's StreamAutoPlaySelector; Stremio's binge-watching does
+    the same). Upstream groups name a torrent or a season pack, so passing them
+    through let one pick hold the rest of the season whatever the picker later
+    learned.
+
+    So the group is the picker's: a verified leader carries one stable group
+    per addon, and no other row carries any. A viewer who picks a row by hand
+    leaves no group behind, and the next episode starts from #1 again.
+    """
+    out = []
+    for i, s in enumerate(streams):
+        bh = s.get("behaviorHints") or {}
+        lead = i == 0 and _is_ranked(s)
+        if not lead and "bingeGroup" not in bh:
+            out.append(s)
+            continue
+        bh = dict(bh)
+        if lead:
+            bh["bingeGroup"] = f"stream-picker|{picker_label}"
+        else:
+            bh.pop("bingeGroup", None)
+        out.append({**s, "behaviorHints": bh})
+    return out
 
 
 # ── semantic content identity ───────────────────────────────────────────────
@@ -1123,28 +1291,86 @@ def _identity_leader_flag(s: dict) -> int:
     return 1 if _identity_leader(s) else 0
 
 
-# Hard-coded (burned-in) foreign subtitles — Chinese/Korean-market WEB rips
-# (a CJK title prefix like "莫离.", or tags like "Chinese-Esub"/HC/KORSUB). They
-# can't be switched off, so the household would rather not see them. DEMOTED
-# below every clean release, never rejected — still served if it's the ONLY
-# source. Env kill-switch HARDSUB_DEMOTE=0 to disable. Matched on the filename
-# (else name+title), NOT the description, so a clean release that merely lists a
-# foreign AKA title in its blurb isn't caught.
+# Hard-coded (burned-in) subtitles. They can't be switched off, so the
+# household would rather not see them: DEMOTED below every clean release,
+# never rejected — still served if it's the ONLY source. Env kill-switch
+# HARDSUB_DEMOTE=0 to disable. Three kinds of evidence, strongest first:
+#
+#  * an explicit tag in the filename (HC, HardSub, KORSUB, Chinese-Esub…).
+#    Believed whatever the container shows — a file can carry burned-in
+#    subtitles AND soft tracks.
+#  * a domestic-market look: a CJK title prefix ("子夜归.Moonlit…") or chs/cht.
+#    Only a hint. Chinese PT groups prefix their Disney+ and Viki rips the same
+#    way, and those are clean international masters with soft subtitles — so a
+#    measured soft-subtitle track overrides it.
+#  * the file itself: a foreign-language title whose track table has no
+#    subtitle track and no English audio. That is a burned-in domestic master
+#    (or a raw with no subtitles at all), and no release name has to admit it.
+#
+# Names are matched on the filename (else name+title), NOT the description, so
+# a clean release that merely lists a foreign AKA title in its blurb isn't
+# caught.
 HARDSUB_DEMOTE = _env_bool("HARDSUB_DEMOTE")
-_HARDSUB_RE = re.compile(
+_HARDSUB_TAG_RE = re.compile(
     r"hard[\s._-]?sub|hard[\s._-]?cod|\bhc\b|kor[\s._-]?sub|"
-    r"burn(?:ed|t)[\s._-]?in|chinese[\s._-]?e?sub|chi[\s._-]?sub|\bchs\b|\bcht\b"
-    r"|[぀-ヿ㐀-䶿一-鿿가-힯]",  # any CJK/Kana/Hangul
+    r"burn(?:ed|t)[\s._-]?in|chinese[\s._-]?e?sub|chi[\s._-]?sub", re.I)
+_HARDSUB_HINT_RE = re.compile(
+    r"\bchs\b|\bcht\b|[぀-ヿ㐀-䶿一-鿿가-힯]",  # chs/cht, any CJK/Kana/Hangul
     re.I)
 
 
-def _hardsub(s: dict) -> bool:
+# The language a switchable subtitle must be in to be any use to the household
+# — the same English the audio gate already assumes (see _resolve_accept_langs).
+_SUB_LANG = "en"
+
+
+def _sub_evidence(subs: list | tuple) -> str:
+    """What a measured subtitle table offers: "english" (a track the household
+    can read), "unknown" (only untagged tracks — could be anything), or "none"
+    (no tracks, or only other languages)."""
+    langs = {str(x or "").lower() for x in subs}
+    if _SUB_LANG in langs:
+        return "english"
+    if "" in langs or "und" in langs:
+        return "unknown"
+    return "none"
+
+
+def _clean_level(s: dict) -> int:
+    """The household's subtitle order — soft > none > burned in — as a rank:
+
+      3  a foreign-language title whose file carries English subtitles they
+         can switch on
+      2  clean as far as anyone can tell (and every English-original title:
+         subtitles there are optional, so they never outrank picture quality)
+      1  a foreign-language title whose file carries no English subtitle
+         track and no English audio — burned in, or nothing usable at all
+      0  the name says burned in, or looks it with no English track measured
+
+    Only switchable English subtitles qualify for this preference.
+    """
     if not HARDSUB_DEMOTE:
-        return False
+        return 2
     bh = s.get("behaviorHints") or {}
     text = bh.get("filename") or " ".join(
         filter(None, (s.get("name"), s.get("title"))))
-    return bool(_HARDSUB_RE.search(text))
+    if _HARDSUB_TAG_RE.search(text):
+        return 0
+    subs = s.get("_subs")        # None = never measured; [] = measured none
+    evidence = _sub_evidence(subs) if subs is not None else None
+    orig = _original_lang.get()
+    foreign = bool(orig and orig != "en")
+    if _HARDSUB_HINT_RE.search(text) and evidence in (None, "none"):
+        return 0
+    if not foreign or evidence is None:
+        return 2
+    if evidence == "english":
+        return 3
+    if evidence == "unknown":
+        return 2                 # untagged tracks: no proof either way
+    if "en" in (s.get("_audio_langs") or ()):
+        return 2                 # an English track needs no subtitles
+    return 1
 
 
 # ── audio-language gate ──────────────────────────────────────────────────────
@@ -1156,6 +1382,10 @@ def _hardsub(s: dict) -> bool:
 AUDIO_GATE = _env_bool("AUDIO_GATE")
 _accept_langs: ContextVar[frozenset | None] = ContextVar("accept_langs", default=None)
 _original_lang_known: ContextVar[bool] = ContextVar("original_lang_known", default=True)
+# TMDB's original language for the title being picked ("zh", "ko", "en"), or
+# None when unknown. Read by _clean_level: an absent subtitle track only means
+# something for a title the household cannot follow without subtitles.
+_original_lang: ContextVar[str | None] = ContextVar("original_lang", default=None)
 
 # Flag emoji (by country) → spoken language (ISO-639-1); addons tag audio tracks
 # with country flags after a 🎙️/🗣️ marker.
@@ -1266,12 +1496,21 @@ async def _resolve_accept_langs(media: str, media_id: str) -> None:
     """Resolve the acceptable-audio set {English, original-language} for the title
     (via TMDB, cached) and stash it on the request context for _quality_key. Left
     as None — no gating — whenever TMDB can't tell us the original language, so a
-    genuinely foreign-original title is never wrongly demoted."""
+    genuinely foreign-original title is never wrongly demoted.
+
+    The original language also decides whether subtitle tracks matter: for a
+    foreign-original title the probe reads every candidate's track table (an
+    MP4's from its end-of-file index when need be) so _clean_level can tell a
+    switchable-subtitle release from a burned-in one."""
     orig = None
     try:
-        if AUDIO_GATE and meta.enabled():
+        if (AUDIO_GATE or HARDSUB_DEMOTE) and meta.enabled():
             orig = await meta.original_language(media, media_id)
     except Exception:
+        orig = None
+    _original_lang.set(orig or None)
+    probe.TRACKS_WANTED.set(bool(HARDSUB_DEMOTE and orig and orig != "en"))
+    if not AUDIO_GATE:
         orig = None
     # English remains positive evidence even if TMDB is unavailable. In that
     # case _audio_ok keeps other explicit languages in the unknown tier because
@@ -1286,9 +1525,11 @@ def _decode_ok(s: dict) -> int:
     — probe-sniffed codecs when available, else explicit name declarations).
     Demoted below every clean candidate, never removed: another player may
     handle it, and it still surfaces as a last resort."""
+    caps = display_caps.current()
     return 0 if decode_health.suspect(_stream_text(s),
                                       s.get("_acodecs") or (),
-                                      s.get("_vcodec_real") or "") else 1
+                                      s.get("_vcodec_real") or "",
+                                      device=caps.device if caps else "") else 1
 
 
 def _detail(s: dict, qbps: float) -> float:
@@ -1319,7 +1560,7 @@ def _quality_key(s: dict):
     #    streams of equal quality it still prefers the cross-validated copy;
     #  * decodability and clean-vs-hardsub are the TOP quality keys, so a release the
     #    player provably can't open (_decode_ok) or with burned-in foreign
-    #    subtitles (_hardsub) sorts below every clean one regardless of
+    #    subtitles (_clean_level) sorts below every clean one regardless of
     #    resolution — it only surfaces as a last resort;
     #  * detail outranks the resolution label: a 4K WEBRip often carries fewer
     #    real bits than a good 1080p BluRay, and a "REMUX" tag is unverifiable
@@ -1335,7 +1576,7 @@ def _quality_key(s: dict):
     qbps = s.get("_qbps")
     if qbps is None:
         qbps = 0
-    clean = 0 if _hardsub(s) else 1
+    clean = _clean_level(s)
     # audio_ok is the top quality key under the identity gate: a wrong-language
     # dub (no English, no original) sorts below everything acceptable, whatever
     # its resolution — you can't watch a 4K you don't understand.
@@ -1343,8 +1584,8 @@ def _quality_key(s: dict):
     if identity_rank is None:
         identity_rank = 5 if _identity_profile_ctx.get() is None else 1
     return (_identity_leader_flag(s), _audio_ok(s), _decode_ok(s), clean,
-            _detail(s, qbps), res, _source_rank(s), _cf_score(s), identity_rank,
-            _size_bytes(s) or 0)
+            _display_ok(s), _detail(s, qbps), res, _source_rank(s),
+            _cf_score(s), identity_rank, _size_bytes(s) or 0)
 
 
 # ── delivery-aware ranking of *verified* streams ─────────────────────────────
@@ -1376,14 +1617,24 @@ def _probe_key(s: dict) -> tuple:
     letting an old success outrank a materially better encode or count as proof
     that the candidate's current URL still plays.
     """
-    leader, audio, decode, clean, detail, res, srank, cf, identity, size = \
-        _quality_key(s)
+    leader, audio, decode, clean, display, detail, res, srank, cf, identity, \
+        size = _quality_key(s)
     prior = int(s.get("_prior_success") or candidate_health.prior_success(s))
-    return (leader, audio, decode, clean, _qbps_bucket(detail), prior,
+    return (leader, audio, decode, clean, display, _qbps_bucket(detail), prior,
             detail, res, srank, cf, identity, size)
 
 
-def _delivery_key(qkey: tuple, ttfb: float, speed: float):
+def _soft_subs(s: dict) -> int:
+    """1 when the file was measured to carry a switchable English subtitle
+    track. A same-quality tiebreak for every title — the household's order is
+    soft > none > burned in — kept below picture quality, because for an
+    English title subtitles are optional. (Foreign titles rank it far higher,
+    via _clean_level.)"""
+    subs = s.get("_subs")
+    return 1 if subs and _sub_evidence(subs) == "english" else 0
+
+
+def _delivery_key(qkey: tuple, ttfb: float, speed: float, soft: int = 0):
     """Sort key for a *verified* stream (descending). `clean` (no burned-in
     foreign subs) stays the very top quality component so a clean release always
     outranks a hardsub one, even a slow-starting clean over a fast hardsub — the
@@ -1397,10 +1648,12 @@ def _delivery_key(qkey: tuple, ttfb: float, speed: float):
     only then fall to throughput, so 'when quality is similar, pick the
     faster-streaming one'. Exact detail and size are last, purely deterministic
     tie-breaks."""
-    leader, audio, decode, clean, detail, res, srank, cf, identity, size = qkey
+    leader, audio, decode, clean, display, detail, res, srank, cf, identity, \
+        size = qkey
     good_start = 1 if ttfb <= GOOD_TTFB else 0
-    return (leader, audio, decode, clean, good_start, _qbps_bucket(detail),
-            res, srank, cf, identity, speed, detail, size)
+    return (leader, audio, decode, clean, display, good_start,
+            _qbps_bucket(detail), res, soft, srank, cf, identity, speed, detail,
+            size)
 
 
 def _verified_key(vr: tuple):
@@ -1410,26 +1663,27 @@ def _verified_key(vr: tuple):
     s, r = vr
     ttfb = 0.0 if r is None else r.ttfb
     speed = LIBRARY_SPEED if r is None else r.speed_bps
-    return _delivery_key(_quality_key(s), ttfb, speed)
+    return _delivery_key(_quality_key(s), ttfb, speed, _soft_subs(s))
 
 
 def _verified_quality_key(vr: tuple):
     """Best-all-around slow order: hard quality first, delivery inside a band."""
     s, r = vr
-    leader, audio, decode, clean, detail, res, srank, cf, identity, size = \
-        _quality_key(s)
+    leader, audio, decode, clean, display, detail, res, srank, cf, identity, \
+        size = _quality_key(s)
     ttfb = 0.0 if r is None else r.ttfb
     speed = LIBRARY_SPEED if r is None else r.speed_bps
     good_start = 1 if ttfb <= GOOD_TTFB else 0
-    return (leader, audio, decode, clean, _qbps_bucket(detail), res,
-            good_start, speed, srank, cf, identity, detail, size)
+    return (leader, audio, decode, clean, display, _qbps_bucket(detail), res,
+            _soft_subs(s), good_start, speed, srank, cf, identity, detail, size)
 
 
 def _marked_key(s: dict):
     """_delivery_key for an already-marked stream, reading the probe delivery
     stamped onto it by _mark (used when re-sorting after the ProbeResult objects
     are gone, e.g. folding the library in). Unstamped -> treated as slow/unknown."""
-    return _delivery_key(_quality_key(s), s.get("_ttfb", 0.0), s.get("_speed", 0.0))
+    return _delivery_key(_quality_key(s), s.get("_ttfb", 0.0),
+                         s.get("_speed", 0.0), _soft_subs(s))
 
 
 def _usable(s: dict, profile: dict, runtime: float) -> bool:
@@ -1494,16 +1748,44 @@ def _eligible_library(lib: list[dict], profile: dict,
 
 # ── metadata ────────────────────────────────────────────────────────────────
 
+# One metadata lookup per title, shared and never cancelled by a caller's
+# timeout. The fast picker gives metadata only FAST_METADATA_BUDGET; when that
+# lapsed, the lookup used to be cancelled with it and the request ran on the
+# fail-closed profile to the end — every candidate "unknown", none allowed to
+# lead. Measured: Dark S01E01 probed dozens of good copies and verified none
+# in 70+ s, while the retry two minutes later verified in 0.7 s.
+_profile_tasks: dict[tuple[str, str], asyncio.Task] = {}
+# The lookup still running behind a fail-closed profile, for _race_fast to
+# adopt the moment it lands.
+_late_identity_ctx: ContextVar[asyncio.Task | None] = ContextVar(
+    "late_identity", default=None)
+
+
+def _profile_task(media: str, media_id: str) -> asyncio.Task:
+    key = (media, media_id)
+    task = _profile_tasks.get(key)
+    if task is None or (task.done() and (task.cancelled()
+                                         or task.exception() is not None)):
+        task = asyncio.create_task(meta.identity_profile(media, media_id))
+        _profile_tasks[key] = task
+        while len(_profile_tasks) > 200:
+            _profile_tasks.pop(next(iter(_profile_tasks)))
+    return task
+
+
 async def _resolve_identity_profile(
         media: str, media_id: str,
         timeout: float | None = None) -> content_identity.IdentityProfile:
     """Resolve and install the authoritative request profile, failing closed."""
     started = time.monotonic()
+    late = None
     try:
-        operation = meta.identity_profile(media, media_id)
-        profile = (await asyncio.wait_for(operation, timeout)
-                   if timeout is not None else await operation)
+        task = _profile_task(media, media_id)
+        profile = (await asyncio.wait_for(asyncio.shield(task), timeout)
+                   if timeout is not None else await asyncio.shield(task))
     except Exception:
+        task = _profile_tasks.get((media, media_id))
+        late = task if task is not None and not task.done() else None
         parts = media_id.split(":")
         season = episode = None
         if media != "movie" and len(parts) == 3 \
@@ -1513,6 +1795,7 @@ async def _resolve_identity_profile(
             media=media, imdb_id=parts[0], aliases=(),
             season=season, episode=episode)
     _set_identity_profile(profile)
+    _late_identity_ctx.set(late)
     remaining = (None if timeout is None else
                  max(timeout - (time.monotonic() - started), 0.0))
     await _set_anime_expectation(media, media_id, profile, remaining)
@@ -1654,15 +1937,59 @@ def _assemble(verified: list[tuple[dict, probe.ProbeResult | None]],
     streams = [_mark(s, i + 1, r) for i, (s, r) in enumerate(verified)]
     # Twins of the verified picks jump the queue so they survive the [:15] cut
     # and reach the proxy as splice ammo.
-    rest = _twins_first(vset, [_ingested_stream(s) for s in
-                               (identity_fallbacks + leftovers)
-                               if s.get("url") not in vurls])
+    proven = []
+    for s in identity_fallbacks:
+        out = _ingested_stream(s)
+        # Plays (the probe proved it), but the title could not be confirmed.
+        # Never stamped verified; _display_gate may offer it once nothing
+        # confirmed can still turn up.
+        out[_TRANSPORT_OK_KEY] = True
+        proven.append(out)
+    rest = _twins_first(vset, proven + [_ingested_stream(s) for s in leftovers
+                                        if s.get("url") not in vurls])
     streams += rest[:15]
-    if had_transport_success and not verified:
-        streams.insert(0, _notice_stream("checking"))
     if fallback:
         streams.append(fallback)
     return streams
+
+
+# What Nuvio may see. It auto-plays the first stream that arrives from either
+# addon, so anything at #1 that is not a confirmed-playable stream gets played
+# — a "⏳ Finding Best Stream" placeholder included. The household's rule: show
+# nothing until there is something real, and say "nothing found" only once
+# every source has confirmed it. Placeholders that announce a settled outcome
+# are the exception; the transient ones never leave the picker.
+_SETTLED_NOTICES = ("not_found", "theatrical", "added", "private_empty")
+
+
+def _work_pending(cache_key: str, media: str, media_id: str) -> bool:
+    """Is anything still able to produce a confirmed stream for this title?"""
+    task = _background.get(cache_key)
+    return bool((task is not None and not task.done())
+                or sources.in_progress(media, media_id)
+                or nzb_lane.in_progress(media, media_id)
+                or private_trackers.search_in_progress(media, media_id))
+
+
+def _display_gate(cache_key: str, media: str, media_id: str,
+                  streams: list[dict]) -> list[dict]:
+    if not streams:
+        return []
+    head = streams[0]
+    if (_is_ranked(head) or head.get("_private_tracker")
+            or head.get(_NOTICE_STATE_KEY) in _SETTLED_NOTICES):
+        return streams
+    if head.get(_NOTICE_STATE_KEY):
+        return []                       # a transient placeholder: say nothing
+    if _work_pending(cache_key, media, media_id):
+        return []
+    # Everything has settled and nothing confirmed exists. Streams the probe
+    # proved playable but whose title stayed ambiguous are the last thing
+    # available; unproven candidates are not offered as a leader at all.
+    proven = [s for s in streams if s.get(_TRANSPORT_OK_KEY)]
+    if not proven:
+        return []
+    return proven + [s for s in streams if not s.get(_TRANSPORT_OK_KEY)]
 
 
 def _store(key: str, streams: list[dict]) -> None:
@@ -2054,48 +2381,74 @@ def _need_bps_fn(runtime: float):
     return need_bps
 
 
-def _fast_checking_notice(cache_key: str, media: str, media_id: str,
-                          profile: dict, runtime: float,
-                          pool: list[dict]) -> list[dict]:
-    """Fast picker's fallback when it couldn't verify a single link in its budget:
-    show only the controlled, playable 'finding best stream' notice — never an
-    upstream candidate that did not pass — and make sure the background finisher
-    is running so the retry gets a verified answer from cache. No _notice_until
-    here: the cached verified result overrides on retry the moment it lands."""
+async def _fast_no_verified(cache_key: str, media: str, media_id: str,
+                            profile: dict, runtime: float,
+                            pool: list[dict]) -> list[dict]:
+    """Fast picker's answer when nothing verified inside its window.
+
+    Never a placeholder: Nuvio auto-plays the first thing either addon returns,
+    so a "finding best stream" splash got played instead of a film (~8 % of
+    first results in October). The rule is:
+      * public candidates or searches still in play → nothing yet; the
+        background finisher verifies, and the retry gets a real stream;
+      * public exhausted, private trackers hold the title → those rows: the
+        last available option, and the first one auto-plays (downloading);
+      * every source, private included, answered empty → "nothing found".
+    """
     if cache_key not in _background:
         _background[cache_key] = asyncio.create_task(
             _finish_in_background(cache_key, media, media_id, profile,
                                   runtime, list(pool)))
-    # "Re-open in a few seconds" is a promise, and it has to be true. It is when
-    # candidates exist and merely need verifying, or a lane is still working —
-    # a retry then really does get a stream. It is a lie when every source came
-    # back empty and nothing is still running, which is exactly what this used
-    # to say anyway: the Columbo case logged "verifying 0 candidates" and still
-    # told the viewer to try again.
-    working = (bool(pool) or nzb_lane.in_progress(media, media_id)
-               or sources.in_progress(media, media_id)
-               or private_trackers.search_in_progress(media, media_id))
-    if not working and private_trackers.enabled():
-        # Nothing public at all is precisely when the private lane earns its
-        # keep, so consult it before declaring failure. should_search() governs
-        # the *partial* case (fewer than N public releases) and its default of 0
-        # never fires; finding literally nothing is unambiguous, so it triggers
-        # here regardless. The search is inert — it adds and downloads nothing.
-        #
-        # Once only. Re-launching it on every retry would keep the title on
-        # "checking" forever, which is the exact failure this function exists to
-        # remove: an outcome of "empty" or "failed" is an answer, and repeating
-        # a search that already answered will not change it.
-        seen = private_trackers.search_outcome(media, media_id)
-        if not seen:
-            asyncio.create_task(private_trackers.candidates(media, media_id))
-            working = True
-        elif seen.get("state") == "ok":
-            working = True          # it found releases; the finisher serves them
-    kind = "checking" if working else "not_found"
-    logger.info(f"{cache_key}: no verified link in fast budget — '{kind}' "
-                f"notice, finisher verifying {len(pool)} candidates in background")
-    return [_notice_stream(kind)]
+    public_working = (bool(pool) or nzb_lane.in_progress(media, media_id)
+                      or sources.in_progress(media, media_id))
+    if private_trackers.enabled():
+        # Inert search — it adds and downloads nothing — started the moment
+        # public sources look thin, so its ~90 s cold round-trip overlaps the
+        # public work instead of following it.
+        found = await private_trackers.candidates(media, media_id, wait=0)
+        if not public_working:
+            rows = await _private_last_resort(media, media_id, profile,
+                                              runtime, found)
+            if rows:
+                _store(cache_key, rows)
+                return rows
+        outcome = private_trackers.search_outcome(media, media_id)
+        if (public_working or private_trackers.search_in_progress(media, media_id)
+                or outcome.get("state") != "empty"):
+            logger.info(f"{cache_key}: nothing verified in fast budget — "
+                        f"answering empty while {len(pool)} candidate(s) and "
+                        "the private search finish in the background")
+            return []
+    elif public_working:
+        logger.info(f"{cache_key}: nothing verified in fast budget — answering "
+                    f"empty while {len(pool)} candidate(s) finish verifying")
+        return []
+    logger.info(f"{cache_key}: every source answered empty — 'not found'")
+    return [_notice_stream("not_found")]
+
+
+async def _private_last_resort(media: str, media_id: str, profile: dict,
+                               runtime: float,
+                               found: list[dict] | None = None) -> list[dict]:
+    """What private trackers can offer once nothing public plays: a copy
+    already on disk (plays like a library file), a download already under way
+    (streams as it lands), else the searched releases as download rows."""
+    complete, pending = await private_trackers.local_streams(media, media_id)
+    if complete:
+        complete = _eligible_library(complete, profile, runtime)
+    if complete:
+        rows = _assemble(_as_verified(complete), pending, None)
+        rows += await private_trackers.choice_streams(media, media_id, wait=0)
+        return rows
+    if pending:
+        return pending + await private_trackers.choice_streams(
+            media, media_id, wait=0)
+    if found is None:
+        found = await private_trackers.candidates(media, media_id, wait=0)
+    if found:
+        return private_trackers.fallback_streams(
+            media, media_id, found, await private_trackers.downloaded_index())
+    return []
 
 
 # ── fast picker ─────────────────────────────────────────────────────────────
@@ -2158,6 +2511,17 @@ async def _finish_in_background(cache_key: str, media: str, media_id: str,
             _store(cache_key, streams)
             logger.info(f"{cache_key}: background verification cached "
                         f"{len(verified)} verified of {len(ok)}")
+        elif private_trackers.enabled():
+            # Nothing public plays after the full search: private trackers are
+            # now the only option, so they become the answer the retry gets.
+            found = await private_trackers.candidates(
+                media, media_id, wait=max(left(), 0.0))
+            rows = await _private_last_resort(media, media_id, profile,
+                                              runtime, found)
+            if rows:
+                _store(cache_key, rows)
+                logger.info(f"{cache_key}: nothing public plays — cached "
+                            f"{len(rows)} private last-resort row(s)")
     except Exception:
         logger.exception(f"{cache_key}: background verification failed")
     finally:
@@ -2225,8 +2589,39 @@ async def _race_fast(media: str, media_id: str, profile: dict, runtime: float,
     host_fails: dict[str, int] = {}    # per-pick probe failures by host
     host_ok: set[str] = set()          # hosts that have passed at least once
     verified: list[tuple[dict, probe.ProbeResult | None]] = []
+    # Probe passes the identity gate turned away. Under the fail-closed
+    # stand-in profile that is every one of them, so they are kept to be
+    # judged again when the real profile lands.
+    identity_rejected: list[tuple[dict, probe.ProbeResult]] = []
     first_verified_at: float | None = None   # when the safety net first appeared
     deadline = min(t0 + FAST_RACE_DEADLINE, t0 + TOTAL_DEADLINE)
+
+    def _adopt_late_identity() -> None:
+        nonlocal first_verified_at, identity_rejected
+        late = _late_identity_ctx.get()
+        if late is None or not late.done():
+            return
+        _late_identity_ctx.set(None)
+        if late.cancelled() or late.exception() is not None:
+            return
+        _set_identity_profile(late.result())
+        _annotate_identity(pool)
+        pool.sort(key=_quality_key, reverse=True)
+        again, identity_rejected = identity_rejected, []
+        recovered = []
+        for vs, vr in again:
+            if _apply_probe_evidence(vs, vr, runtime):
+                recovered.append((vs, vr))
+            else:
+                identity_rejected.append((vs, vr))
+        if recovered:
+            verified.extend(recovered)
+            ident_ok.update(i for i in (_release_ident(vs) for vs, _ in recovered)
+                            if i)
+            if first_verified_at is None:
+                first_verified_at = time.monotonic()
+        logger.info(f"identity metadata landed {time.monotonic() - t0:.1f}s in; "
+                    f"{len(recovered)} already-probed stream(s) now verified")
 
     # Completion-first, and the clock is never the reason to wait. Once the race
     # holds a stream that definitely plays, waiting is justified only by a
@@ -2239,24 +2634,43 @@ async def _race_fast(media: str, media_id: str, profile: dict, runtime: float,
     # bounded so a page of unproven "HD" scraper labels that never verify cannot
     # hold a guaranteed copy hostage. The slow picker and the background
     # finisher do the patient, thorough verification.
-    def _best_verified_res() -> int:
-        return max((int(s.get("_effres") or _resolution(s))
-                    for s, _ in verified), default=0)
+    def _tier(s: dict) -> tuple[int, int, int]:
+        # "Better" is acceptable-audio first, then subtitles, then resolution
+        # — the same precedence as _quality_key. Judged on resolution alone, a
+        # verified 2160p with burned-in subtitles ended the race before a
+        # single clean 1080p was tried and became the only verified row — and a verified foreign dub could do the same.
+        return (_audio_ok(s), _clean_level(s),
+                int(s.get("_effres") or _resolution(s)))
 
-    def _better_pending(than: int) -> bool:
+    def _undesirable(tier: tuple[int, int, int]) -> bool:
+        """Plays, but not in a language or with subtitles the household wants."""
+        return tier[0] == 0 or tier[1] < 2
+
+    def _best_verified() -> tuple[int, int, int]:
+        return max((_tier(s) for s, _ in verified), default=(0, 0, 0))
+
+    def _better_pending(than: tuple[int, int, int]) -> bool:
         """Is a candidate ranked above what we already hold still being probed,
-        or still waiting for a slot? Only then is waiting buying anything."""
-        if any(int(s.get("_effres") or _resolution(s)) > than
-               for s, _ in running_probes.values()):
+        or still waiting for a slot — or might one still arrive? Only then is
+        waiting buying anything."""
+        if any(_tier(s) > than for s, _ in running_probes.values()):
             return True
-        return any(int(s.get("_effres") or _resolution(s)) > than
-                   for s in pool if s.get("url") not in probed)
+        if any(_tier(s) > than for s in pool if s.get("url") not in probed):
+            return True
+        # A source that has not answered yet may well hold something better.
+        # Easynews leads the race and answers in well under a second, so a
+        # title it has only a lone 720p of was answered with that 720p before
+        # the debrid lanes had landed their 4K remuxes. Below the 1080p bar
+        # (or holding a dub/hardsub), give them the
+        # bounded grace; at 1080p+ the race still ends at once.
+        return bool(pending_sources) and (than[2] < 1080 or _undesirable(than))
 
     def _sufficient() -> bool:
         # Nothing that plays yet: there is nothing to serve, so keep looking.
         if first_verified_at is None:
             return False
-        held = _best_verified_res()
+        best = _best_verified()
+        held = best[2]
         waited = time.monotonic() - first_verified_at
         # One rule, applied at every tier: we hold something that definitely
         # plays, so the *only* reason to keep the viewer waiting is that
@@ -2265,9 +2679,15 @@ async def _race_fast(media: str, media_id: str, profile: dict, runtime: float,
         # answer now rather than run out a timer against an empty screen. Lots
         # of older titles only ever have a 720p or an SD copy, and that copy is
         # the right answer, not a consolation prize.
-        if not _better_pending(held):
+        if not _better_pending(best):
             return True
-        if _enough(verified):
+        if _undesirable(best):
+            # What we hold is a foreign dub or burned in (or carries no
+            # subtitles), and something better is still in flight. The
+            # household would rather wait a little than get either — but only
+            # a little.
+            return waited >= FAST_VERIFIED_GRACE
+        if _enough([v for v in verified if _tier(v[0])[:2] == best[:2]]):
             # We hold 1080p+ and something better is still in flight. Probing
             # runs best-quality-first, so a 2160p that has not landed yet is
             # merely bigger and slower to prove, not worse — worth a few
@@ -2313,7 +2733,10 @@ async def _race_fast(media: str, media_id: str, profile: dict, runtime: float,
         _ingest_library(lib_task)
 
     try:
-        while not _sufficient() and time.monotonic() < deadline:
+        while True:
+            _adopt_late_identity()
+            if _sufficient() or time.monotonic() >= deadline:
+                break
             # Direct-NZB returns its first mount immediately and appends later
             # mounts to the shared list. Poll that live list so a failed first
             # release does not hide the second release from this same request.
@@ -2391,6 +2814,14 @@ async def _race_fast(media: str, media_id: str, profile: dict, runtime: float,
                 if nzb_lane.in_progress(media, media_id):
                     await asyncio.sleep(0.2)
                     continue
+                late = _late_identity_ctx.get()
+                if identity_rejected and late is not None and not late.done():
+                    # Everything probed, nothing allowed to lead yet — but the
+                    # title's metadata is still on its way and will settle it.
+                    await asyncio.wait(
+                        {late}, timeout=min(max(deadline - time.monotonic(), 0),
+                                            0.25))
+                    continue
                 break
             done, _ = await asyncio.wait(
                 active, timeout=min(max(deadline - time.monotonic(), 0), 0.25),
@@ -2416,6 +2847,8 @@ async def _race_fast(media: str, media_id: str, profile: dict, runtime: float,
                     for vs, vr in passed:
                         if _apply_probe_evidence(vs, vr, runtime):
                             identity_passed.append((vs, vr))
+                        else:
+                            identity_rejected.append((vs, vr))
                     verified.extend(identity_passed)
                     if identity_passed and first_verified_at is None:
                         first_verified_at = time.monotonic()   # start grace timer
@@ -2448,6 +2881,13 @@ async def _race_fast(media: str, media_id: str, profile: dict, runtime: float,
 
 
 async def pick(media: str, media_id: str, profile_name: str = "full") -> list[dict]:
+    streams = await _pick_fast(media, media_id, profile_name)
+    return _display_gate(_result_key(profile_name, media, media_id),
+                         media, media_id, streams)
+
+
+async def _pick_fast(media: str, media_id: str,
+                     profile_name: str = "full") -> list[dict]:
     # Local library is a fast, reliable source, so the fast picker uses it too:
     # query Jellyfin alongside the online search and put any library hit first.
     started = time.monotonic()
@@ -2502,7 +2942,7 @@ async def _pick_online(media: str, media_id: str,
                        started: float | None = None) -> list[dict]:
     t0 = started if started is not None else time.monotonic()
     profile = PROFILES[profile_name]
-    cache_key = f"{profile_name}:{media}:{media_id}"
+    cache_key = _result_key(profile_name, media, media_id)
     hit = await _cached_pick(cache_key, media, media_id, profile)
     if hit is not None:
         logger.info(f"cache hit for {cache_key}")
@@ -2524,6 +2964,8 @@ async def _pick_online(media: str, media_id: str,
     runtime_task = asyncio.create_task(_runtime_seconds(media, media_id))
     _accept_langs.set(None)
     _original_lang_known.set(False)
+    _original_lang.set(None)
+    probe.TRACKS_WANTED.set(False)
     prep_deadline = min(t0 + FAST_METADATA_BUDGET, t0 + TOTAL_DEADLINE)
     await _resolve_identity_profile(
         media, media_id, timeout=max(prep_deadline - time.monotonic(), 0.05))
@@ -2533,6 +2975,8 @@ async def _pick_online(media: str, media_id: str,
     except (TimeoutError, asyncio.TimeoutError):
         _accept_langs.set(None)
         _original_lang_known.set(False)
+        _original_lang.set(None)
+        probe.TRACKS_WANTED.set(False)
     # Semantic identity is a hard prerequisite for an automatic result. Its
     # timeout above installs an exact-request but alias-empty fail-closed profile,
     # under which only validated Newznab/Jellyfin IMDb evidence may lead.
@@ -2576,7 +3020,8 @@ async def _pick_online(media: str, media_id: str,
     # Fast deadline hit / nothing verified anywhere yet. We never hand back an
     # unverified #1 — show the 'finding best stream' notice and let the finisher
     # verify for the retry.
-    return _fast_checking_notice(cache_key, media, media_id, profile, runtime, pool)
+    return await _fast_no_verified(cache_key, media, media_id, profile,
+                                   runtime, pool)
 
 
 # ── slow / best-quality picker ──────────────────────────────────────────────
@@ -2938,7 +3383,7 @@ async def _no_source(cache_key: str, media: str, media_id: str,
     if private_trackers.search_in_progress(media, media_id):
         logger.info("%s: private last-resort search continues in background",
                     cache_key)
-        return [_notice_stream("checking")]
+        return []
     private_outcome = private_trackers.search_outcome(media, media_id)
     if private_trackers.enabled() and private_outcome.get("state") == "empty":
         streams = [_notice_stream("private_empty")]
@@ -2947,8 +3392,10 @@ async def _no_source(cache_key: str, media: str, media_id: str,
                     cache_key)
         return streams
     if private_trackers.enabled() and private_outcome.get("state") == "failed":
+        # Not an answer: the trackers were never actually asked. Say nothing
+        # rather than claim the title doesn't exist.
         logger.warning("%s: private tracker search failed", cache_key)
-        return [_notice_stream("private_failed")]
+        return []
     if acquire.enabled_for(media):
         task = asyncio.create_task(acquire.request(media, media_id))
         try:
@@ -2958,22 +3405,31 @@ async def _no_source(cache_key: str, media: str, media_id: str,
             _acquire_tasks.add(task)
             task.add_done_callback(_acquire_tasks.discard)
             logger.info(f"{cache_key}: acquisition request still pending")
-            return [_notice_stream("checking")]
+            return []
         if ok:
             _notice_until[cache_key] = (time.monotonic() + NOTICE_TTL, "added")
             logger.info(f"{cache_key}: release should exist but none found — "
                         f"accepted by {'radarr' if media == 'movie' else 'sonarr'}")
             return [_notice_stream("added")]
         logger.warning(f"{cache_key}: acquisition request was not accepted")
-    logger.info(f"{cache_key}: no source found (acquire disabled)")
-    return []
+    if private_trackers.enabled():
+        return []                # no settled private answer to report yet
+    logger.info(f"{cache_key}: every source answered empty — 'not found'")
+    return [_notice_stream("not_found")]
 
 
 async def pick_slow(media: str, media_id: str,
                     profile_name: str = "full") -> list[dict]:
+    streams = await _pick_best(media, media_id, profile_name)
+    return _display_gate(_result_key(profile_name, media, media_id, slow=True),
+                         media, media_id, streams)
+
+
+async def _pick_best(media: str, media_id: str,
+                     profile_name: str = "full") -> list[dict]:
     t0 = time.monotonic()
     profile = PROFILES[profile_name]
-    cache_key = f"slow:{profile_name}:{media}:{media_id}"
+    cache_key = _result_key(profile_name, media, media_id, slow=True)
     hit = await _cached_pick(cache_key, media, media_id, profile, slow=True)
     if hit is not None:
         logger.info(f"cache hit for {cache_key}")
@@ -3105,7 +3561,7 @@ async def pick_slow(media: str, media_id: str,
     # a viewer's request on a tracker round-trip is what the fast/slow split
     # exists to avoid.
     if ok and private_trackers.should_search(distinct):
-        asyncio.create_task(private_trackers.candidates(media, media_id))
+        _spawn(private_trackers.candidates(media, media_id))
         logger.info("%s: %d distinct public release(s) — also searching "
                     "private trackers in the background", cache_key, distinct)
 
@@ -3157,25 +3613,21 @@ async def pick_slow(media: str, media_id: str,
     # it may be stale and has already failed the byte gate above. Let Usenet
     # finish mounting or let the normal no-source/acquisition path decide.
     if not ok and nzb_lane.in_progress(media, media_id):
-        logger.info(f"{cache_key}: direct usenet still mounting; showing "
-                    "checking notice instead of acquiring prematurely")
-        return [_notice_stream("checking")]
+        logger.info(f"{cache_key}: direct usenet still mounting; answering "
+                    "empty while the finisher waits for it")
+        return []
     if not ok:
         return await _no_source(cache_key, media, media_id,
                                 [fast, stremthru, mediafusion, nzb],
                                 private_wait=max(left() - 1, 0))
 
-    # Candidates exist but none verified in the foreground window. We never hand
-    # the user an unverified #1 — it might not play — so show the "finding best
-    # stream" notice and let the finisher (spawned above) verify and cache the
-    # best working one for the retry. A short notice window keeps rapid re-opens
-    # cheap; the cached verified result overrides it the moment it lands.
-    _notice_until[cache_key] = (time.monotonic() + CHECKING_NOTICE_TTL, "checking")
+    # Candidates exist but none verified in the foreground window. Nothing is
+    # shown: an unverified #1 might not play, and a "finding best stream"
+    # placeholder would be auto-played instead of a film. The finisher
+    # (spawned above) verifies and caches the best working one for the retry.
     logger.info(f"{cache_key}: {len(ok)} candidates, none verified yet — "
-                f"showing 'checking' notice while the finisher verifies")
-    lower = [_ingested_stream(s) for s in ok
-             if s.get(_IDENTITY_STATE_KEY) != content_identity.CONTRADICTION]
-    return [_notice_stream("checking"), *lower[:15]]
+                f"answering empty while the finisher verifies")
+    return []
 
 
 # ── next-episode prefetch ────────────────────────────────────────────────────
@@ -3292,8 +3744,7 @@ def note_playback(media: str, media_id: str, picker_label: str,
         return
     profile = "mobile" if "mob" in (picker_label or "") else "full"
     slow = "slow" in (picker_label or "")
-    key = (f"slow:{profile}:{media}:{media_id}" if slow
-           else f"{profile}:{media}:{media_id}")
+    key = _result_key(profile, media, media_id, slow=slow)
     hit = _cached_candidate(key)
     if not hit:
         return
@@ -3381,8 +3832,8 @@ async def _prepare_and_cache(media: str, playing_id: str, target_id: str,
                 logger.info(f"prefetch: no verified stream for {target_id} "
                             f"({kind}); not caching")
                 continue
-            _store(f"slow:{profile}:{media}:{target_id}" if kind == "slow"
-                   else f"{profile}:{media}:{target_id}", streams)
+            _store(_result_key(profile, media, target_id,
+                               slow=kind == "slow"), streams)
             if first_ready is None and started_at is not None:
                 first_ready = time.monotonic() - started_at
             top = " ".join((streams[0].get("name") or "").split())[:40]
@@ -3409,8 +3860,8 @@ async def prefetch_next(media: str, media_id: str, picker_label: str) -> None:
         telemetry.record_cache_event(
             "prewarm_join", target_id=nxt, active=active)
         return
-    fast_key = f"{profile}:{media}:{nxt}"
-    slow_key = f"slow:{profile}:{media}:{nxt}"
+    fast_key = _result_key(profile, media, nxt)
+    slow_key = _result_key(profile, media, nxt, slow=True)
     if _cache_ready(fast_key) and _cache_ready(slow_key):
         telemetry.record_cache_event(
             "prewarm_cache_hit", target_id=nxt, seconds=0)

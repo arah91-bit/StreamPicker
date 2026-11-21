@@ -404,7 +404,8 @@ class PrefetchCacheRegressionTests(unittest.IsolatedAsyncioTestCase):
                 hlsproxy._note_segment("tok", entry, st, 1024)
             await asyncio.sleep(0)
             self.assertTrue(entry.get("nextfetched"))
-            fired.assert_awaited_once_with("tt9999999:1:1", "slow", "")
+            # No caps on the session: a stock player, ranked as before.
+            fired.assert_awaited_once_with("tt9999999:1:1", "slow", "", "")
 
     async def test_playback_trigger_is_single_flight_and_carries_release(self) -> None:
         from app import proxy
@@ -418,7 +419,7 @@ class PrefetchCacheRegressionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(entry["nextfetched"])
         fired.assert_awaited_once_with(
-            "tt9999999:1:1", "fast", "file:known-release")
+            "tt9999999:1:1", "fast", "file:known-release", "")
 
     async def test_playback_prioritizes_next_episode_not_current_research(self) -> None:
         from app import proxy

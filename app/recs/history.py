@@ -129,13 +129,47 @@ async def last_play_at(viewer_key: str) -> int:
     return int(rows[0]["played_at"]) if rows else 0
 
 
+# A play has to have delivered at least this much to count as "started" at all,
+# so an index read or an abandoned open doesn't put a card in the row.
+STARTED_SECS = 60.0
+STARTED_MB = 32.0
+
+
+def _progress_of(row: dict) -> float | None:
+    """How much of this title was actually watched, 0-100, or None if unknown.
+
+    **Not `position_pct`.** That column is the offset of the last range request,
+    and every player reads the container index at EOF before it can show a
+    frame — so it pins near 100% on the *first* open of any file, whatever was
+    watched. Filtering on it hides genuinely part-watched titles from Continue
+    Watching (measured: 8 of one viewer's 92 "finished" rows had over two
+    minutes of real playback). Delivered bytes are the honest signal: the proxy
+    counted them, and they only advance as the file is consumed.
+    """
+    delivered = row.get("megabytes") or 0
+    total = row.get("total_bytes") or 0
+    if delivered and total:
+        return min(100.0, delivered * 1_000_000 / total * 100.0)
+    # No size known — fall back to the stored share, which for a Trakt-era
+    # import is the only thing there is.
+    pct = row.get("watched_pct")
+    return float(pct) if pct is not None else None
+
+
+def _started(row: dict) -> bool:
+    return ((row.get("seconds") or 0) >= STARTED_SECS
+            or (row.get("megabytes") or 0) >= STARTED_MB)
+
+
 async def in_progress(viewer_key: str, limit: int = 200) -> list[dict]:
     """Part-watched plays, most recent first — the Continue Watching source."""
     out = []
     seen: set[str] = set()
     for row in await db.play_history(viewer_key, limit=limit * 4):
-        pct = row.get("position_pct")
-        if pct is None or not (2.0 <= pct < FINISHED_PCT):
+        if not _started(row):
+            continue
+        pct = _progress_of(row)
+        if pct is not None and pct >= FINISHED_PCT:
             continue
         if row["content_id"] in seen:
             continue

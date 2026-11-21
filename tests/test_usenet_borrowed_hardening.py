@@ -295,6 +295,8 @@ def _lane_patches(search_one):
     stack = contextlib.ExitStack()
     for p in (patch.object(usenet, "INDEXERS", [("one", "https://x", "k")]),
               patch.object(usenet, "_search_one", search_one),
+              patch("app.meta.title_aliases", AsyncMock(return_value=())),
+              patch("app.meta.season_year", AsyncMock(return_value=None)),
               patch("app.meta.title_year", AsyncMock(
                   return_value=("Example Show", "Example Show", 2024))),
               patch("app.usenet_health.should_skip", return_value=False),

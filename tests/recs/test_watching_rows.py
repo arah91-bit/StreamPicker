@@ -242,8 +242,8 @@ class CollectionFilenameTests(unittest.IsolatedAsyncioTestCase):
 
     def test_characters_that_would_break_a_header_or_path_are_dropped(self):
         self.assertEqual(
-            main.collection_filename({"name": 'Toya/Tonya "T"'}),
-            "ToyaTonya T collections.json")
+            main.collection_filename({"name": 'Viewer/One "T"'}),
+            "ViewerOne T collections.json")
 
     def test_a_name_of_pure_punctuation_still_yields_a_usable_file(self):
         self.assertEqual(main.collection_filename({"name": "///"}),
@@ -252,16 +252,20 @@ class CollectionFilenameTests(unittest.IsolatedAsyncioTestCase):
     async def test_the_download_is_served_under_that_name(self):
         with (
             patch.object(main.db, "get_user", AsyncMock(
-                return_value={"token": "viewer", "name": "Skylar"})),
+                return_value={"token": "viewer", "name": "Taylor"})),
+            # A list of collections, which is what the export actually
+            # returns — the download now concatenates several of them.
             patch.object(main.profile_streaming, "collection_export_for_user",
-                         lambda _u: {"catalogs": []}),
+                         lambda _u: [{"id": "streaming", "folders": []}]),
+            patch.object(main.dramas, "collection_export_for_user",
+                         lambda _u, _addon: []),
         ):
             response = await self.client.get("/viewer/streaming-collection.json")
 
         self.assertEqual(response.status_code, 200)
         disposition = response.headers["content-disposition"]
-        self.assertIn('filename="Skylar collections.json"', disposition)
-        self.assertIn("filename*=UTF-8''Skylar%20collections.json", disposition)
+        self.assertIn('filename="Taylor collections.json"', disposition)
+        self.assertIn("filename*=UTF-8''Taylor%20collections.json", disposition)
 
 
 class UnairedNextEpisodeTests(unittest.IsolatedAsyncioTestCase):

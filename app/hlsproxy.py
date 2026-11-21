@@ -29,11 +29,13 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import ipaddress
 import logging
 import os
 import re
 import time
 from collections import OrderedDict
+from contextvars import ContextVar
 from urllib.parse import urljoin, urlsplit
 
 import httpx
@@ -61,10 +63,60 @@ _BUFFER_CONCURRENCY = max(1, int(os.environ.get("HLS_BUFFER_CONCURRENCY", "4")))
 _KEY = hashlib.sha256(
     ("hls:" + os.environ.get("ADDON_SECRET", "")).encode()).digest()
 
+# ── where playlist-derived URLs may point ───────────────────────────────────
+# The master playlist URL comes from a configured addon; every URI *inside* a
+# playlist comes from whoever wrote the playlist. Fetching those server-side
+# means an upstream could aim this process at the household's own services
+# (http://radarr:7878/…, http://nzbdav:8080/…, 169.254.169.254) and have the
+# answer relayed to a player. So a playlist-derived fetch may not reach a
+# loopback, private, link-local or otherwise non-global address, `localhost`,
+# or a bare (dot-less) Docker service name — unless it is on the candidate's
+# own master host, which is how an internal addon legitimately serves its own
+# segments. Enforced on every request including redirect hops (httpx calls the
+# hook per hop). Literal addresses and names only: a public name that resolves
+# privately is not chased through DNS.
+_guard_origin: ContextVar[str | None] = ContextVar("hls_guard_origin",
+                                                   default=None)
+
+
+class InternalTarget(httpx.RequestError):
+    """A playlist URI pointed at an internal address."""
+
+
+def _host_of(url: str) -> str:
+    try:
+        return (urlsplit(url or "").hostname or "").lower()
+    except ValueError:
+        return ""
+
+
+def _internal_host(host: str) -> bool:
+    host = (host or "").strip("[]").lower()
+    if not host:
+        return True
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        return not ipaddress.ip_address(host).is_global
+    except ValueError:
+        return "." not in host            # a bare Docker service name
+
+
+async def _guard_request(request: httpx.Request) -> None:
+    origin = _guard_origin.get()
+    if origin is None:
+        return
+    host = (request.url.host or "").lower()
+    if host != origin and _internal_host(host):
+        raise InternalTarget(f"playlist URI targets internal host {host!r}",
+                             request=request)
+
+
 _client = httpx.AsyncClient(
     follow_redirects=True,
     timeout=httpx.Timeout(connect=10, read=30, write=10, pool=10),
-    headers={"User-Agent": "Stremio"})
+    headers={"User-Agent": "Stremio"},
+    event_hooks={"request": [_guard_request]})
 
 # Upstream request headers a stream may declare (behaviorHints.proxyHeaders.
 # request). Allowlisted: these carry host requirements (referers, tokens) —
@@ -535,6 +587,34 @@ def _playlist_response(token: str, entry: dict, st: dict, text: str,
                     headers={"Cache-Control": "no-store"})
 
 
+class _Fetched:
+    """A bounded GET: status, headers, at most `cap` bytes, final URL."""
+
+    __slots__ = ("status_code", "headers", "content", "url", "too_large")
+
+    def __init__(self, status_code, headers, content, url, too_large):
+        self.status_code, self.headers, self.content = status_code, headers, content
+        self.url, self.too_large = url, too_large
+
+
+async def _fetch_capped(url: str, headers: dict, timeout: float,
+                        cap: int) -> _Fetched:
+    """GET `url`, reading no more than `cap` bytes. A playlist URL that turns
+    out to serve a whole film used to be read into memory in full before the
+    size check rejected it."""
+    async with _client.stream("GET", url, headers=headers,
+                              timeout=timeout) as r:
+        buf = bytearray()
+        too_large = False
+        async for chunk in r.aiter_bytes():
+            buf += chunk
+            if len(buf) > cap:
+                too_large = True
+                break
+        return _Fetched(r.status_code, r.headers, bytes(buf), str(r.url),
+                        too_large)
+
+
 async def serve_master(token: str, entry: dict, request) -> Response:
     """Entry point for /proxy/{token} when the token wraps an HLS stream: pick
     the best non-cooled candidate, fetch its playlist upstream (with the
@@ -574,14 +654,14 @@ async def serve_master(token: str, entry: dict, request) -> Response:
             continue
         rh = c.get("rh") or {}
         try:
-            r = await _client.get(c["u"], headers=cfsolver.merge_headers(c["u"], rh),
-                                  timeout=min(10.0, remaining))
+            r = await _fetch_capped(c["u"], cfsolver.merge_headers(c["u"], rh),
+                                    min(10.0, remaining), _PLAYLIST_MAX)
         except Exception as e:
             logger.info(f"hls: cand {idx} playlist fetch failed "
                         f"({type(e).__name__})")
             bad(c, f"playlist-{type(e).__name__.lower()}")
             continue
-        if r.status_code != 200 or len(r.content) > _PLAYLIST_MAX:
+        if r.status_code != 200 or r.too_large:
             if cfsolver.looks_challenged(r.status_code, r.headers, r.content):
                 cfsolver.note_challenge(c["u"])
             bad(c, (f"playlist-http-{r.status_code}" if r.status_code != 200
@@ -607,6 +687,24 @@ async def serve_master(token: str, entry: dict, request) -> Response:
 async def serve_resource(token: str, entry: dict, request) -> Response:
     """Signed sub-resource fetch: variant playlists come back rewritten,
     segments/keys/init maps stream through (with retries and read-ahead)."""
+    guard = _guard_origin.set(_guard_host(token, entry, request))
+    try:
+        return await _serve_resource(token, entry, request)
+    finally:
+        _guard_origin.reset(guard)
+
+
+def _guard_host(token: str, entry: dict, request) -> str:
+    """The one internal host this resource may reach: its candidate's own."""
+    candidate_key = request.query_params.get("c", "")
+    cands = entry.get("cands") or []
+    cand = next((c for c in cands if _cand_key(c) == candidate_key), None) \
+        if candidate_key else None
+    cand = cand or _st(token, entry).get("cand") or (cands[0] if cands else {})
+    return _host_of(cand.get("u") or "")
+
+
+async def _serve_resource(token: str, entry: dict, request) -> Response:
     u = request.query_params.get("u", "")
     s = request.query_params.get("s", "")
     try:

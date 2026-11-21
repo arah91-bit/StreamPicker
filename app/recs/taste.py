@@ -586,6 +586,8 @@ class Candidate:
     # How good this is *as a departure* — quality, times how far outside the
     # viewer's usual it sits. Only consulted for the reserved slots.
     explore_score: float = 0.0
+    # Set by select_diverse when the card filled a variety slot.
+    variety: bool = False
 
 
 def genre_distribution(items) -> dict[str, float]:
@@ -691,10 +693,50 @@ def _fill(limit: int, jittered: dict[str, float], taken: list[Candidate],
             taken_media.get(candidate.media_type, 0) + 1)
 
 
+def _take(candidate: Candidate, taken: list[Candidate],
+          taken_genres: dict[str, float], taken_seeds: dict[str, int],
+          taken_media: dict[str, int]) -> None:
+    taken.append(candidate)
+    genres = [g for g in candidate.genres if g]
+    if genres:
+        share = 1.0 / len(genres)
+        for slug in genres:
+            taken_genres[slug] = taken_genres.get(slug, 0.0) + share
+    taken_seeds[candidate.seed_id] = taken_seeds.get(candidate.seed_id, 0) + 1
+    taken_media[candidate.media_type] = (
+        taken_media.get(candidate.media_type, 0) + 1)
+
+
+def _variety_pick(remaining: dict[str, Candidate], jittered: dict[str, float],
+                  taken: list[Candidate], variety_genres: set[str],
+                  core_genres: set[str], window: int) -> Candidate | None:
+    """The best candidate for a variety slot, or None.
+
+    It must carry one of the viewer's secondary genres. Preferred, in order:
+    clear of their core genres and of every genre in the last ``window``
+    cards; clear of the core; clear of the window. The pool is the same one
+    the rest of the row is drawn from, so a variety card is still something
+    their history points at — just not the thing the cards beside it are.
+    """
+    recent = {g for c in taken[-window:] for g in c.genres if g}
+    eligible = [c for c in remaining.values()
+                if variety_genres & set(c.genres)]
+    for keep in (lambda c: not (set(c.genres) & (core_genres | recent)),
+                 lambda c: not (set(c.genres) & core_genres),
+                 lambda c: not (set(c.genres) & recent)):
+        tier = [c for c in eligible if keep(c)]
+        if tier:
+            return max(tier, key=lambda c: jittered[c.imdb_id])
+    return None
+
+
 def select_diverse(candidates: list[Candidate], limit: int, *,
                    rng=None, movie_share: float = 0.5,
                    explore_share: float = 0.0,
-                   target_genres: dict[str, float] | None = None) -> list[Candidate]:
+                   target_genres: dict[str, float] | None = None,
+                   variety_every: int = 0,
+                   variety_genres: set[str] | None = None,
+                   core_genres: set[str] | None = None) -> list[Candidate]:
     """Greedily fill a row, spending relevance to buy variety.
 
     At every step the highest-scoring candidate wins *after* subtracting what
@@ -743,8 +785,28 @@ def select_diverse(candidates: list[Candidate], limit: int, *,
         explore_slots = min(round(limit * explore_share), len(explorers))
 
     # Tailored slots first, so the row opens on what the viewer came for.
-    _fill(limit - explore_slots, jittered, taken, taken_genres, taken_seeds,
-          taken_media, remaining, target, seed_quota, movie_quota, series_quota)
+    # With variety on, every `variety_every`-th card is a variety pick: a
+    # genre the viewer also watches, unlike the cards just before it. Off
+    # (0) unless asked for, so only Top Picks has these.
+    if variety_every > 1 and variety_genres:
+        tailored = limit - explore_slots
+        while remaining and len(taken) < tailored:
+            if (len(taken) + 1) % variety_every == 0:
+                pick = _variety_pick(remaining, jittered, taken,
+                                     set(variety_genres), set(core_genres or ()),
+                                     variety_every - 1)
+                if pick is not None:
+                    remaining.pop(pick.imdb_id)
+                    pick.variety = True
+                    _take(pick, taken, taken_genres, taken_seeds, taken_media)
+                    continue
+            _fill(len(taken) + 1, jittered, taken, taken_genres, taken_seeds,
+                  taken_media, remaining, target, seed_quota, movie_quota,
+                  series_quota)
+    else:
+        _fill(limit - explore_slots, jittered, taken, taken_genres, taken_seeds,
+              taken_media, remaining, target, seed_quota, movie_quota,
+              series_quota)
 
     if explore_slots:
         by_departure = sorted(

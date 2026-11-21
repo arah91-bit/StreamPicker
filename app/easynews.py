@@ -151,26 +151,51 @@ def _queries(media: str, media_id: str, titles: list[str],
     film. Alias fan-out is bounded at three — every extra query is another
     round trip and the strict gates make breadth cheap only in coverage, not in
     latency."""
+    suffix = _query_suffix(media, media_id, year)
+    out: list[str] = []
+    for title in _distinct_titles(titles)[:3]:
+        out.append(f"{usenet._query_text(title)} {suffix}".strip())
+    return out
+
+
+def _query_suffix(media: str, media_id: str, year: int | None) -> str:
+    """ "SxxEyy" for an episode, the year for a film, else nothing."""
     parts = media_id.split(":")
-    episode = ""
     if media != "movie" and len(parts) >= 3:
         try:
-            episode = f"S{int(parts[1]):02d}E{int(parts[2]):02d}"
+            return f"S{int(parts[1]):02d}E{int(parts[2]):02d}"
         except ValueError:
-            episode = ""
+            return ""
+    return str(year) if year else ""
+
+
+def _distinct_titles(titles: list[str]) -> list[str]:
+    """Titles in metadata order, one per accent-folded spelling."""
     out: list[str] = []
     seen: set[str] = set()
     for raw in titles:
-        title = usenet._query_text(str(raw or "").strip())
-        folded = title.casefold()
-        if not title or folded in seen:
-            continue
-        seen.add(folded)
-        out.append(f"{title} {episode}" if episode else
-                   f"{title} {year}" if year else title)
-        if len(out) >= 3:
-            break
+        title = str(raw or "").strip()
+        key = usenet._norm(title)
+        if key and key not in seen:
+            seen.add(key)
+            out.append(title)
     return out
+
+
+def _fallback_queries(media: str, media_id: str, titles: list[str],
+                      year: int | None) -> list[str]:
+    """The second pass, run only when the first matched nothing: the first
+    three titles spelled as written when that differs from the folded form
+    (posted filenames are nearly always unaccented, but not always), then up
+    to two further titles. Bounded like the first pass: each is a round trip."""
+    suffix = _query_suffix(media, media_id, year)
+    distinct = _distinct_titles(titles)
+    queries = [f"{spelling} {suffix}".strip() for title in distinct[:3]
+               for spelling in usenet._spellings(title)[1:]]
+    queries += [f"{usenet._query_text(title)} {suffix}".strip()
+                for title in distinct[3:5]]
+    first = set(_queries(media, media_id, titles, year))
+    return [q for q in dict.fromkeys(queries) if q not in first][:5]
 
 
 async def _search(query: str) -> dict:
@@ -253,7 +278,7 @@ def _height_of(row: dict) -> int:
 
 def _candidates(rows: list[dict], titles: list[str],
                 season_episode: tuple[int, int] | None,
-                year: int | None,
+                year: int | frozenset[int] | None,
                 expect_runtime: float | None) -> list[dict]:
     """Rows that are actually this title, best-first.
 
@@ -381,8 +406,12 @@ async def streams(media: str, media_id: str) -> list[dict]:
             expect_runtime = await meta.expected_runtime(media, media_id)
         except Exception:
             expect_runtime = None
-        searched = await asyncio.gather(*(_search(q) for q in queries),
-                                        return_exceptions=True)
+        # The season-year lookup (see usenet._accepted_years) overlaps the
+        # searches rather than delaying a fast-lane source; it never raises.
+        searched, accepted_years = await asyncio.gather(
+            asyncio.gather(*(_search(q) for q in queries),
+                           return_exceptions=True),
+            usenet._accepted_years(media, media_id, year))
         if all(isinstance(p, BaseException) for p in searched):
             raise next(p for p in searched if isinstance(p, BaseException))
     except Exception as e:
@@ -395,21 +424,34 @@ async def streams(media: str, media_id: str) -> list[dict]:
     out: list[dict] = []
     seen: set[str] = set()
     matched = 0
-    for payload in searched:
-        if not isinstance(payload, dict):
-            continue
-        rows = payload.get("data")
-        cands = _candidates(rows if isinstance(rows, list) else [],
-                            titles, season_episode, year, expect_runtime)
-        matched += len(cands)
-        for cand in cands:
-            key = f"{_name_of(cand).lower()}{_ext_of(cand)}"
-            if key in seen:
+
+    def collect(pages: list) -> None:
+        nonlocal matched
+        for payload in pages:
+            if not isinstance(payload, dict):
                 continue
-            seen.add(key)
-            built = _row(payload, cand)
-            if built:
-                out.append(built)
+            rows = payload.get("data")
+            cands = _candidates(rows if isinstance(rows, list) else [],
+                                titles, season_episode, accepted_years,
+                                expect_runtime)
+            matched += len(cands)
+            for cand in cands:
+                key = f"{_name_of(cand).lower()}{_ext_of(cand)}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                built = _row(payload, cand)
+                if built:
+                    out.append(built)
+
+    collect(searched)
+    if not matched:
+        # Likeliest spellings first; cycle through the rest before giving up.
+        extra = _fallback_queries(media, media_id, titles, year)
+        if extra:
+            collect(await asyncio.gather(*(_search(q) for q in extra),
+                                         return_exceptions=True))
+            queries = queries + extra
     out = out[:MAX_RESULTS]
     if not out:
         _record(media, media_id, "empty", "no matching files")

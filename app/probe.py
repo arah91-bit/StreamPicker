@@ -16,7 +16,9 @@ import logging
 import os
 import re
 import secrets
+import struct
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from urllib.parse import urljoin
 
@@ -139,9 +141,18 @@ class ProbeResult:
     acodecs: tuple = ()      # audio codec names, () = not sniffed
     vcodec: str = ""         # video codec name, "" = not sniffed
     audio_langs: tuple = ()  # normalized ISO-639-1 audio-track languages
+    # Measured video transfer function: "pq", "hlg", or "" for SDR/unknown.
+    # Feeds display-compatibility demotion the same way acodecs/vcodec feed
+    # decode demotion — a measured answer where the release name is a claim.
+    transfer: str = ""
     media_secs: float = 0.0  # measured duration (playlist sum / container), 0 = unknown
     content_kind: str = ""   # "file" or "hls" after content sniffing
     encrypted: bool = False  # HLS playlist declares encrypted media segments
+    # Subtitle-track languages read from the container's track table. None =
+    # the table was never read (no sniff, or an MP4 whose index sits at EOF);
+    # () = measured, and the file carries no switchable subtitles at all.
+    sub_langs: tuple | None = None
+    total: int = 0           # file length from the probe's Content-Range, 0 = unknown
     head: bytes = field(default=b"", repr=False)   # transient; cleared by probe()
 
 
@@ -306,6 +317,89 @@ def _hls_variant_info(text: str) -> dict:
 
 _CONTENT_RANGE_RE = re.compile(r"^bytes\s+(\d+)-(\d+)/(\d+)$", re.I)
 
+# Set by the picker for a title whose original language is not English: only
+# then does "does this file carry switchable subtitles?" change the ranking,
+# so only then is an MP4's end-of-file index worth a second range read.
+TRACKS_WANTED: ContextVar[bool] = ContextVar("probe_tracks_wanted", default=False)
+# An MP4 index is a few MB (3.4 MB for a 45-minute 4K episode). Anything past
+# this after the media data is not an index we should be downloading.
+_MP4_INDEX_MAX = 32 * 1024 * 1024
+_MP4_INDEX_TIMEOUT = float(os.environ.get("PROBE_MP4_INDEX_TIMEOUT", "8"))
+
+
+def _mp4_boxes(buf: bytes, base: int = 0):
+    """Walk ISO-BMFF top-level box headers in `buf` (which starts at file
+    offset `base`). Yields (kind, offset, size) — size 0 = "to end of file" —
+    and stops at the first header that is not wholly inside `buf`."""
+    off = 0
+    while off + 8 <= len(buf):
+        size, kind = struct.unpack(">I4s", buf[off:off + 8])
+        if size == 1:
+            if off + 16 > len(buf):
+                return
+            size = struct.unpack(">Q", buf[off + 8:off + 16])[0]
+            if size < 16:
+                return
+        elif size != 0 and size < 8:
+            return                                   # corrupt: refuse to loop
+        yield kind, base + off, size
+        if size == 0:
+            return
+        off += size
+
+
+def _mp4_index_offset(head: bytes, total: int) -> int | None:
+    """Where an MP4's end-of-file index starts, or None when it is already in
+    the head, runs to EOF, or would be implausibly large to fetch."""
+    end = 0
+    for kind, off, size in _mp4_boxes(head):
+        if kind == b"moov" or size == 0:
+            return None
+        end = off + size
+    if end <= 0 or end >= total or total - end > _MP4_INDEX_MAX:
+        return None
+    return end
+
+
+async def _mp4_index(url: str, head: bytes, total: int,
+                     headers: dict | None) -> bytes:
+    """`ftyp` + `moov` of an MP4 whose index sits after its media data: a
+    file ffprobe can read the whole track table from. b"" when not found."""
+    boxes = list(_mp4_boxes(head))
+    if not boxes or boxes[0][0] != b"ftyp" or not boxes[0][2]:
+        return b""
+    ftyp = head[:boxes[0][2]]
+    start = _mp4_index_offset(head, total)
+    if start is None:
+        return b""
+    req = dict(headers or {})
+    req["Range"] = f"bytes={start}-{total - 1}"
+    req = cfsolver.merge_headers(url, req)
+
+    async def _fetch() -> bytes:
+        buf = bytearray()
+        async with _client.stream("GET", url, headers=req) as resp:
+            cr = _CONTENT_RANGE_RE.match(
+                resp.headers.get("content-range", "").strip())
+            if resp.status_code != 206 or not cr or int(cr.group(1)) != start:
+                return b""
+            async for chunk in resp.aiter_bytes():
+                buf += chunk
+                if len(buf) > _MP4_INDEX_MAX:
+                    return b""
+        return bytes(buf)
+
+    try:
+        tail = await asyncio.wait_for(_fetch(), _MP4_INDEX_TIMEOUT)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return b""
+    for kind, off, size in _mp4_boxes(tail):
+        if kind == b"moov" and size and off + size <= len(tail):
+            return ftyp + tail[off:off + size]
+    return b""
+
 
 async def _probe_spots(url: str, total: int, ttfb_max: float,
                        headers: dict | None) -> str:
@@ -381,11 +475,22 @@ async def probe(url: str, need_bps: float | None, ttfb_max: float,
             _free()
     if r.ok and r.head and CODEC_SNIFF and vprobe.enabled():
         try:
-            ac, vc, secs, langs = await vprobe.media_info_of(r.head)
-            r.acodecs, r.vcodec = tuple(ac), vc
-            r.audio_langs = tuple(langs)
-            if secs:
-                r.media_secs = secs
+            info = await vprobe.media_details_of(r.head)
+            if (info.subs is None and TRACKS_WANTED.get()
+                    and r.head[4:8] == b"ftyp" and r.total):
+                # An MP4 that keeps its index at EOF told the head sniff
+                # nothing. When the caller needs the track table (whether a
+                # foreign title carries switchable subtitles), fetch just the
+                # index — one bounded range read — rather than guess.
+                index = await _mp4_index(url, r.head, r.total, headers)
+                if index:
+                    info = await vprobe.media_details_of(index)
+            r.acodecs, r.vcodec = tuple(info.audio), info.video
+            r.audio_langs = tuple(info.langs)
+            r.transfer = info.transfer
+            r.sub_langs = tuple(info.subs) if info.subs is not None else None
+            if info.secs:
+                r.media_secs = info.secs
         except Exception:
             pass
     r.head = b""            # transient sniff buffer — never leaves this module
@@ -536,9 +641,12 @@ async def _probe_url(url: str, required: float, ttfb_max: float,
                         ctype, head, encrypted=bool((media or {}).get("encrypted"))):
                     return ProbeResult(False, ttfb=ttfb, speed_bps=speed, **ni,
                                        reason="not a recognized media container")
+                cr = _CONTENT_RANGE_RE.match(
+                    resp.headers.get("content-range", "").strip())
                 return ProbeResult(True, ttfb=ttfb, speed_bps=speed, **ni,
                                    head=bytes(sniff) if hops == 0 else b"",
                                    content_kind="hls" if hops else "file",
+                                   total=int(cr.group(3)) if cr else 0,
                                    **(media or {}))
     except asyncio.CancelledError:
         raise

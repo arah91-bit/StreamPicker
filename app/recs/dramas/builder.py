@@ -395,10 +395,15 @@ async def build() -> None:
             if not row:
                 continue
             kept_actors.append(a)
-            # isRequired hides the catalog from Nuvio's home page (it filters
-            # out catalogs with required extras) while collections can still
-            # fetch it — these rows exist to feed the imported collection.
+            # Both guards, because the two clients use different ones and only
+            # one of them was here. Mobile hides descriptors carrying a required
+            # extra; **TV honours showInHome=false and nothing else**, so these
+            # actor rows — Drama Stars — arrived loose on the TV home screen for
+            # every viewer opted into dramas, while the same manifest looked
+            # correct on a phone. Same pairing as profile_streaming's
+            # collection-only descriptors; see the note in recs/main.py.
             defs.append({"type": "series", "id": cid, "name": a["name"],
+                         "showInHome": False,
                          "extra": [{"name": "genre", "options": ["All"],
                                     "isRequired": True}]})
             rows[cid] = row
@@ -413,6 +418,7 @@ async def build() -> None:
             rows[cid] = rows[f"{cid}|Trending"]
             defs.append({
                 "type": "series", "id": cid, "name": f"{adj} Dramas",
+                "showInHome": False,
                 "genres": GENRES,
                 "extra": [{"name": "genre", "options": GENRES,
                            "isRequired": True}],

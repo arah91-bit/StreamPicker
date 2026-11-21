@@ -46,11 +46,13 @@ class AdminOnboardingTests(unittest.TestCase):
         os.environ.pop("ADMIN_USERNAME", None)
         os.environ.pop("ADMIN_PASSWORD", None)
         adminui._AUTH_CACHE.clear()
+        adminui._FAILS.clear()
         self.local = TestClient(main.app, client=("127.0.0.1", 50000))
 
     def tearDown(self):
         self.local.close()
         adminui._AUTH_CACHE.clear()
+        adminui._FAILS.clear()
         self._env.stop()
         self._tmp.cleanup()
 
@@ -76,6 +78,40 @@ class AdminOnboardingTests(unittest.TestCase):
             headers={"x-csrf-token": self._csrf()},
             json=self._payload(**changes),
         )
+
+    def test_repeated_wrong_passwords_lock_the_client_out(self):
+        """Each wrong password costs an scrypt derivation, but nothing else
+        slowed a guesser down on a published dashboard."""
+        self.assertEqual(201, self._create().status_code)
+        wrong = _basic(self.USERNAME, "not the password at all")
+        self.assertEqual(401, self.local.get("/").status_code,
+                         "the credential-less challenge is not a failure")
+        for _ in range(adminui._FAIL_FREE):
+            self.assertEqual(401, self.local.get("/", headers=wrong).status_code)
+        with mock.patch.object(admin_auth, "verify_credentials") as verify:
+            locked = self.local.get("/", headers=wrong)
+            right = self.local.get("/", headers=_basic(self.USERNAME,
+                                                       self.PASSWORD))
+        self.assertEqual(429, locked.status_code)
+        self.assertIn("retry-after", locked.headers)
+        self.assertEqual(429, right.status_code,
+                         "a locked client is not even checked")
+        verify.assert_not_called()
+
+        other = TestClient(main.app, client=("127.0.0.2", 50000))
+        self.addCleanup(other.close)
+        self.assertEqual(200, other.get("/", headers=_basic(
+            self.USERNAME, self.PASSWORD)).status_code,
+            "one client's lockout is not everyone's")
+
+    def test_a_success_clears_the_failures(self):
+        self.assertEqual(201, self._create().status_code)
+        wrong = _basic(self.USERNAME, "not the password at all")
+        for _ in range(adminui._FAIL_FREE - 1):
+            self.local.get("/", headers=wrong)
+        self.assertEqual(200, self.local.get("/", headers=_basic(
+            self.USERNAME, self.PASSWORD)).status_code)
+        self.assertNotIn("127.0.0.1", adminui._FAILS)
 
     def test_first_run_form_creates_separate_admin_credentials(self):
         self.assertTrue(admin_auth.setup_required())

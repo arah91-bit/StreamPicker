@@ -17,19 +17,26 @@ body{margin:0;background:var(--bg);color:var(--ink);
   padding:max(16px,env(safe-area-inset-top)) 16px
           max(16px,env(safe-area-inset-bottom));
   display:flex;flex-direction:column;gap:14px}
-header{display:flex;flex-direction:column;gap:3px}
-h1{margin:0;font-size:1.3rem;letter-spacing:-.01em}
-.who{color:var(--dim);font-size:.9rem}
 .hint{color:var(--dim);font-size:.9rem;margin:0}
 .hide{display:none!important}
-.room{display:flex;gap:6px;flex-wrap:wrap;font-size:.78rem}
+.room{display:flex;gap:6px;flex-wrap:wrap;font-size:.78rem;align-items:center}
+/* `display:contents` so the peers painted into #room are laid out by .room
+   itself, and the "you" pill sits in the same row rather than beside a box. */
+#room{display:contents}
 .peer{border:1px solid var(--line);border-radius:999px;padding:3px 9px;
   color:var(--dim)}
 .peer.here{border-color:#22562f;color:var(--yes)}
+/* Which seat this is. A household gets one link each and they are easy to mix
+   up; the header that used to say so was costing the poster its height. */
+.peer.you{border-color:var(--accent);color:var(--accent);font-weight:600}
+/* The voting step is the flex context the card grows inside. Without it this
+   section is a plain block, `.deck{flex:1}` has nothing to take a share of,
+   and the slack pools under the buttons instead of going to the poster. */
+#playing{flex:1;min-height:0;display:flex;flex-direction:column;gap:14px}
 /* Same trap as the taste page: `flex:1` only distributes leftover space, so
    without a floor this collapses to nothing on a phone and the absolutely
    positioned card renders 0x0. */
-.deck{position:relative;flex:1;min-height:clamp(260px,52vh,460px)}
+.deck{position:relative;flex:1;min-height:clamp(220px,46vh,480px)}
 .card{position:absolute;inset:0;background:var(--card);border:1px solid var(--line);
   border-radius:16px;overflow:hidden;display:flex;flex-direction:column}
 /* Contained, not cropped — the title and the faces are what tell somebody
@@ -66,11 +73,14 @@ h1{margin:0;font-size:1.3rem;letter-spacing:-.01em}
 </style></head>
 <body><div class="wrap">
 
-<header>
-  <h1>Movie night</h1>
-  <p class="who">you're <b>__WHO__</b> — pick anything you'd be happy to watch</p>
-</header>
-<div class="room" id="room"></div>
+<!-- The room strip stays where the title and the running tally went. Those
+     were about this screen; this is about the other people, which is the whole
+     reason the feature exists — and it is the only sign that anybody else is
+     still voting. -->
+<div class="room">
+  <span class="peer you">you're __WHO__</span>
+  <span id="room"></span>
+</div>
 
 <section id="playing">
   <div class="deck" id="deck"></div>
@@ -78,7 +88,7 @@ h1{margin:0;font-size:1.3rem;letter-spacing:-.01em}
     <button class="no" id="pass"><span class="em">👎</span>Not tonight</button>
     <button class="yes" id="want"><span class="em">👍</span>I'd watch it</button>
   </div>
-  <p class="hint" id="status"></p>
+  <p class="hint hide" id="status"></p>
 </section>
 
 <section id="done" class="hide">
@@ -94,6 +104,12 @@ h1{margin:0;font-size:1.3rem;letter-spacing:-.01em}
 </div>
 <script>
 const base = location.pathname.replace(/\/$/, "");
+// Seat-scoped, not token-scoped: a guest seat carries no access to anybody's
+// profile and must not gain any by way of a trailer button.
+const TRAILER_BASE = base + "/trailer";
+</script>
+__TRAILER__
+<script>
 const $ = id => document.getElementById(id);
 let current = null, busy = false, poll = null;
 
@@ -129,17 +145,27 @@ function paint(s) {
   $("want").disabled = waiting;
   $("pass").disabled = waiting;
   if (waiting) {
-    deck.innerHTML = s.exhausted
-      ? '<p class="hint">That\'s everything on the list. Waiting to see if '
-        + 'the others land on one of yours…</p>'
-      : '<p class="hint">Loading…</p>';
+    deck.innerHTML = !s.exhausted
+      ? '<p class="hint">Loading…</p>'
+      : s.finding_more
+      // The pool is topped up from what the room has agreed on, so running dry
+      // is usually a pause and not an ending. Saying "that's the lot" when
+      // more are seconds away is how a room gives up early.
+      ? '<p class="hint">Finding more you might agree on…</p>'
+      : '<p class="hint">That\'s everything for now. Waiting to see if '
+        + 'the others land on one of yours…</p>';
+    // The one status worth keeping: with no card on screen and no explanation,
+    // a room full of people waiting on each other looks like a broken page.
+    // The running tally that used to live here was furniture.
     $("status").innerHTML = '<span class="wait"><span class="dot"></span>'
       + 'waiting for the others</span>';
+    $("status").classList.remove("hide");
     return;
   }
   const el = document.createElement("article");
   el.className = "card";
-  el.innerHTML = `<img alt="" loading="eager">
+  el.innerHTML = `<span class="playhint">▶ Trailer</span>
+    <img alt="" loading="eager">
     <div class="info"><div class="t"></div>
     <div class="sub"><span class="yr"></span><span class="gn"></span>
     <span class="rt"></span></div></div>`;
@@ -149,11 +175,9 @@ function paint(s) {
   el.querySelector(".yr").textContent = card.year || "";
   el.querySelector(".gn").textContent = (card.genres || []).join(" · ");
   el.querySelector(".rt").textContent = card.rating ? "★ " + card.rating : "";
+  attachTrailer(el, card);
   deck.appendChild(el);
-  // `in_play` shrinks as films are ruled out by anybody, so it is the honest
-  // measure of how much is left to agree on — the full list never was.
-  $("status").textContent = `${s.voted} seen · ${s.wanted} you'd watch · `
-    + `${s.in_play} still in play`;
+  $("status").classList.add("hide");
 }
 
 async function refresh() {

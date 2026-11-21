@@ -236,6 +236,70 @@ class SilenceTimerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(e.playfail.get("rejected"))
         learn.assert_called_once_with(e, played=False)
 
+    async def test_a_retry_loop_rejects_without_ever_going_quiet(self):
+        """The other shape of giving up. Live case: an Easynews fansub remux
+        whose filename said AAC and whose audio was FLAC — the player reopened
+        at byte 0 every ~0.8s for 67s, so `e.last` was never stale and silence
+        never came. It never failed over; the viewer switched source by hand.
+        Strikes still arriving at the end of the window say the same thing
+        silence does."""
+        e = _entry("file:loop")
+        _short(e.playfail, sig="file:loop")
+        _short(e.playfail, sig="file:loop")
+        with (patch.object(proxy, "_REJECT_SILENCE_SECS", 0.05),
+              patch("app.proxy.reputation.observe") as observe,
+              patch("app.proxy.reputation.cooldown") as cooldown,
+              patch("app.proxy.telemetry.record_buffer")):
+            proxy._arm_reject_timer(e, "tok1")
+            for _ in range(proxy.PLAYER_REJECT_STARTS):
+                await asyncio.sleep(0.01)
+                e.consumers = 1                    # never quiet for a moment
+                _short(e.playfail, sig="file:loop")
+                e.last = time.time()
+                e.consumers = 0
+            await asyncio.sleep(0.2)
+
+        self.assertTrue(e.playfail.get("rejected"))
+        observe.assert_called_once()
+        cooldown.assert_called_once_with("file:loop", proxy.REJECT_COOLDOWN)
+
+    async def test_a_busy_reader_scoring_no_strikes_is_still_not_a_loop(self):
+        """The discriminator is strikes, not traffic. A player chunk-reading a
+        working file touches the entry constantly and opens at nonzero offsets,
+        so it scores nothing while the window runs — it must survive."""
+        e = _entry("file:reading")
+        _short(e.playfail, sig="file:reading")
+        _short(e.playfail, sig="file:reading")
+        with (patch.object(proxy, "_REJECT_SILENCE_SECS", 0.05),
+              patch("app.proxy.reputation.observe") as observe):
+            proxy._arm_reject_timer(e, "tok1")
+            for _ in range(4):
+                await asyncio.sleep(0.01)
+                _short(e.playfail, sig="file:reading", offset=90_000_000)
+                e.last = time.time()
+            await asyncio.sleep(0.2)
+
+        self.assertFalse(e.playfail.get("rejected"))
+        observe.assert_not_called()
+
+    async def test_a_retry_loop_that_starts_playing_is_left_alone(self):
+        """`real_play` stays the latch that outranks both branches."""
+        e = _entry("file:recovers")
+        _short(e.playfail, sig="file:recovers")
+        _short(e.playfail, sig="file:recovers")
+        with (patch.object(proxy, "_REJECT_SILENCE_SECS", 0.05),
+              patch("app.proxy.reputation.observe") as observe):
+            proxy._arm_reject_timer(e, "tok1")
+            await asyncio.sleep(0.01)
+            for _ in range(proxy.PLAYER_REJECT_STARTS):
+                _short(e.playfail, sig="file:recovers")
+            _short(e.playfail, sig="file:recovers",
+                   dur=45.0, served=900_000_000)   # then it settled and played
+            await asyncio.sleep(0.2)
+
+        self.assertFalse(e.playfail.get("rejected"))
+        observe.assert_not_called()
+
     async def test_below_strike_threshold_never_arms_the_timer(self):
         e = _entry("file:once")
         _short(e.playfail, sig="file:once")

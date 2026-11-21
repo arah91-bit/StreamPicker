@@ -4,3 +4,9 @@ httpx==0.28.*
 cryptography>=46,<49
 # app/recs (Daily Picks catalogs) — per-viewer SQLite
 aiosqlite==0.21.*
+# Trailer playback on the taste page. Used only to resolve a YouTube id to a
+# direct progressive-MP4 URL, which this service then proxies — that is what
+# makes the trailer ad-free, since ads belong to the player and not to the
+# file. Deliberately not pinned tight: YouTube changes its extraction path
+# often, and a pinned yt-dlp is a dead trailer button a month later.
+yt-dlp>=2026.7,<2027

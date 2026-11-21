@@ -1,9 +1,11 @@
 """Daily refresh loop.
 
-Daily Picks is the household's viewing surface, so freshness matters even for
-someone returning after several quiet days.  Every profile is rebuilt nightly;
-otherwise the first session after an absence would be served an old slate and
-would not become fresh until the *following* night.
+Every profile somebody used since its last build is rebuilt nightly. A profile
+nobody opened or watched on is left alone: rebuilding it costs a full TMDB
+fan-out for a slate no one will see. When its viewer does come back, opening
+the app rebuilds it in the background (main._refresh_if_stale), so the slate
+is fresh within minutes of their return rather than the following night. The
+very first page they load after a long absence is the stored one.
 """
 
 import asyncio
@@ -12,19 +14,34 @@ import logging
 import time
 
 from app.recs import config, db
+from app.recs import history as local_history
 from app.recs.catalogs import generate_for_user
+from app.recs.profile_streaming import private_namespace_for_user
 logger = logging.getLogger("nuvio-recs")
 
 async def _refresh_reason(user: dict) -> str | None:
-    """Return why this user should rebuild.
+    """Return why this user should rebuild, or None to leave them be.
 
-    Kept as a small policy function for the admin status/tests.  At the nightly
-    boundary every healthy profile is eligible because release, popularity,
-    theme, and rotation signals change even when watch history did not.
+    Kept as a small policy function for the admin status/tests. A profile is
+    rebuilt nightly only if somebody used it since its last build: opened the
+    app (``last_served_at``) or watched something on it. Otherwise the work is
+    wasted. When such
+    a viewer comes back, opening the app rebuilds their slate in the
+    background (see main._refresh_if_stale).
     """
     if not user["last_generated_at"] or user["last_error"]:
         return "missing catalogs" if not user["last_generated_at"] else "retry after error"
-    return "daily freshness"
+    built = user["last_generated_at"]
+    if (user.get("last_served_at") or 0) >= built:
+        return "opened since last build"
+    try:
+        last_play = await local_history.last_play_at(
+            private_namespace_for_user(user))
+    except Exception:
+        last_play = 0
+    if last_play >= built:
+        return "watched since last build"
+    return None
 
 
 async def _needs_refresh(user: dict) -> bool:
@@ -47,6 +64,9 @@ async def _refresh_all(reason: str) -> None:
     ran = False
     for user in users:
         refresh_reason = await _refresh_reason(user)
+        if refresh_reason is None:
+            logger.info(f"[{user['token'][:8]}] idle since last build — skipped")
+            continue
         logger.info(f"[{user['token'][:8]}] rebuilding: {refresh_reason}")
         if ran:
             await asyncio.sleep(config.STAGGER_SECONDS)
@@ -82,3 +102,12 @@ async def run() -> None:
             await _refresh_all("nightly")
         except Exception:
             logger.exception("nightly refresh failed")
+        # The bootstrapper's deal log is a row per card per viewer and is
+        # worthless the moment it falls out of its window, so it is swept with
+        # the same pass rather than left to grow for the life of the install.
+        try:
+            dropped = await db.prune_dealt(config.TASTE_DEALT_HOURS)
+            if dropped:
+                logger.info(f"pruned {dropped} expired taste deal record(s)")
+        except Exception:
+            logger.exception("pruning taste deal records failed")

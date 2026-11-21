@@ -49,6 +49,7 @@ class EpisodeSafetyTests(unittest.IsolatedAsyncioTestCase):
         ]
         with (patch.object(usenet, "INDEXERS", [("one", "https://x", "k")]),
               patch.object(usenet, "_search_one", AsyncMock(return_value=rows)),
+              patch("app.meta.title_aliases", AsyncMock(return_value=())),
               patch("app.meta.title_year", AsyncMock(
                   return_value=("Example Show", "Example Show", 2024))),
               patch("app.usenet_health.should_skip", return_value=False),
@@ -82,6 +83,7 @@ class EpisodeSafetyTests(unittest.IsolatedAsyncioTestCase):
         ]
         with (patch.object(usenet, "INDEXERS", [("one", "https://x", "k")]),
               patch.object(usenet, "_search_one", AsyncMock(return_value=rows)),
+              patch("app.meta.title_aliases", AsyncMock(return_value=())),
               patch("app.meta.title_year", AsyncMock(
                   return_value=("Example Show", "Example Show", 2024))),
               patch("app.usenet_health.should_skip", return_value=False),
@@ -117,6 +119,7 @@ class EpisodeSafetyTests(unittest.IsolatedAsyncioTestCase):
                   ("dead", "https://dead", "k"),
                   ("good", "https://good", "k")]),
               patch.object(usenet, "_search_one", search),
+              patch("app.meta.title_aliases", AsyncMock(return_value=())),
               patch("app.meta.title_year", AsyncMock(
                   return_value=("Example Show", "Example Show", 2024))),
               patch("app.usenet_health.should_skip", return_value=False),

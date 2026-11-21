@@ -36,10 +36,11 @@ import logging
 import os
 import re
 import time
-import unicodedata
 from dataclasses import dataclass, field
 
 import httpx
+
+from app import textfold
 
 logger = logging.getLogger("stream-picker")
 
@@ -428,8 +429,7 @@ _STOP_ABS = re.compile(r"^(?:19|20)\d{2}$|^(?:480|540|576|720|1080|1440|2160|432
 
 
 def _fold(value: str) -> str:
-    value = unicodedata.normalize("NFKD", value or "").casefold()
-    return "".join(ch for ch in value if not unicodedata.combining(ch))
+    return textfold.fold(value)
 
 
 def _pairs(text: str) -> set[tuple[int, int]]:

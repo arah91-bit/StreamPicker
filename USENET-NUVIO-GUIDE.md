@@ -152,12 +152,14 @@ services:
     cap_drop:
       - ALL
     # Used only by the entrypoint to repair bind-mount ownership and drop to
-    # UID/GID 1000. The serving process retains no capabilities.
+    # UID/GID 1000. The serving process retains no capabilities. KILL lets
+    # init forward SIGTERM to the UID-1000 app so stops are graceful.
     cap_add:
       - CHOWN
       - DAC_OVERRIDE
       - SETGID
       - SETUID
+      - KILL
     security_opt:
       - no-new-privileges:true
     pids_limit: 512

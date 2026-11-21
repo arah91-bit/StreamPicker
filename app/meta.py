@@ -16,11 +16,12 @@ import asyncio
 import datetime
 import logging
 import os
+import re
 import time
 
 import httpx
 
-from app import content_identity, omdb
+from app import content_identity, omdb, textfold
 
 logger = logging.getLogger("stream-picker")
 
@@ -64,11 +65,79 @@ async def _get(path: str, **params):
     return r.json()
 
 
+async def _memo(cache: dict, inflight: dict, key, factory):
+    """Cached, single-flight await: concurrent callers share one fetch.
+
+    ``factory()`` returns ``(value, ttl_seconds)``. An exception propagates to
+    every waiter and is not cached, so callers keep their own error policy."""
+    hit = cache.get(key)
+    if hit and time.monotonic() < hit[0]:
+        return hit[1]
+    task = inflight.get(key)
+    if task is None:
+        async def run():
+            value, ttl = await factory()
+            cache[key] = (time.monotonic() + ttl, value)
+            if len(cache) > 1000:
+                cache.pop(next(iter(cache)))
+            return value
+
+        task = asyncio.create_task(run())
+        inflight[key] = task
+        task.add_done_callback(lambda _t: inflight.pop(key, None))
+    return await asyncio.shield(task)
+
+
+# One /find and one /tv/{id} record per title, shared by every helper below:
+# before they were shared, a first foreign S2+ request made four /find and
+# three /tv/{id} calls for the same show.
+_find_cache: dict[str, tuple[float, dict]] = {}
+_find_inflight: dict[str, asyncio.Task] = {}
+_tv_cache: dict[int, tuple[float, dict]] = {}
+_tv_inflight: dict[int, asyncio.Task] = {}
+
+
+async def _find_payload(imdb_id: str) -> dict:
+    base = imdb_id.split(":")[0]
+
+    async def fetch():
+        return await _get(f"/find/{base}", external_source="imdb_id"), _TTL
+    return await _memo(_find_cache, _find_inflight, base, fetch)
+
+
+async def _find_row(media: str, imdb_id: str) -> dict | None:
+    kind = "movie_results" if media == "movie" else "tv_results"
+    rows = (await _find_payload(imdb_id)).get(kind) or []
+    return rows[0] if rows else None
+
+
+async def _tv_record(tmdb_tv_id: int) -> dict:
+    """``/tv/{id}`` with alternative titles and translations appended:
+    seasons (episode counts, air dates), origin countries and every name in one
+    cached record."""
+    async def fetch():
+        return await _get(f"/tv/{tmdb_tv_id}",
+                          append_to_response="alternative_titles,translations"
+                          ), _TTL
+    return await _memo(_tv_cache, _tv_inflight, tmdb_tv_id, fetch)
+
+
 async def _find(imdb_id: str, kind: str):
     """Return the TMDB id for an imdb id (kind: 'movie_results'|'tv_results')."""
-    data = await _get(f"/find/{imdb_id}", external_source="imdb_id")
-    results = data.get(kind) or []
+    results = (await _find_payload(imdb_id)).get(kind) or []
     return results[0]["id"] if results else None
+
+
+async def is_animation(media: str, imdb: str) -> bool | None:
+    """Whether TMDB files the work under Animation (genre 16); None if unknown.
+    Decides whether an anime-only tracker is worth a rationed query."""
+    if not TMDB_KEY:
+        return None
+    try:
+        row = await _find_row(media, imdb)
+    except Exception:
+        return None
+    return None if row is None else 16 in (row.get("genre_ids") or ())
 
 
 async def digital_released(imdb_id: str) -> bool | None:
@@ -218,7 +287,7 @@ async def _season_counts(imdb: str) -> dict[int, int] | None:
         try:
             tid = await _find(imdb, "tv_results")
             if tid is not None:
-                d = await _get(f"/tv/{tid}")
+                d = await _tv_record(tid)
                 counts = {s["season_number"]: s.get("episode_count") or 0
                           for s in d.get("seasons") or []
                           if s.get("season_number")}      # skip specials (S0)
@@ -233,6 +302,64 @@ async def _season_counts(imdb: str) -> dict[int, int] | None:
     if len(_seasons_cache) > 1000:
         _seasons_cache.pop(next(iter(_seasons_cache)))
     return counts
+
+
+_CINEMETA_SERIES = "https://v3-cinemeta.strem.io/meta/series/{}.json"
+_cinemeta_cache: dict[str, tuple[float, dict[int, int]]] = {}
+_cinemeta_inflight: dict[str, asyncio.Task] = {}
+
+
+async def _cinemeta_season_years(imdb: str) -> dict[int, int]:
+    """{season: first-release year} in Cinemeta's numbering; {} on failure."""
+    base = imdb.split(":")[0]
+
+    async def fetch():
+        try:
+            r = await _client.get(_CINEMETA_SERIES.format(base), timeout=8)
+            r.raise_for_status()
+            years: dict[int, int] = {}
+            for video in ((r.json().get("meta") or {}).get("videos") or []):
+                season = video.get("season")
+                date = str(video.get("released") or "")[:4]
+                if isinstance(season, int) and season > 0 and date.isdigit():
+                    years[season] = min(years.get(season, 9999), int(date))
+            return years, (_TTL if years else _NEG_TTL)
+        except Exception as e:
+            logger.warning(f"cinemeta season years {base}: {type(e).__name__}")
+            return {}, _NEG_TTL
+    return await _memo(_cinemeta_cache, _cinemeta_inflight, base, fetch)
+
+
+async def season_year(imdb: str, season: int) -> int | None:
+    """First-air year of one season of a series, or None if unknown.
+
+    Long-running Chinese shows are released season by season under that
+    season's year — 乡村爱情 S17 is "Country Love 2025 S17" although the show
+    began in 2006 — so the year gates accept it beside the show's own year.
+
+    A Stremio id's season follows whichever metadata add-on the client uses,
+    Cinemeta by default, and TMDB sometimes numbers seasons differently
+    (split cours, folded specials, renumbered Chinese seasons). The year is
+    returned only when TMDB and Cinemeta agree on it; otherwise the extra
+    year would belong to some other season, so the gates stay on the show year."""
+    if not TMDB_KEY:
+        return None
+    base = imdb.split(":")[0]
+    try:
+        tid = await _find(base, "tv_results")
+        record = await _tv_record(tid) if tid is not None else {}
+    except Exception as e:
+        logger.warning(f"tmdb season years {base}: {type(e).__name__}")
+        return None
+    tmdb_year = None
+    for s in record.get("seasons") or []:
+        date = str(s.get("air_date") or "")
+        if s.get("season_number") == season and date[:4].isdigit():
+            tmdb_year = int(date[:4])
+    if tmdb_year is None:
+        return None
+    cinemeta_year = (await _cinemeta_season_years(base)).get(season)
+    return tmdb_year if cinemeta_year == tmdb_year else None
 
 
 async def next_episode(imdb: str, season: int, ep: int) -> tuple[int, int] | None:
@@ -257,6 +384,13 @@ _title_details_cache: dict[tuple[str, str], tuple[float, tuple[
 _title_details_inflight: dict[tuple[str, str], asyncio.Task] = {}
 _identity_cache: dict[tuple[str, str], tuple[float, content_identity.IdentityProfile]] = {}
 _identity_inflight: dict[tuple[str, str], asyncio.Task] = {}
+# (media, imdb) -> (expires_at, aliases); a failed lookup expires quickly, a
+# genuine "no aliases" answer does not.
+_aliases_cache: dict[tuple[str, str], tuple[float, tuple[str, ...]]] = {}
+_aliases_inflight: dict[tuple[str, str], asyncio.Task] = {}
+# Every real alias of a work fits comfortably; the cap stops a sprawling TMDB
+# record from turning each strict title gate into a long OR.
+_MAX_ALIASES = 6
 
 _COUNTRY_REGION = {
     "united states": "us", "united states of america": "us", "usa": "us",
@@ -285,13 +419,10 @@ async def _title_details(media: str, imdb: str
     task = _title_details_inflight.get(key)
     if task is None:
         async def fetch():
-            kind = "movie_results" if media == "movie" else "tv_results"
             try:
-                data = await _get(f"/find/{base}", external_source="imdb_id")
-                rows = data.get(kind) or []
-                if not rows:
+                d = await _find_row(media, base)
+                if d is None:
                     return None, None, None, None
-                d = rows[0]
                 title = d.get("title") or d.get("name")
                 orig = d.get("original_title") or d.get("original_name")
                 date = d.get("release_date") or d.get("first_air_date") or ""
@@ -310,6 +441,86 @@ async def _title_details(media: str, imdb: str
         _title_details_inflight[key] = task
         task.add_done_callback(lambda _t, k=key: _title_details_inflight.pop(k, None))
     return await asyncio.shield(task)
+
+
+def _alias_usable(title: str) -> bool:
+    """Whether an alias is distinctive enough to identify a work on its own.
+
+    A short or single common word ("Up", "Home", "Mother") names far more
+    unrelated releases than it recovers, and aliases feed every title gate and
+    the identity check. A Latin alias therefore needs two words, or one word
+    of at least eight letters ("Gisaengchung"); native-script titles are
+    distinctive however short."""
+    words = re.findall(r"[^\W_]+", textfold.fold(title))
+    folded = "".join(words)
+    if not folded:
+        return False
+    if not folded.isascii():
+        return True
+    return (len(words) >= 2 and len(folded) >= 4) or len(folded) >= 8
+
+
+async def title_aliases(media: str, imdb: str) -> tuple[str, ...]:
+    """The names a foreign-language work is actually released under.
+
+    IMDb's own title first — English trackers such as AvistaZ file releases
+    under it — then TMDB's regional alternative titles, then the original
+    language's regional spellings (simplified/traditional Chinese). Chinese, Korean and
+    Thai releases are routinely named after an alias that is neither TMDB's
+    English title nor the native one: 乡村爱情 (TMDB "Love Stories in the
+    Countryside") is released as ``Country Love``, ``Rural Love Story`` and
+    ``Xiang Cun Ai Qing``, and the strict title gates rejected every one of
+    them. Only titles registered for the work's own origin countries are kept,
+    season-specific entries are skipped, and English originals get none: an
+    English work is released under its own name, and each extra alias widens
+    what those gates have to defend."""
+    if not TMDB_KEY:
+        return ()
+    base = imdb.split(":")[0]
+
+    async def fetch():
+        try:
+            row = await _find_row(media, base)
+            if row is None or (row.get("original_language") or "en") == "en":
+                return (), _TTL
+            if media == "movie":
+                d = await _get(f"/movie/{row['id']}",
+                               append_to_response="alternative_titles,"
+                                                  "translations")
+            else:
+                d = await _tv_record(row["id"])
+            home = set(d.get("origin_country") or [])
+            home |= {c.get("iso_3166_1")
+                     for c in d.get("production_countries") or []}
+            alt = d.get("alternative_titles") or {}
+            names = [await imdb_title(media, base)]
+            names += [str(r.get("title") or "")
+                      for r in alt.get("results") or alt.get("titles") or []
+                      if r.get("iso_3166_1") in home
+                      and "season" not in str(r.get("type") or "").lower()]
+            # Native-script regional spellings last: Taiwanese and Hong Kong
+            # trackers name a Chinese work in traditional characters (鄉村愛情),
+            # mainland ones in simplified (乡村爱情).
+            lang = row.get("original_language")
+            for t in (d.get("translations") or {}).get("translations") or []:
+                data = t.get("data") or {}
+                if t.get("iso_639_1") == lang:
+                    names.append(str(data.get("name") or data.get("title") or ""))
+            # The canonical and native titles are already searched; an alias
+            # that repeats one would only take a slot.
+            seen = {re.sub(r"\W+", "", textfold.fold(str(row.get(k) or "")))
+                    for k in ("name", "original_name", "title", "original_title")}
+            found: list[str] = []
+            for title in (str(n or "").strip() for n in names):
+                folded = re.sub(r"\W+", "", textfold.fold(title))
+                if _alias_usable(title) and folded not in seen:
+                    seen.add(folded)
+                    found.append(title)
+            return tuple(found[:_MAX_ALIASES]), _TTL
+        except Exception as e:
+            logger.warning(f"tmdb aliases {base}: {type(e).__name__}")
+            return (), _NEG_TTL
+    return await _memo(_aliases_cache, _aliases_inflight, (media, base), fetch)
 
 
 async def identity_profile(media: str, media_id: str
@@ -334,9 +545,16 @@ async def identity_profile(media: str, media_id: str
             tmdb_result = (None, None, None, None)
             omdb_result = None
             episode_result = None
+            regional: tuple[str, ...] = ()
+            this_season_year = None
             jobs: list[tuple[str, asyncio.Future | asyncio.Task | object]] = []
             if TMDB_KEY:
                 jobs.append(("tmdb", _title_details(media, base)))
+                jobs.append(("aliases", title_aliases(media, base)))
+                if (media != "movie" and len(parts) == 3
+                        and parts[1].isdigit() and int(parts[1]) > 1):
+                    jobs.append(("season_year",
+                                 season_year(base, int(parts[1]))))
             if omdb.enabled():
                 jobs.append(("omdb", omdb.lookup(media, base)))
                 if (media != "movie" and len(parts) == 3
@@ -353,13 +571,18 @@ async def identity_profile(media: str, media_id: str
                         tmdb_result = value
                     elif name == "omdb":
                         omdb_result = value
+                    elif name == "aliases":
+                        regional = value
+                    elif name == "season_year":
+                        this_season_year = value
                     else:
                         episode_result = value
 
             title, original, tmdb_year, _lang = tmdb_result
             aliases = tuple(dict.fromkeys(
                 value for value in (title, original,
-                                    getattr(omdb_result, "title", None))
+                                    getattr(omdb_result, "title", None),
+                                    *regional)
                 if value))
             omdb_year = getattr(omdb_result, "year", None)
             years = frozenset(y for y in (tmdb_year, omdb_year)
@@ -369,6 +592,10 @@ async def identity_profile(media: str, media_id: str
             # per-item IMDb evidence can still resolve it in the classifier.
             conflict = bool(tmdb_year and omdb_year
                             and abs(int(tmdb_year) - int(omdb_year)) > 1)
+            # A later season is often labelled with its own air year; add it
+            # only after the provider-agreement check, which is about the work.
+            if years and isinstance(this_season_year, int):
+                years = years | {this_season_year}
             countries = tuple(getattr(omdb_result, "countries", ()) or ())
             season = episode = None
             if media != "movie" and len(parts) == 3:
@@ -412,6 +639,21 @@ async def original_language(media: str, imdb: str) -> str | None:
     if not TMDB_KEY:
         return None
     return (await _title_details(media, imdb))[3]
+
+
+async def imdb_title(media: str, imdb: str) -> str | None:
+    """IMDb's own primary title via OMDb, whose lookup is already cached and
+    budgeted for every request. English-language trackers such as AvistaZ file
+    a work under it, and TMDB's English title is often something else: 乡村爱情
+    is "Country Love" on IMDb and AvistaZ, "Love Stories in the Countryside" on
+    TMDB."""
+    if not omdb.enabled():
+        return None
+    try:
+        return getattr(await omdb.lookup(media, imdb.split(":")[0]),
+                       "title", None)
+    except Exception:
+        return None
 
 
 async def title_year(media: str, imdb: str

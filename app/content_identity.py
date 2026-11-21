@@ -29,8 +29,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 import re
-import unicodedata
 from urllib.parse import unquote
+
+from app import textfold
 
 
 STRONG = "strong"
@@ -132,8 +133,7 @@ _GENERIC_NAMES = frozenset({
 
 def _fold(value: str) -> str:
     """Case/diacritic fold while retaining non-Latin letters and digits."""
-    value = unicodedata.normalize("NFKD", value or "").casefold()
-    return "".join(ch for ch in value if not unicodedata.combining(ch))
+    return textfold.fold(value)
 
 
 def _tokens(value: str) -> tuple[str, ...]:

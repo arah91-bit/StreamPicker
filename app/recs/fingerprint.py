@@ -78,9 +78,28 @@ BOOTSTRAP_BUDGET_RATIO = 0.67
 # decisive for them while the ratio restrains it for everybody else.
 BOOTSTRAP_MIN_BUDGET = 4.0
 
+# What a "want to watch" is worth against a "liked it". Both are taps, so the
+# difference is not effort — it is what each one can possibly know. A like is a
+# verdict on a film somebody sat through. A save is a verdict on a poster, a
+# premise and a genre, taken before the thing has been watched at all, and
+# plenty of saves never get watched or turn out to be disappointing. It is real
+# evidence about what appeals, weighed as the lesser evidence it is.
+#
+# Saves share the likes' budget rather than adding to it: a session's total
+# influence over a fingerprint is capped by BOOTSTRAP_BUDGET_RATIO, and a
+# second channel outside that cap would quietly reopen exactly the hole the cap
+# was dug to close.
+BOOTSTRAP_SAVE_SHARE = 0.5
 
-def bootstrap_weight(play_weight: float, likes: int) -> float:
-    """What each explicit like is worth, given how much watching there is."""
+
+def bootstrap_weight(play_weight: float, likes: float) -> float:
+    """What each explicit like is worth, given how much watching there is.
+
+    `likes` may be fractional: a saved-for-later title is charged to the same
+    budget at BOOTSTRAP_SAVE_SHARE of a like, so that a long session of saves
+    is sized against the viewing it is joining exactly as a session of likes
+    would be.
+    """
     if likes <= 0:
         return 0.0
     if play_weight <= 0:
@@ -250,11 +269,27 @@ async def for_viewer(model, context: str | None, rng=None,
         fresh_likes = [i for i, e in feedback.items()
                        if e["verdict"] == "liked" and i not in weights
                        and i in store]
+        # Saved-for-later titles are the softer half of the same signal. A
+        # title that is both saved and liked is only counted once, at the
+        # like's full weight — the like is the better evidence and the save
+        # adds nothing to it.
+        try:
+            saved = await db.watchlist_ids(user_token)
+        except Exception:
+            saved = set()
+        fresh_saves = [i for i in saved
+                       if i not in weights and i in store
+                       and i not in set(fresh_likes)]
         played_weight = sum(w for i, w in weights.items()
                             if w > 0 and i in store)
-        like_weight = bootstrap_weight(played_weight, len(fresh_likes))
+        # Saves count as fractional likes when sizing the budget, so a session
+        # of fifty saves is charged for what it is rather than arriving free.
+        charged = len(fresh_likes) + BOOTSTRAP_SAVE_SHARE * len(fresh_saves)
+        like_weight = bootstrap_weight(played_weight, charged)
         for imdb_id in fresh_likes:
             weights[imdb_id] = like_weight
+        for imdb_id in fresh_saves:
+            weights[imdb_id] = like_weight * BOOTSTRAP_SAVE_SHARE
         for imdb_id, entry in feedback.items():
             if entry["verdict"] == "disliked":
                 disliked[imdb_id] = 1.0

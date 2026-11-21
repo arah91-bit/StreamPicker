@@ -19,30 +19,44 @@ class RefreshPolicyTests(unittest.IsolatedAsyncioTestCase):
         row.update(updates)
         return row
 
-    async def test_open_profile_gets_daily_freshness(self):
-        reason = await scheduler._refresh_reason(
-            self.user(last_served_at=1_001))
-        self.assertEqual(reason, "daily freshness")
+    async def reason(self, last_play=0, **updates):
+        with patch("app.recs.scheduler.local_history.last_play_at",
+                   return_value=last_play):
+            return await scheduler._refresh_reason(self.user(**updates))
 
-    async def test_idle_profile_still_gets_daily_freshness(self):
-        self.assertEqual(
-            await scheduler._refresh_reason(self.user()), "daily freshness")
+    async def test_a_profile_opened_since_its_build_is_rebuilt(self):
+        self.assertEqual(await self.reason(last_served_at=1_001),
+                         "opened since last build")
 
-    async def test_open_before_latest_build_is_still_refreshed_nightly(self):
-        self.assertEqual(
-            await scheduler._refresh_reason(self.user(last_served_at=999)),
-            "daily freshness",
-        )
+    async def test_a_profile_watched_on_since_its_build_is_rebuilt(self):
+        self.assertEqual(await self.reason(last_play=1_500),
+                         "watched since last build")
+
+    async def test_a_profile_nobody_used_is_left_alone(self):
+        """Skip nightly builds for inactive profiles."""
+        self.assertIsNone(await self.reason())
+        self.assertIsNone(await self.reason(last_served_at=999, last_play=900))
+
+    async def test_an_idle_profile_is_skipped_by_the_nightly_pass(self):
+        users = [self.user(token="busy", last_served_at=1_001),
+                 self.user(token="idle")]
+        built = []
+
+        async def fake_generate(user, trigger):
+            built.append(user["token"])
+
+        with (patch("app.recs.scheduler.db.all_users", return_value=users),
+              patch("app.recs.scheduler.local_history.last_play_at",
+                    return_value=0),
+              patch("app.recs.scheduler.generate_for_user", fake_generate)):
+            await scheduler._refresh_all("nightly")
+        self.assertEqual(["busy"], built)
 
     async def test_missing_or_failed_catalogs_are_retried(self):
-        self.assertEqual(
-            await scheduler._refresh_reason(self.user(last_generated_at=None)),
-            "missing catalogs",
-        )
-        self.assertEqual(
-            await scheduler._refresh_reason(self.user(last_error="boom")),
-            "retry after error",
-        )
+        self.assertEqual(await self.reason(last_generated_at=None),
+                         "missing catalogs")
+        self.assertEqual(await self.reason(last_error="boom"),
+                         "retry after error")
 
 
 class RotationTests(unittest.TestCase):

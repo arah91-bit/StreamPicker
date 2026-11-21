@@ -52,6 +52,22 @@ def response(request: httpx.Request, status: int = 200, payload=None,
                           request=request)
 
 
+def _token_of(req: httpx.Request) -> str | None:
+    """The access token a request carries in its Authorization header."""
+    import re
+    m = re.search(r'Token="([^"]*)"', req.headers.get("authorization", ""))
+    return m.group(1) if m else None
+
+
+def _url_token(url: str) -> str:
+    """The capability in a /library URL, with or without the transcode
+    lane's /master.m3u8 suffix."""
+    path = urlsplit(url).path
+    if path.endswith("/master.m3u8"):
+        path = path[:-len("/master.m3u8")]
+    return path.rsplit("/", 1)[-1]
+
+
 def auth_payload(token: str = ACCESS_TOKEN) -> dict:
     return {"User": {"Id": USER_ID}, "AccessToken": token}
 
@@ -186,7 +202,9 @@ class NativeJellyfinCase(unittest.IsolatedAsyncioTestCase):
 
     def assert_token_header(self, req: httpx.Request,
                             expected: str = ACCESS_TOKEN) -> None:
-        self.assertEqual(expected, req.headers.get("x-emby-token"))
+        self.assertEqual(expected, _token_of(req))
+        self.assertNotIn("x-emby-token", req.headers,
+                         "newer Jellyfin rejects the legacy header")
         self.assertNotIn("api_key", req.url.params)
         self.assertNotIn(expected, str(req.url))
 
@@ -232,7 +250,7 @@ class AuthenticationTests(NativeJellyfinCase):
             if req.url.path == "/Users/AuthenticateByName":
                 logins += 1
                 return response(req, payload=auth_payload(f"token-{logins}"))
-            api_tokens.append(req.headers.get("x-emby-token"))
+            api_tokens.append(_token_of(req))
             return response(req, 401 if len(api_tokens) == 1 else 200,
                             {"Version": "synthetic"})
 
@@ -254,14 +272,14 @@ class AuthenticationTests(NativeJellyfinCase):
                 logins += 1
                 await asyncio.sleep(0.02)
                 return response(req, payload=auth_payload("fresh-token"))
-            if req.headers.get("x-emby-token") == "expired-token":
+            if _token_of(req) == "expired-token":
                 expired_calls += 1
                 # Let both requests observe the same expired generation before
                 # either starts the refresh.
                 while expired_calls < 2:
                     await asyncio.sleep(0)
                 return response(req, 401, {"error": "expired"})
-            self.assertEqual("fresh-token", req.headers.get("x-emby-token"))
+            self.assertEqual("fresh-token", _token_of(req))
             return response(req, payload={"ok": True})
 
         self.install(handler)
@@ -546,7 +564,7 @@ class PlaybackProxyTests(NativeJellyfinCase):
             if req.url.path == "/Users/AuthenticateByName":
                 logins += 1
                 return response(req, payload=auth_payload(f"token-{logins}"))
-            playback_tokens.append(req.headers.get("x-emby-token"))
+            playback_tokens.append(_token_of(req))
             if len(playback_tokens) == 1:
                 return response(req, 401, {"error": "expired"})
             return response(req, 206, content=b"ok", headers={
@@ -642,14 +660,26 @@ class TranscodeTests(NativeJellyfinCase):
         streams = await library.streams("movie", "tt0113568")
         self.assertEqual(1, len(streams))
         capability = library._decode_capability(
-            streams[0]["url"].rsplit("/", 1)[-1])
+            _url_token(streams[0]["url"]))
         self.assertEqual("h", capability["mode"])
         self.assertTrue(library.identity_trusted(streams[0]))
+
+    async def test_a_transcode_url_says_hls_to_the_player(self):
+        """Players choose HLS-vs-file from the URL and filename before they
+        fetch anything. With an extensionless URL Nuvio fell back to the
+        filename's .mkv and opened the playlist as Matroska — the transcode
+        that sat on the loading screen."""
+        self.install(self._handler())
+        streams = await library.streams("movie", "tt0113568")
+        self.assertTrue(urlsplit(streams[0]["url"]).path.endswith("/master.m3u8"))
+        from app import main
+        self.assertIn("/library/{token}/master.m3u8",
+                      {getattr(r, "path", "") for r in main.app.routes})
 
     async def test_transcode_chain_keeps_token_out_of_player_urls(self):
         self.install(self._handler())
         streams = await library.streams("movie", "tt0113568")
-        token = streams[0]["url"].rsplit("/", 1)[-1]
+        token = _url_token(streams[0]["url"])
 
         master = await library.serve(token, request())
         self.assertEqual(200, master.status_code)
@@ -715,7 +745,7 @@ class TranscodeTests(NativeJellyfinCase):
 
         self.install(handler)
         streams = await library.streams("movie", "tt0113568")
-        token = streams[0]["url"].rsplit("/", 1)[-1]
+        token = _url_token(streams[0]["url"])
         with self.assertLogs("stream-picker", level="WARNING"):
             served = await library.serve(token, request())
         self.assertEqual(502, served.status_code)
@@ -723,7 +753,7 @@ class TranscodeTests(NativeJellyfinCase):
     async def test_tampered_resource_signature_is_rejected(self):
         self.install(self._handler())
         streams = await library.streams("movie", "tt0113568")
-        token = streams[0]["url"].rsplit("/", 1)[-1]
+        token = _url_token(streams[0]["url"])
         master = await library.serve(token, request())
         params = dict(parse_qsl(urlsplit(proxy_urls(master.body.decode())[0]).query))
         forged = ("A" if params["s"][0] != "A" else "B") + params["s"][1:]

@@ -510,6 +510,40 @@ async def movie_credits(tmdb_id: int) -> dict:
     return await _get(f"/movie/{tmdb_id}/credits")
 
 
+# What a trailer is preferred to be, best first. "Trailer" beats "Teaser"
+# because a teaser is often thirty seconds of a logo, and an official one beats
+# a fan upload because the fan upload is as likely to be a reaction video.
+_TRAILER_TYPES = ("Trailer", "Teaser", "Clip")
+
+
+def _trailer_rank(video: dict) -> tuple:
+    kind = video.get("type") or ""
+    return (
+        _TRAILER_TYPES.index(kind) if kind in _TRAILER_TYPES else len(_TRAILER_TYPES),
+        0 if video.get("official") else 1,
+        -int(video.get("size") or 0),          # 1080 before 360
+    )
+
+
+async def trailer_key(media_type: str, tmdb_id: int) -> str | None:
+    """The best YouTube id to play for this title, or None.
+
+    Only YouTube is considered: it is the only site TMDB carries in volume, and
+    the extractor behind the playback endpoint speaks that one anyway.
+    """
+    try:
+        data = await _get(f"/{media_type}/{tmdb_id}/videos")
+    except Exception:
+        logger.debug("tmdb: trailer lookup failed", exc_info=True)
+        return None
+    videos = [v for v in (data.get("results") or [])
+              if (v.get("site") == "YouTube" and v.get("key")
+                  and v.get("type") in _TRAILER_TYPES)]
+    if not videos:
+        return None
+    return sorted(videos, key=_trailer_rank)[0]["key"]
+
+
 async def find_by_imdb(imdb_id: str) -> dict | None:
     """Resolve an IMDb id to a TMDB movie/tv result. Returns
     {'tmdb_id', 'media_type', 'genre_ids'} or None if not found."""
@@ -550,6 +584,32 @@ async def episode_aired(tmdb_id: int, season: int, episode: int) -> bool:
     if not aired:
         return False            # no such episode, or no air date yet
     return aired <= datetime.date.today().isoformat()
+
+
+async def search_keyword_results(query: str, limit: int = 4) -> list[dict]:
+    """Keyword IDs with names, so callers can verify topic identity."""
+    data = await _get("/search/keyword", {"query": query})
+    return data.get("results", [])[:limit]
+
+
+async def alternative_titles(media_type: str, tmdb_id: int) -> list[str]:
+    data = await _get(f"/{media_type}/{tmdb_id}/alternative_titles")
+    rows = data.get("titles", []) if media_type == "movie" else data.get("results", [])
+    return [str(row.get("title") or row.get("name") or "") for row in rows]
+
+
+async def candidate_details(media_type: str, tmdb_id: int) -> dict:
+    return await _get(f"/{media_type}/{tmdb_id}")
+
+
+async def collection_parts(collection_id: int) -> list[dict]:
+    data = await _get(f"/collection/{collection_id}")
+    return data.get("parts", [])
+
+
+async def similar_titles(media_type: str, tmdb_id: int) -> list[dict]:
+    data = await _get(f"/{media_type}/{tmdb_id}/similar")
+    return data.get("results", [])
 
 
 async def search_keywords(query: str, limit: int = 2) -> list[int]:

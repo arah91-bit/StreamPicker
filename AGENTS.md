@@ -119,13 +119,23 @@ change *pending* a restart, `GET /api/settings/status.json` returns
 
 ### Validate *before* you restart — don't rely on the safety net
 
-At boot, an invalid `config.json` (a bad value, an out-of-range number, or a
-broken cross-field invariant) is **quarantined**: the process moves it aside as
-`config.json.corrupt-<ts>` and boots on `.env`/defaults instead of
-crash-looping. That protects the install — but it means a botched edit is
-**silently reverted**, and because a bad file is quarantined *on read*,
-`config.validate_pending()` will report "OK" (it re-read the now-empty store).
-So do not use the file + restart loop to find out whether your change is valid.
+What happens to a bad `config.json` depends on how bad it is:
+
+- **One entry this build can't use** — a key it doesn't know (typically
+  written by a newer build, e.g. after rolling back to an older image) or a
+  value outside its schema — is **skipped with a warning and left in the
+  file**. It is applied nowhere, survives every later save, and a build that
+  understands it picks it back up. Saving or clearing that key replaces it.
+- **A file that isn't valid JSON, or a contradictory combination** (a broken
+  cross-field invariant) is **quarantined at boot**: moved aside as
+  `config.json.corrupt-<ts>`, and the process boots on `.env`/defaults instead
+  of crash-looping. That protects the install, but a botched edit is
+  silently reverted.
+
+Read-only paths never move the file. `config.validate_pending()` (and the
+`/health/ready` probe built on it) reports an unparseable or contradictory
+store as an error instead. Even so, don't use the file-plus-restart loop to
+find out whether a change is valid.
 
 To check a prospective change **without** the silent-revert surprise, validate
 it the way the dashboard does — it rejects a bad combination up front with a

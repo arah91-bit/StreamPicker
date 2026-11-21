@@ -108,6 +108,25 @@ class StremthruSurgeryTests(unittest.TestCase):
                          cfg["stores"])
         self.assertIn("/stremio/torz/", base_url)
 
+    def test_the_segment_decodes_strictly_whatever_its_length(self):
+        """StremThru decodes the config with Go's *padded* URL alphabet. An
+        unpadded segment failed with "illegal base64 data at input byte N"
+        (HTTP 500) whenever the JSON's length was not a multiple of 3, which a
+        different key or a second store is enough to cause (measured against
+        StremThru 0.105.3). Strict decoding here mirrors that."""
+        from app import wizard
+        for key in ("K", "K1", "K12", "K123"):           # every length % 3
+            for url in (debrid.build_stremthru("https://st.example",
+                                               [("torbox", key)]),
+                        wizard.stremthru_url([("torbox", key)],
+                                             "https://st.example")):
+                seg = url.split("/stremio/torz/", 1)[1]
+                with self.subTest(key=key, url=url[:40]):
+                    self.assertEqual(0, len(seg) % 4)
+                    cfg = json.loads(base64.b64decode(
+                        seg, altchars=b"-_", validate=True))
+                    self.assertEqual(key, cfg["stores"][0]["t"])
+
     def test_build_preserves_existing_torz_settings(self):
         first = debrid.build_stremthru("https://st.example",
                                        [("torbox", "K1")])

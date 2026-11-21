@@ -39,6 +39,14 @@ ROW_SPECS = (
         "desc": "Everything recently watched, newest first, one card per "
                 "title.",
     },
+    {
+        "row": "nr-watchlist",
+        "flag": "watchlist_row",
+        "title": "Want to watch",
+        "desc": "Titles they saved from the taste page, newest first. Cards "
+                "drop off the row once they have been watched, so it stays a "
+                "list of what is still outstanding.",
+    },
 )
 
 # Whole row families that used to be separate add-ons or a hardcoded env list.
@@ -49,9 +57,12 @@ FAMILY_SPECS = (
         "row": "streaming-catalogs",
         "flag": "streaming_catalogs_row",
         "title": "Streaming catalogs",
-        "desc": "Netflix, Prime, Disney+, Paramount+, Apple TV+ and Max, "
-                "sorted by this viewer's taste. Import the collection file "
-                "below after ticking this on.",
+        "desc": "One folder per service, sorted by this viewer's taste. Pick "
+                "the services below, then import the collection file after "
+                "ticking this on.",
+        # Draws the per-service switches from the user record's
+        # `streaming_providers` list underneath this row.
+        "providers": True,
     },
     {
         "row": "asian-dramas",
@@ -59,7 +70,7 @@ FAMILY_SPECS = (
         "title": "Asian dramas",
         "desc": "Korean, Chinese, Thai, Taiwanese and Japanese dramas by "
                 "country and genre, plus rows for the actors the people who "
-                "tick this watch most.",
+                "tick this watch most. Ships in the same collection file.",
     },
 )
 
@@ -85,6 +96,16 @@ cursor:pointer;border:1px solid var(--line2);white-space:nowrap}
 button.sw.on{background:var(--accent);border-color:transparent;color:var(--accent-ink)}
 button.sw.off{background:transparent;color:var(--mut)}
 button.sw:disabled{cursor:default;opacity:.65}
+/* Per-service switches, indented under the streaming row they qualify. Small
+   and wrapping, because six of them must not out-shout the row itself. */
+.provs{display:flex;flex-wrap:wrap;gap:6px;margin:-2px 0 6px 43px}
+.provs.off{display:none}
+button.prov{font:600 11.5px var(--sans);padding:3px 9px;border-radius:99px;
+cursor:pointer;border:1px solid var(--line2)}
+button.prov.on{background:var(--accent-soft);border-color:var(--accent);
+color:var(--accent)}
+button.prov.off{background:transparent;color:var(--mut)}
+button.prov:disabled{cursor:default;opacity:.5}
 a.url{display:block;font:12px var(--mono);color:var(--accent);word-break:break-all;
 background:var(--inset);padding:7px 9px;border-radius:7px;margin:2px 0 8px;
 text-decoration:none}a.url:hover{text-decoration:underline}
@@ -345,6 +366,31 @@ function rowEl(u, spec, pos) {{
   return el;
 }}
 
+// The six streaming services, each switchable on its own. Hidden while the
+// parent row is off, because the services only mean anything once the family
+// they belong to is switched on.
+function providerEl(u, parentOn) {{
+  const el = document.createElement("div");
+  el.className = "provs" + (parentOn ? "" : " off");
+  for (const p of (u.streaming_providers || [])) {{
+    const b = document.createElement("button");
+    b.className = "prov " + (p.on ? "on" : "off");
+    b.textContent = p.title;
+    b.title = (p.on ? "Showing " : "Hiding ") + p.title
+      + " in " + u.name + "'s collection";
+    b.onclick = async () => {{
+      b.disabled = true;
+      await fetch(api("/streaming-provider/" + u.token), {{
+        method: "POST", headers: {{"Content-Type": "application/json"}},
+        body: JSON.stringify({{provider: p.id, enabled: !p.on}}),
+      }});
+      load();
+    }};
+    el.appendChild(b);
+  }}
+  return el;
+}}
+
 async function load() {{
   const out = $("out");
   let users;
@@ -384,7 +430,7 @@ async function load() {{
       <div class="acts">
         <button class="taste">Copy taste-setup link</button>
         <button class="copy">Copy main add-on URL</button>
-        ${{u.streaming_collection_url
+        ${{u.collection_url
             ? '<button class="dl">Download ' + u.collection_filename + '</button>' : ""}}
         <button class="rf">Refresh now</button>
         <button class="rm danger">Remove</button>
@@ -431,7 +477,10 @@ async function load() {{
       "watchlist, because-you-watched, genres, people, decades.";
     rows.appendChild(slate);
 
-    FAMILIES.forEach(spec => rows.appendChild(rowEl(u, spec, "·")));
+    FAMILIES.forEach(spec => {{
+      rows.appendChild(rowEl(u, spec, "·"));
+      if (spec.providers) rows.appendChild(providerEl(u, !!u[spec.flag]));
+    }});
 
     card.querySelector(".copy").onclick = async ev => {{
       const ok = await copyText(u.manifest_url);
@@ -460,7 +509,7 @@ async function load() {{
     const dl = card.querySelector(".dl");
     if (dl) dl.onclick = () => {{
       const a = document.createElement("a");
-      a.href = u.streaming_collection_url;
+      a.href = u.collection_url;
       a.download = u.collection_filename;
       document.body.appendChild(a); a.click(); a.remove();
     }};

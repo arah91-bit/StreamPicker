@@ -56,11 +56,26 @@ Two independent safety layers keep it fail-closed:
    authenticated `/v1/vpn/status` and refuses to proceed unless it reports
    `running`.
 
-**What playback feels like:** the clicked file downloads opening-bytes-first, so
-you get a ~10–20 second "Finding Best Stream" splash (a startup buffer, *not* a
-wait for the full download), then it plays. In a season pack the clicked episode
-downloads first and in order so it's immediately streamable while the rest of
-the pack fills in behind it.
+**What playback feels like:** the clicked file downloads in order, opening
+bytes and index first, and playback starts as soon as the download can stay
+ahead of the player — a few seconds on a healthy swarm, never a wait for the
+whole file. On a swarm slower than the video's bitrate, the start is held until
+enough is on disk that playback cannot catch the download (held ≤12 s per
+request, continued across the player's retries for up to 2 minutes — see
+`PRIVATE_TRACKER_START_HOLD`). In a season pack the clicked episode downloads
+first and in order while the rest of the pack fills in behind it.
+
+Private rows are the **last** option: a download is offered first — and so
+auto-played — only when nothing public plays. A copy already on disk is just a
+local file and ranks like any other verified stream.
+
+> **qBittorrent's `.!qB` suffix.** With "Append .!qB extension to incomplete
+> files" on, a downloading file is `Movie.mkv.!qB` until it completes. Stream
+> Picker reads it under either name and follows the rename mid-stream; it once
+> looked only for the final name, which made every private play wait for the
+> whole download. Keep **"Keep incomplete torrents in"** off (or point it at the
+> same shared directory) — a separate incomplete folder is not on the
+> read-only mount.
 
 ## What you need first
 
@@ -375,7 +390,7 @@ PRIVATE_TRACKER_DOWNLOAD_ROOT=/private-downloads/nuviodownloads
 | `PRIVATE_TRACKER_MIN_SEEDERS` | `5` | Hard eligibility floor. |
 | `PRIVATE_TRACKER_MAX_TORRENT_GB` | `0` | Size cap in GB; `0` = unlimited. |
 | `PRIVATE_TRACKER_MAX_ACTIVE_DOWNLOADS` | `3` | Concurrent rqbit downloads. |
-| `PRIVATE_TRACKER_SEARCH_TIMEOUT` | `45` | Prowlarr search timeout (seconds). |
+| `PRIVATE_TRACKER_SEARCH_TIMEOUT` | `120` | Prowlarr search timeout (seconds). Generous by design: an aggregate search waits for its slowest tracker. |
 | `PRIVATE_TRACKER_START_TIMEOUT` | `90` | Max wait for playback to start (seconds). |
 | `PRIVATE_TRACKER_SEARCH_TTL` | `10800` | How long a search result is cached (seconds). |
 

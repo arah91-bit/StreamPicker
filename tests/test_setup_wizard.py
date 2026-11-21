@@ -41,13 +41,16 @@ class MintingTests(unittest.TestCase):
              {"service": "realdebrid", "apiKey": "key-2"}],
             cfg["debridServices"])
 
-    def test_stremthru_url_is_urlsafe_unpadded(self):
+    def test_stremthru_url_is_urlsafe_and_padded(self):
+        """Padded, not stripped: StremThru (0.105.3, measured) decodes with
+        Go's padded URL alphabet and answers HTTP 500 to an unpadded segment."""
         url = wizard.stremthru_url([("torbox", "key-1")])
         self.assertTrue(url.startswith(
             wizard.STREMTHRU_PUBLIC + "/stremio/torz/"))
         b64 = url.rsplit("/", 1)[1]
-        self.assertNotIn("=", b64)
-        cfg = json.loads(base64.urlsafe_b64decode(b64 + "=" * (-len(b64) % 4)))
+        self.assertNotIn("+", b64)
+        self.assertNotIn("/", b64)
+        cfg = json.loads(base64.urlsafe_b64decode(b64))   # strict: no repair
         self.assertEqual({"indexers": None,
                           "stores": [{"c": "tb", "t": "key-1"}],
                           "cached": True}, cfg)

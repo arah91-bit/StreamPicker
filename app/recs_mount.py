@@ -21,6 +21,7 @@ version is skipped here rather than being allowed to lose the race silently.
 """
 
 import logging
+import os
 
 from starlette.routing import Mount
 
@@ -90,6 +91,11 @@ async def startup() -> None:
     await db.init()
     # Register the telemetry hook before anything can play.
     playhistory.install()
+    if os.environ.get("RECS_BACKGROUND_JOBS", "1") in ("0", "false", "no", "off"):
+        # Test harness only: the jobs below do real outbound work (TMDB,
+        # catalog builds) on start, which a test that merely needs the app's
+        # lifespan must not do — it made suite timing depend on the network.
+        return []
     # Everything app/recs would have started from its own @app.on_event
     # handler. Those never fire here — only its routes were copied across — so
     # this list has to stay in step with app/recs/main.py's startup.

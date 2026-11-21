@@ -40,6 +40,16 @@ _FORWARDED_HEADERS = ("x-forwarded-for", "forwarded")
 _HASH_SLOTS = threading.BoundedSemaphore(2)
 _AUTH_CACHE: dict[tuple, float] = {}
 _AUTH_CACHE_TTL = 300.0
+# Failed sign-ins per client. Each wrong password already costs an attacker an
+# scrypt derivation, but nothing else slowed a guesser down when the dashboard
+# is published (DASHBOARD_LOCAL_ONLY=0): roughly twenty guesses a second. The
+# first few mistakes are free — people mistype — then each further failure
+# locks that client out for a doubling interval, answered with 429 and no
+# derivation at all. A success clears the record; an idle one is forgotten.
+_FAIL_FREE = 5
+_FAIL_MAX_LOCK = 300.0
+_FAIL_FORGET = 900.0
+_FAILS: dict[str, tuple[int, float]] = {}
 
 
 def csrf_token() -> str:
@@ -252,12 +262,44 @@ def _with_hash_slot(fn, *args):
         return fn(*args)
 
 
+def _lockout_remaining(client: str, now: float) -> float:
+    count, last = _FAILS.get(client, (0, 0.0))
+    if now - last > _FAIL_FORGET:
+        _FAILS.pop(client, None)
+        return 0.0
+    if count < _FAIL_FREE:
+        return 0.0
+    return max(0.0, last + min(2.0 ** (count - _FAIL_FREE), _FAIL_MAX_LOCK) - now)
+
+
+def _note_failure(client: str, now: float) -> None:
+    count, last = _FAILS.get(client, (0, 0.0))
+    if now - last > _FAIL_FORGET:
+        count = 0
+    _FAILS[client] = (count + 1, now)
+    while len(_FAILS) > 4096:
+        _FAILS.pop(next(iter(_FAILS)))
+
+
 async def require_auth(request) -> None:
+    client = client_ip(request) or "?"
+    now = time.monotonic()
+    wait = _lockout_remaining(client, now)
+    if wait > 0:
+        raise HTTPException(
+            status_code=429,
+            detail="too many failed sign-ins; try again shortly",
+            headers={"Retry-After": str(int(wait) + 1)})
     if not await authenticated(request):
+        # The browser's first, credential-less request is how Basic auth asks
+        # for a password; only a wrong one is a failed attempt.
+        if _decoded_basic(request) is not None:
+            _note_failure(client, now)
         raise HTTPException(
             status_code=401, detail="administrator authentication required",
             headers={"WWW-Authenticate": 'Basic realm="stream-picker admin", charset="UTF-8"'},
         )
+    _FAILS.pop(client, None)
 
 
 def require_csrf(request) -> None:

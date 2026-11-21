@@ -5,6 +5,11 @@ have written root-owned 0600 files.  A static ``USER`` therefore makes both a
 fresh install and an upgrade fragile.  The container grants this bootstrap
 process only CHOWN, DAC_OVERRIDE, SETGID, and SETUID; after the ownership pass,
 the application is exec'd as the unprivileged stream-picker account.
+
+The compose file also grants KILL, which is for init rather than for this
+module: tini runs as root and must signal the UID-1000 process exec'd here.
+Without CAP_KILL that kill() fails with EPERM, tini exits, and every stop
+becomes a hard kill that never reaches uvicorn's graceful shutdown.
 """
 
 from __future__ import annotations

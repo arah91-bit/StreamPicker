@@ -28,14 +28,14 @@ import os
 import re
 import secrets
 import time
-import unicodedata
 import xml.etree.ElementTree as ET
+from collections.abc import Iterable
 from contextvars import ContextVar
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 import httpx
 
-from app import candidate_health, meta, telemetry, usenet_health
+from app import candidate_health, meta, telemetry, textfold, usenet_health
 
 logger = logging.getLogger("stream-picker")
 
@@ -339,8 +339,7 @@ def _fold(t: str) -> str:
     Without folding, every legitimate release for such a title fails the
     title match and the whole lane goes dark for it.
     """
-    t = unicodedata.normalize("NFKD", t or "").casefold()
-    t = "".join(ch for ch in t if not unicodedata.combining(ch))
+    t = textfold.fold(t)
     return t.replace("&", "and").replace("+", "and")
 
 
@@ -431,12 +430,40 @@ def _newznab_identity_evidence(
 
 
 async def _expected_info(media: str, media_id: str) -> tuple[list[str], int | None]:
-    """Authoritative title prefixes and release year for this IMDb id."""
+    """Authoritative title prefixes and release year for this IMDb id.
+
+    Canonical and native titles come first — callers that bound their query
+    fan-out slice from the front — followed by the names a foreign work is
+    actually released under (IMDb's title, then regional aliases)."""
+    imdb = media_id.split(":")[0]
     try:
-        title, orig, year = await meta.title_year(media, media_id.split(":")[0])
+        (title, orig, year), aliases = await asyncio.gather(
+            meta.title_year(media, imdb), meta.title_aliases(media, imdb))
     except Exception:
         return [], None
-    return list(dict.fromkeys(t for t in (title, orig) if t)), year
+    return list(dict.fromkeys(t for t in (title, orig, *aliases) if t)), year
+
+
+async def _accepted_years(media: str, media_id: str,
+                          year: int | None) -> frozenset[int]:
+    """Years a release for this request may be labelled with.
+
+    The work's own year and, for an episode past season 1, that season's
+    first-air year: long-running Chinese shows are released season by season
+    under it (乡村爱情 began in 2006; its S17 is "Country Love 2025 S17").  Any
+    other year still marks a different same-name work.  Empty when the work's
+    year is unknown, which leaves every year gate open exactly as before.
+    Season 1 needs no lookup — its year is the show's."""
+    if not year:
+        return frozenset()
+    years = {int(year)}
+    parts = media_id.split(":")
+    if (media != "movie" and len(parts) == 3 and parts[1].isdigit()
+            and int(parts[1]) > 1):
+        extra = await meta.season_year(parts[0], int(parts[1]))
+        if extra:
+            years.add(int(extra))
+    return frozenset(years)
 
 
 _TITLE_TAIL_MARKERS = {
@@ -495,16 +522,20 @@ def _release_title_match(release: str, expected: str) -> bool:
 
 
 def _release_year_match(release: str, titles: list[str],
-                        expected_year: int | None) -> bool:
+                        expected_year: int | Iterable[int] | None) -> bool:
     """Reject an explicit, contradictory year immediately after a title.
 
     Same-name series/remakes are common (and alias fan-out makes finding them
     more likely). A release with no title-adjacent year remains eligible, but
     ``Shared Show 2026 S01`` cannot satisfy metadata for the 2005 show. Matching
     only the title-adjacent token avoids treating numeric titles such as
-    ``1917`` as the production year.
+    ``1917`` as the production year. ``expected_year`` may be the set from
+    :func:`_accepted_years`; matching any one of them is enough.
     """
-    if not expected_year:
+    if isinstance(expected_year, int):
+        expected_year = (expected_year,)
+    wanted_years = {int(y) for y in expected_year or () if y}
+    if not wanted_years:
         return True
     folded = _fold(release or "")
     for expected in titles:
@@ -529,7 +560,7 @@ def _release_year_match(release: str, titles: list[str],
         actual = int(match.group(1))
         # A one-year discrepancy is common around festival/air/release dates;
         # larger differences identify a different same-name work.
-        if abs(actual - int(expected_year)) <= 1:
+        if any(abs(actual - year) <= 1 for year in wanted_years):
             return True
     return False
 
@@ -613,38 +644,86 @@ def _query_text(title: str) -> str:
     """Free-text query form of an authoritative title: diacritics folded,
     apostrophes dropped, sentence punctuation spaced — the shapes indexer
     full-text search actually stores."""
-    t = unicodedata.normalize("NFKD", title or "")
-    t = "".join(ch for ch in t if not unicodedata.combining(ch))
+    t = textfold.strip_marks(title)
     t = t.replace("'", "").replace("’", "")
     t = re.sub(r"[;:!?~]+", " ", t)
     return re.sub(r"\s+", " ", t).strip()
 
 
+def _spellings(title: str) -> list[str]:
+    """Search spellings of one title, likeliest first.
+
+    Trackers and indexers mostly store release names without diacritics
+    ("Tiem Banh Hoang Tu Be"), so the folded form leads; the title as written
+    follows when it differs, for the sites that keep Unicode names. Every lane
+    searches in that order and only falls through to the next spelling when
+    the likelier one found nothing."""
+    written = re.sub(r"\s+", " ", str(title or "")).strip()
+    return list(dict.fromkeys(s for s in (_query_text(written), written) if s))
+
+
+def _latin_titles(titles: list[str]) -> list[str]:
+    """Distinct titles that indexer full-text search can use, in metadata
+    order: a native CJK title is no query at all there."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for title in titles:
+        key = _norm(title)       # "Country.Love" is the same search
+        if (re.search(r"[A-Za-z0-9]", _query_text(title)) and key
+                and key not in seen):
+            seen.add(key)
+            out.append(title)
+    return out
+
+
+def _text_forms(media: str, parts: list[str], q: str, year: int | None,
+                full: bool = True) -> list[str]:
+    if media == "movie":
+        return [f"{q} {year}" if year else q]
+    season = f"S{int(parts[1]):02d}"
+    if not full:
+        return [f"{q} {season}E{int(parts[2]):02d}"]
+    # Double-episode bundles ("S13E07-E08") and season packs never match an
+    # exact SxxEyy text query; a season-level query recovers them and the
+    # strict matchers keep everything else out. Complete-series containers are
+    # common for older shows and may carry no season token at all; they still
+    # pass strict title + show-pack + mounted-member identity gates.
+    return [f"{q} {season}E{int(parts[2]):02d}", f"{q} {season}",
+            f"{q} Complete"]
+
+
 def _text_queries(media: str, parts: list[str], titles: list[str],
                   year: int | None) -> list[str]:
+    # The first two usable titles, accent-folded: for a Chinese drama that is
+    # its English title and the name it is released under.
     queries = []
-    for title in titles[:2]:
-        q = _query_text(title)
-        if not re.search(r"[A-Za-z0-9]", q):
-            continue
-        if media == "movie":
-            queries.append(f"{q} {year}" if year else q)
-        else:
-            queries.append(f"{q} S{int(parts[1]):02d}E{int(parts[2]):02d}")
-            # Double-episode bundles ("S13E07-E08") and season packs never
-            # match an exact SxxEyy text query; a season-level query recovers
-            # them and the strict matchers keep everything else out.
-            queries.append(f"{q} S{int(parts[1]):02d}")
-            # Complete-series containers are common for older shows and may
-            # carry no season token at all. This broader query runs only in the
-            # existing no-fetchable-single fallback and still passes strict
-            # title + show-pack + mounted-member identity gates.
-            queries.append(f"{q} Complete")
+    for title in _latin_titles(titles)[:2]:
+        queries.extend(_text_forms(media, parts, _query_text(title), year))
     return list(dict.fromkeys(queries))
 
 
+def _text_fallback_queries(media: str, parts: list[str], titles: list[str],
+                           year: int | None) -> list[str]:
+    """The last text pass before the lane gives up: the first two titles as
+    written when that differs from the folded spelling, then up to two further
+    release titles by their exact episode (or year). It runs only when the id
+    query and the first text pass found nothing fetchable, and stays small —
+    each query costs one request per indexer against daily API caps."""
+    latin = _latin_titles(titles)
+    queries: list[str] = []
+    for title in latin[:2]:
+        for spelling in _spellings(title)[1:]:
+            queries.extend(_text_forms(media, parts, spelling, year))
+    for title in latin[2:4]:
+        queries.extend(_text_forms(media, parts, _query_text(title), year,
+                                   full=False))
+    first = set(_text_queries(media, parts, titles, year))
+    return [q for q in dict.fromkeys(queries) if q not in first]
+
+
 async def _text_search(media: str, parts: list[str], titles: list[str],
-                       year: int | None) -> list[list[dict]]:
+                       year: int | None,
+                       queries: list[str] | None = None) -> list[list[dict]]:
     """Free-text fallback when the id-scoped query yields nothing usable.
 
     Anime and Asian dramas have the worst IMDb-id coverage on indexers —
@@ -652,7 +731,8 @@ async def _text_search(media: str, parts: list[str], titles: list[str],
     an imdbid query.  A ``t=search`` pass with the title and episode token in
     the query recovers them; every result still runs the full strict identity
     pipeline, so breadth here cannot admit wrong content."""
-    queries = _text_queries(media, parts, titles, year)
+    if queries is None:
+        queries = _text_queries(media, parts, titles, year)
     if not queries:
         return []
     cat = "2000" if media == "movie" else "5000"
@@ -677,10 +757,14 @@ async def search(media: str, media_id: str) -> list[dict]:
             return []
         params = {"t": "tvsearch", "imdbid": imdb,
                   "season": parts[1], "ep": parts[2]}
+    async def expected_identity():
+        titles, year = await _expected_info(media, media_id)
+        return titles, year, await _accepted_years(media, media_id, year)
+
     results, expected = await asyncio.gather(
         asyncio.gather(*(_search_one(n, b, k, params) for n, b, k in INDEXERS)),
-        _expected_info(media, media_id))
-    expected_titles, expected_year = expected
+        expected_identity())
+    expected_titles, expected_year, accepted_years = expected
     # Wrong content is worse than no direct-usenet result. If authoritative
     # title metadata is unavailable, leave this optional lane out for now.
     if not expected_titles:
@@ -729,10 +813,10 @@ async def search(media: str, media_id: str) -> list[dict]:
                     continue
                 pack_scope = usenet_health._content_scope(
                     media, pack_media_id)
-            if expected_year:
+            if accepted_years:
                 years = {int(y) for y in re.findall(r"(?<!\d)((?:19|20)\d{2})(?!\d)",
                                                     it["title"])}
-                if years and expected_year not in years:
+                if years and not years & accepted_years:
                     dropped += 1
                     continue
             if not _mountable_release(it["title"]):
@@ -782,6 +866,7 @@ async def search(media: str, media_id: str) -> list[dict]:
                            "media_id": media_id,
                            "titles": list(expected_titles),
                            "year": expected_year,
+                           "years": sorted(accepted_years),
                        }}
             if is_pack:
                 release["_nzb_pack"] = True
@@ -804,6 +889,18 @@ async def search(media: str, media_id: str) -> list[dict]:
             logger.info(f"nzb search {media_id}: id query yielded nothing "
                         f"usable; free-text fallback recovered "
                         f"{len(releases) - before} release(s)")
+    if not _any_fetchable(releases):
+        extra = _text_fallback_queries(media, parts, expected_titles,
+                                       expected_year)
+        if extra:
+            before = len(releases)
+            for lst in await _text_search(media, parts, expected_titles,
+                                          expected_year, extra):
+                _ingest(lst)
+            if len(releases) > before:
+                logger.info(f"nzb search {media_id}: written spellings / "
+                            f"further aliases recovered "
+                            f"{len(releases) - before} release(s)")
     if packs:
         logger.info(f"nzb search {media_id}: admitting {len(packs)} "
                     "episode-gated pack candidate(s)")
@@ -1527,8 +1624,12 @@ def _basename_identity(href: str, release: dict,
     year = expected.get("year")
     try:
         year = int(year) if year else None
+        # A series episode may also carry its season's own year; see
+        # _accepted_years. Older stored releases have only "year".
+        accepted = ({int(y) for y in expected.get("years") or () if y}
+                    or ({year} if year else set()))
     except (TypeError, ValueError):
-        year = None
+        year, accepted = None, set()
     evidence: list[str] = ["basename-title"] if title_exact else []
 
     if expected.get("media") == "movie":
@@ -1557,7 +1658,7 @@ def _basename_identity(href: str, release: dict,
     if requested and tokens and not episode_exact:
         # The requested token began a range/multi-episode bundle.
         return "contradiction", evidence + ["basename-episode-bundle"], "wrong-episode"
-    if year and years and year not in years:
+    if accepted and years and not years & accepted:
         return "contradiction", evidence + ["basename-year-mismatch"], "wrong-year"
     if title_exact and episode_exact:
         marks = ["basename-episode"] + (["basename-episode-range"]
@@ -2016,8 +2117,13 @@ def _refresh_out(out: list[dict], results: dict[int, dict]) -> None:
     out[:] = [results[i] for i in sorted(results)]
 
 
-def _verified_pack_releases(media_id: str) -> list[dict]:
-    """Reconstruct credential-free releases for persistent mounted-pack reuse."""
+def _verified_pack_releases(media_id: str,
+                            season_year: int | None = None) -> list[dict]:
+    """Reconstruct credential-free releases for persistent mounted-pack reuse.
+
+    The registry stores only the show's year; ``season_year`` restores the
+    season's own year so a season pack's members ("Show 2025 S17E02") still
+    pass the basename year check on reuse."""
     releases: list[dict] = []
     for row in candidate_health.pack_seeds(media_id):
         key = str(row.get("release_key") or "")
@@ -2025,6 +2131,7 @@ def _verified_pack_releases(media_id: str) -> list[dict]:
         if not key.startswith("nzb:") or not titles \
                 or usenet_health.should_skip(key):
             continue
+        year = int(row.get("year") or 0) or None
         releases.append({
             "title": str(row.get("title") or ""),
             "size": int(row.get("size") or 0),
@@ -2043,7 +2150,9 @@ def _verified_pack_releases(media_id: str) -> list[dict]:
                 "media": "series",
                 "media_id": media_id,
                 "titles": titles,
-                "year": int(row.get("year") or 0) or None,
+                "year": year,
+                "years": sorted({y for y in (year, season_year) if y}
+                                if year else ()),
             },
         })
     return releases
@@ -2110,8 +2219,11 @@ async def _run_lane(media: str, media_id: str, out: list[dict],
 
         # At most two already-verified containers get the head start. They are
         # cheap DAV reuse checks and count against this lane's normal mount cap.
+        season_year = (await meta.season_year(parts[0], episode[0])
+                       if episode and episode[0] > 1 else None)
         seeds = _select_releases(
-            _verified_pack_releases(media_id), min(2, limit), media)
+            _verified_pack_releases(media_id, season_year), min(2, limit),
+            media)
         seed_by_key = {r.get("release_key"): r for r in seeds
                        if r.get("release_key")}
         seed_failed: set[str] = set()

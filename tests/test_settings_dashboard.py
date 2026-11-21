@@ -71,6 +71,49 @@ class ConfigStoreTests(unittest.TestCase):
         self.assertFalse(path.exists())
         self.assertTrue(list(path.parent.glob(path.name + ".corrupt-*")))
 
+    def _write_raw(self, env: dict) -> pathlib.Path:
+        path = pathlib.Path(os.environ["CONFIG_FILE"])
+        path.write_text(json.dumps({"env": env}))
+        return path
+
+    def test_a_setting_from_a_newer_build_is_dormant_not_fatal(self):
+        """Booting a rollback image against its successor's config used to
+        quarantine the whole file — every debrid key and indexer — for the
+        sake of one knob the older build had never heard of."""
+        path = self._write_raw({"BUFFER_CACHE_GB": "150",
+                                "SOME_FUTURE_KNOB": "7"})
+        self.assertEqual({"BUFFER_CACHE_GB": "150"}, config._read())
+        self.assertTrue(path.exists(), "the store was quarantined")
+        self.assertEqual("150", config.pending("BUFFER_CACHE_GB"))
+
+        config.save({"MAX_PROBES": "5"})            # a later save keeps it
+        env = json.loads(path.read_text())["env"]
+        self.assertEqual("7", env["SOME_FUTURE_KNOB"])
+        self.assertEqual("5", env["MAX_PROBES"])
+
+    def test_a_value_this_build_cannot_accept_is_dormant_until_replaced(self):
+        path = self._write_raw({"DV_REJECT": "future-mode",
+                                "BUFFER_CACHE_GB": "150"})
+        self.assertEqual({"BUFFER_CACHE_GB": "150"}, config._read())
+        config.save({"BUFFER_CACHE_GB": "120"})
+        self.assertEqual("future-mode",
+                         json.loads(path.read_text())["env"]["DV_REJECT"])
+        config.save({"DV_REJECT": "all"})           # an explicit save replaces it
+        self.assertEqual("all", json.loads(path.read_text())["env"]["DV_REJECT"])
+
+    def test_reading_never_moves_the_file(self):
+        """The readiness probe polls validate_pending() every 30 s; a read
+        must report a broken store, not quietly quarantine it."""
+        path = pathlib.Path(os.environ["CONFIG_FILE"])
+        before = set(path.parent.glob(path.name + ".corrupt-*"))
+        path.write_text('{"env": {broken')
+        with self.assertRaisesRegex(ValueError, "unreadable"):
+            config.validate_pending()
+        config.pending("BUFFER_CACHE_GB")
+        config.restart_pending()
+        self.assertTrue(path.exists(), "a read moved the operator's file")
+        self.assertEqual(before, set(path.parent.glob(path.name + ".corrupt-*")))
+
     def test_choice_must_be_in_schema(self):
         config.save({"DV_REJECT": "all"})
         self.assertEqual("all", config.pending("DV_REJECT"))

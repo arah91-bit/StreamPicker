@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("ADDON_SECRET", "test-secret")
 
-from app import picker, probe, reputation
+from app import picker, probe, reputation, vprobe
 
 
 class DurationReasonTests(unittest.TestCase):
@@ -125,11 +125,11 @@ class ProbeDurationGateTests(unittest.TestCase):
                                 + b"\x00" * (4 * 1024 * 1024)], url)})
 
         async def fake_info(target, timeout=5.0):
-            return ["aac"], "h264", 185.0, ["en"]
+            return vprobe.MediaDetails(["aac"], "h264", 185.0, ["en"], "", [])
 
         with (patch.object(probe, "CODEC_SNIFF", True),
               patch("app.probe.vprobe.enabled", return_value=True),
-              patch("app.probe.vprobe.media_info_of", side_effect=fake_info)):
+              patch("app.probe.vprobe.media_details_of", side_effect=fake_info)):
             r = self._run(probe.probe(url, 1_000_000, ttfb_max=10,
                                       expect_secs=1440))
         self.assertFalse(r.ok)
@@ -142,11 +142,11 @@ class ProbeDurationGateTests(unittest.TestCase):
                                          + b"\x00" * (4 * 1024 * 1024)], url)})
 
         async def fake_info(target, timeout=5.0):
-            return ["aac"], "h264", 1420.0, ["en"]
+            return vprobe.MediaDetails(["aac"], "h264", 1420.0, ["en"], "", [])
 
         with (patch.object(probe, "CODEC_SNIFF", True),
               patch("app.probe.vprobe.enabled", return_value=True),
-              patch("app.probe.vprobe.media_info_of", side_effect=fake_info)):
+              patch("app.probe.vprobe.media_details_of", side_effect=fake_info)):
             r = self._run(probe.probe(url, 1_000_000, ttfb_max=10,
                                       expect_secs=1440))
         self.assertTrue(r.ok, r.reason)

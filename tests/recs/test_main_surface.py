@@ -74,6 +74,7 @@ class MainSurfaceTests(unittest.IsolatedAsyncioTestCase):
                          AsyncMock(return_value=summary)),
             patch.object(main.db, "feedback_counts",
                          AsyncMock(return_value={"liked": 7, "disliked": 3})),
+            patch.object(main.db, "watchlist_count", AsyncMock(return_value=4)),
         ):
             response = await self.client.get(
                 f"/setup/{SETUP_SECRET}/api/users")
@@ -89,6 +90,9 @@ class MainSurfaceTests(unittest.IsolatedAsyncioTestCase):
         # label, so an operator can see who has actually done it.
         self.assertTrue(listed["taste_url"].endswith("/viewer/taste"))
         self.assertEqual(10, listed["taste_rated"])
+        # Saves are counted separately from the verdicts because they are
+        # stored separately — they are a shelf, not an opinion.
+        self.assertEqual(4, listed["taste_saved"])
 
     async def test_manifest_advertises_optional_skip_for_every_catalog(self):
         catalogs = [

@@ -157,6 +157,9 @@ def merge_headers(url: str, base: dict | None = None) -> dict:
     return merged
 
 
+_solves: set[asyncio.Task] = set()
+
+
 def note_challenge(url: str) -> None:
     """A request to this host just hit a Cloudflare challenge. Schedule a
     background solve so the *next* request carries clearance. Deduped per host,
@@ -178,7 +181,11 @@ def note_challenge(url: str) -> None:
         return
     _inflight.add(host)
     _cooldown[host] = time.monotonic() + _SOLVE_COOLDOWN
-    loop.create_task(_solve(host, origin))
+    # Held, or a solve can be collected mid-flight and leave its host in
+    # _inflight forever — never solved again until a restart.
+    task = loop.create_task(_solve(host, origin))
+    _solves.add(task)
+    task.add_done_callback(_solves.discard)
 
 
 async def _flaresolverr_get(origin: str) -> dict:

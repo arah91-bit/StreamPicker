@@ -96,7 +96,9 @@ class SeedSelectionTests(unittest.TestCase):
         with patch.object(Generator, "_movie_share", return_value=0.3):
             chosen = gen._ranked_seeds(TOP_PICKS_SEED_COUNT)
         films = [s for s, _ in chosen if s["type"] == "movie"]
-        self.assertEqual(3, len(films))
+        # The movie share of the seed slots, whatever the slot count is.
+        self.assertEqual(round(TOP_PICKS_SEED_COUNT * 0.3), len(films))
+        self.assertGreater(len(films), 0)
 
     def test_a_weak_film_seed_earns_a_place_but_not_a_strong_score(self):
         """Normalising strength per medium as well as allocating slots per

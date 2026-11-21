@@ -25,13 +25,14 @@ from pathlib import Path
 import re
 import secrets
 import time
+from typing import NamedTuple
 from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 
 import httpx
 from fastapi import HTTPException, Request
 from starlette.responses import Response, StreamingResponse
 
-from app import telemetry, usenet
+from app import meta, telemetry, usenet
 
 logger = logging.getLogger("stream-picker")
 
@@ -116,10 +117,27 @@ MAX_ACTIVE_DOWNLOADS = max(0, int(os.environ.get(
 # the complete release (no hit-and-run). When OFF, only the clicked episode is
 # downloaded from a season pack (others set to skip); the release stays partial.
 WHOLE_TORRENT = _bool("PRIVATE_TRACKER_WHOLE_TORRENT", True)
+# One Prowlarr aggregate search waits for its slowest tracker, and trackers
+# retry their own 5xx/gateway timeouts: across ~34 private indexers a cold
+# search measured 82-94 s whether 8 or 12 queries were in flight. At 45 s every
+# query timed out and a show that M-Team carried came back "failed". Nothing
+# waits on this — callers bound their own wait and the search finishes into
+# the shared cache — so a tight value only throws the answer away.
 SEARCH_TIMEOUT = max(2.0, float(os.environ.get(
-    "PRIVATE_TRACKER_SEARCH_TIMEOUT", "45")))
+    "PRIVATE_TRACKER_SEARCH_TIMEOUT", "120")))
 START_TIMEOUT = max(5.0, float(os.environ.get(
     "PRIVATE_TRACKER_START_TIMEOUT", "90")))
+# Holding a not-yet-complete file's first request until the download can stay
+# ahead of playback (see _hold_for_headroom). Per request it must stay under a
+# player's read timeout (the TV fork's is 15 s): past that the request fails,
+# so a longer hold continues across the player's own retries via a 503, up to
+# START_HOLD_TOTAL_SECS, after which playback starts anyway.
+START_HOLD_SECS = max(0.0, float(os.environ.get(
+    "PRIVATE_TRACKER_START_HOLD", "12")))
+START_HOLD_TOTAL_SECS = max(0.0, float(os.environ.get(
+    "PRIVATE_TRACKER_START_HOLD_TOTAL", "120")))
+START_MIN_SECS = 20.0        # head start never below this much video
+HEADROOM_MARGIN = 1.25       # swarm rates wobble; plan on 80 % of the measured rate
 SEARCH_TTL = max(60.0, float(os.environ.get(
     "PRIVATE_TRACKER_SEARCH_TTL", "10800")))
 TOKEN_TTL = max(SEARCH_TTL, 24 * 3600)
@@ -169,6 +187,60 @@ _rqbit_vpn_checked_at = 0.0
 _search_cache: dict[tuple[str, str], tuple[float, list[dict]]] = {}
 _search_tasks: dict[tuple[str, str], asyncio.Task] = {}
 _search_outcomes: dict[tuple[str, str], dict] = {}
+# (type, query, indexer ids) -> (expires_at, rows). Most of a lookup's queries
+# ("Show", "Show S17", the IMDb-id season search) are identical for every
+# episode of a season, so the next episode costs the trackers nothing.
+_query_cache: dict[tuple[str, str, frozenset[int]], tuple[float, list[dict]]] = {}
+# An empty answer may be a tracker that rate-limited Prowlarr's request (the
+# aggregate API does not say), so it is only briefly trusted.
+_EMPTY_QUERY_TTL = 900.0
+
+# The AvistaZ network (AvistaZ, CinemaZ, PrivateHD, AnimeZ, ExoticaZ) shares one
+# API quota. The ordinary fan-out sent each site 12 queries per lookup, and a few
+# lookups later all four answered 429 in the same second. Prowlarr then logs
+# "Disabled for 01:00:00" yet keeps forwarding searches — each one re-tripping
+# the limit, for Sonarr/Radarr too — so this lane has to ration itself. The
+# network also carries season packs only ("Show S01 (2025) 1080p ...", IMDb and
+# TVDB ids attached): an SxxEyy query there measured 0 results every time, while
+# an IMDb-id season search or the bare title returned all of them in < 1 s.
+_RATIONED_IMPLEMENTATIONS = frozenset({
+    "avistaz", "cinemaz", "privatehd", "animez", "exoticaz"})
+# AnimeZ carries only anime: a live-action title query there came back with
+# dozens of unrelated rows and spent a share of the network quota.
+_ANIME_ONLY_IMPLEMENTATIONS = frozenset({"animez"})
+# Seconds between two rationed queries, process-wide. Prowlarr and Jackett both
+# space requests to one AvistaZ site 6 s apart; a query here reaches every site
+# of the network at once, so leave more room than that.
+RATIONED_SPACING = 10.0
+_rationed_lock = asyncio.Lock()
+_rationed_next = 0.0
+
+
+class _IndexerTraits(NamedTuple):
+    rationed: bool = False       # shares the AvistaZ network quota
+    imdb_tv: bool = False        # supports an IMDb-id TV search
+    imdb_movie: bool = False     # supports an IMDb-id movie search
+    anime_only: bool = False     # carries nothing but anime
+    # Whether the tracker carries movies / TV at all, from its Prowlarr
+    # categories (Newznab 2000s / 5000s). Unknown stays True: a gap in the
+    # catalogue must not silently hide a source.
+    movies: bool = True
+    tv: bool = True
+
+
+def _carries(categories: list, family: int) -> bool:
+    """Whether a Prowlarr category tree has anything in a Newznab family
+    (2000 movies, 5000 TV), subcategories included."""
+    for cat in categories or ():
+        ids = [cat.get("id")] + [sub.get("id")
+                                 for sub in cat.get("subCategories") or ()]
+        if any(isinstance(i, int) and i // 1000 * 1000 == family for i in ids):
+            return True
+    return False
+
+
+_NO_TRAITS = _IndexerTraits()
+_indexer_traits: dict[int, _IndexerTraits] = {}
 
 # Opaque player capabilities. Candidate payloads contain Prowlarr download URLs
 # and therefore stay memory-only; the URL exposed to a player is random.
@@ -236,8 +308,11 @@ def classify_release(title: str, season: int, episode: int) -> str:
         for left, right in pattern.findall(text):
             low, high = sorted((int(left), int(right)))
             return "series" if low <= season <= high else ""
+    # (?!\d) stops the digits backtracking: without it "S18E13" yields season
+    # 1 (the "e\d" guard fails after "18", passes after "1"), which filed every
+    # single episode of seasons 10-19 as a season-1 pack.
     seasons = {int(x) for x in re.findall(
-        r"(?<![A-Za-z0-9])s0*(\d{1,3})(?!\s*e\d)", text, re.I)}
+        r"(?<![A-Za-z0-9])s0*(\d{1,3})(?!\d)(?!\s*e\d)", text, re.I)}
     seasons |= {int(x) for x in re.findall(
         r"\bseason[ ._-]*0*(\d{1,3})\b", text, re.I)}
     if seasons == {season}:
@@ -347,23 +422,47 @@ async def _private_torrent_indexers() -> dict[int, str]:
         f"{PROWLARR_URL}/api/v1/indexer",
         headers={"X-Api-Key": PROWLARR_API_KEY}, timeout=15)
     response.raise_for_status()
+    rows = [row for row in response.json()
+            if row.get("enable", True)
+            and str(row.get("protocol") or "").lower() == "torrent"
+            and str(row.get("privacy") or "").lower() == "private"
+            and str(row.get("id") or "").isdigit()]
     indexers = {
         int(row["id"]): _indexer_name(
             row.get("name") or row.get("implementationName"),
             f"Private tracker #{row['id']}")
-        for row in response.json()
-        if row.get("enable", True)
-        and str(row.get("protocol") or "").lower() == "torrent"
-        and str(row.get("privacy") or "").lower() == "private"
-        and str(row.get("id") or "").isdigit()
+        for row in rows
     }
+    for row in rows:
+        caps = row.get("capabilities") or {}
+        implementation = str(row.get("implementation") or "").lower()
+        categories = caps.get("categories") or []
+        _indexer_traits[int(row["id"])] = _IndexerTraits(
+            rationed=implementation in _RATIONED_IMPLEMENTATIONS,
+            imdb_tv="imdbId" in (caps.get("tvSearchParams") or ()),
+            imdb_movie="imdbId" in (caps.get("movieSearchParams") or ()),
+            anime_only=implementation in _ANIME_ONLY_IMPLEMENTATIONS,
+            movies=_carries(categories, 2000) if categories else True,
+            tv=_carries(categories, 5000) if categories else True)
     _private_indexers = (now, indexers)
     return dict(indexers)
 
 
-async def _prowlarr_query(query: str, indexer_ids: set[int]) -> list[dict]:
+def _cached_query(key: tuple[str, str, frozenset[int]]) -> list[dict] | None:
+    hit = _query_cache.get(key)
+    if hit and time.monotonic() < hit[0]:
+        return hit[1]
+    return None
+
+
+async def _prowlarr_query(query: str, indexer_ids: set[int],
+                          kind: str = "search") -> list[dict]:
+    key = (kind, query, frozenset(indexer_ids))
+    cached = _cached_query(key)
+    if cached is not None:
+        return cached
     params: list[tuple[str, str]] = [
-        ("query", query), ("type", "search"), ("limit", "100")]
+        ("query", query), ("type", kind), ("limit", "100")]
     params += [("indexerIds", str(i)) for i in sorted(indexer_ids)]
     response = await _client.get(
         f"{PROWLARR_URL}/api/v1/search",
@@ -371,37 +470,163 @@ async def _prowlarr_query(query: str, indexer_ids: set[int]) -> list[dict]:
         timeout=SEARCH_TIMEOUT)
     response.raise_for_status()
     payload = response.json()
-    return payload if isinstance(payload, list) else []
+    rows = payload if isinstance(payload, list) else []
+    _query_cache[key] = (
+        time.monotonic() + (SEARCH_TTL if rows else _EMPTY_QUERY_TTL), rows)
+    if len(_query_cache) > 500:
+        _query_cache.pop(next(iter(_query_cache)), None)
+    return rows
 
 
-def _query_strings(media: str, titles: str | list[str], year: int | None,
-                   coords: tuple[int, int] | None) -> list[str]:
+def _rationed_tiers(media: str, media_id: str, titles: list[str],
+                    coords: tuple[int, int] | None, rationed: set[int],
+                    animation: bool | None = None
+                    ) -> list[list[tuple[str, str, set[int]]]]:
+    """(type, query, indexers) searches for the AvistaZ network, in two tiers.
+
+    Tier 1, at most three queries: an IMDb-id search scoped to the season (or
+    the film) finds packs whatever they are named, on the sites that support
+    it, and the first two Latin-script titles, accent-folded, catch releases
+    the tracker never linked to the id — 乡村爱情 is filed as "Country Love"
+    with no IMDb id at all. The site searches English names only, so a native
+    CJK query is a wasted request there. Tier 2, only after every tracker's
+    tier 1 found nothing, adds at most three more: those titles as written
+    when that differs, then the next Latin titles. Anime-only sites are
+    skipped when TMDB says the work is not animation (``animation`` False);
+    unknown keeps them."""
+    imdb = media_id.split(":")[0]
+    tv = coords is not None
+    traits = {i: _indexer_traits.get(i, _NO_TRAITS) for i in rationed}
+    by_id = {i for i, t in traits.items() if (t.imdb_tv if tv else t.imdb_movie)}
+    by_title = {i for i, t in traits.items()
+                if not (t.anime_only and animation is False)}
+    first: list[tuple[str, str, set[int]]] = []
+    if by_id and re.fullmatch(r"tt\d+", imdb):
+        first.append(
+            ("tvsearch", f"{{ImdbId:{imdb}}}{{Season:{coords[0]}}}", by_id)
+            if tv else ("movie", f"{{ImdbId:{imdb}}}", by_id))
+    latin = usenet._latin_titles(titles)
+    later: list[tuple[str, str, set[int]]] = []
+    if by_title:
+        for title in latin[:2]:
+            spellings = usenet._spellings(title)
+            first.append(("search", spellings[0], set(by_title)))
+            later.extend(("search", s, set(by_title)) for s in spellings[1:])
+        later.extend(("search", usenet._spellings(t)[0], set(by_title))
+                     for t in latin[2:])
+    return [tier for tier in (first, later[:3]) if tier]
+
+
+async def _rationed_rows(requests: list[tuple[str, str, set[int]]],
+                         budget: float | None = None) -> list[dict]:
+    """Run rationed searches one at a time, RATIONED_SPACING apart process-wide
+    — across concurrent lookups too — so the network never sees a burst.
+
+    The chain shares the private search's deadline (``budget``, default
+    SEARCH_TIMEOUT): the lookup gathers it alongside the other trackers, so
+    an unbounded queue behind other lookups' queries would hold every
+    tracker's results hostage. Whatever it has collected by the deadline is
+    returned; queries it never reached are simply not sent. A query another
+    lookup answered while this one waited for its turn is taken from the
+    cache without spending a turn."""
+    global _rationed_next
+    deadline = time.monotonic() + (SEARCH_TIMEOUT if budget is None else budget)
+    rows: list[dict] = []
+    errors: list[BaseException] = []
+    for kind, query, ids in requests:
+        key = (kind, query, frozenset(ids))
+        cached = _cached_query(key)
+        if cached is not None:
+            rows.extend(cached)
+            continue
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            await asyncio.wait_for(_rationed_lock.acquire(), remaining)
+        except asyncio.TimeoutError:
+            break
+        try:
+            cached = _cached_query(key)
+            if cached is not None:
+                rows.extend(cached)
+                continue
+            delay = _rationed_next - time.monotonic()
+            if delay >= deadline - time.monotonic():
+                break
+            if delay > 0:
+                await asyncio.sleep(delay)
+            try:
+                rows.extend(await asyncio.wait_for(
+                    _prowlarr_query(query, ids, kind),
+                    max(0.1, deadline - time.monotonic())))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                _rationed_next = time.monotonic() + RATIONED_SPACING
+        finally:
+            _rationed_lock.release()
+    if requests and len(errors) == len(requests):
+        raise errors[0]
+    return rows
+
+
+# A total miss runs the second tier too; this bounds how much of it one lookup
+# may send, since every query reaches every private tracker.
+_MAX_FALLBACK_QUERIES = 16
+
+
+def _query_tiers(media: str, titles: str | list[str], year: int | None,
+                 coords: tuple[int, int] | None) -> list[list[str]]:
+    """Private-tracker queries in escalating tiers, likeliest first.
+
+    Tier 1 is what most often finds the release: the accent-folded spellings
+    (see usenet._spellings) of the canonical, native and first two release
+    titles, with the forms each has always had. Tier 2 runs only when tier 1
+    found nothing eligible, and cycles through everything else before giving
+    up: the same queries spelled as written, the bare-title and
+    complete-series forms tier 1 skips for aliases, and every further alias."""
     names = [titles] if isinstance(titles, str) else list(titles)
-    # Metadata order is meaningful (canonical first), but foreign works often
-    # need their native-script or regional alias. Bound the fan-out and dedupe
-    # case-insensitively so a large alias list cannot hammer Prowlarr.
     clean: list[str] = []
     seen: set[str] = set()
     for raw in names:
         title = str(raw or "").strip()
-        folded = title.casefold()
-        if title and folded not in seen:
+        if title and title.casefold() not in seen:
             clean.append(title)
-            seen.add(folded)
-        if len(clean) >= 4:
-            break
-    if not coords:
-        return list(dict.fromkeys(
-            f"{title} {year}" if year else title for title in clean))
-    season, episode = coords
-    queries: list[str] = []
-    for title in clean:
+            seen.add(title.casefold())
+
+    def forms(title: str, rank: int, skipped: bool = False) -> list[str]:
+        if not coords:
+            if skipped:          # a year token some trackers' search chokes on
+                return [title] if year else []
+            return [f"{title} {year}" if year else title]
+        season, episode = coords
         # Exact episode first, then reusable season/series packs. A bare-title
-        # query catches trackers whose search parser discards Sxx tokens.
-        queries.extend((f"{title} S{season:02d}E{episode:02d}",
-                        f"{title} S{season:02d}", title,
-                        f"{title} complete series"))
-    return list(dict.fromkeys(queries))
+        # query catches trackers whose search parser discards Sxx tokens;
+        # regional aliases (rank >= 2) leave those two to tier 2, since the
+        # bare native-title query already returns the show's whole shelf.
+        core = [f"{title} S{season:02d}E{episode:02d}", f"{title} S{season:02d}"]
+        wide = [title, f"{title} complete series"]
+        if skipped:
+            return wide if rank >= 2 else []
+        return core + (wide if rank < 2 else [])
+
+    first: list[str] = []
+    later: list[str] = []
+    for rank, title in enumerate(clean[:4]):
+        spellings = usenet._spellings(title)
+        first.extend(forms(spellings[0], rank))
+        for spelling in spellings[1:]:
+            later.extend(forms(spelling, rank))
+        later.extend(forms(spellings[0], rank, skipped=True))
+    for title in clean[4:]:
+        for spelling in usenet._spellings(title):
+            later.extend(forms(spelling, 2))
+    first = list(dict.fromkeys(first))
+    later = [q for q in dict.fromkeys(later) if q not in first]
+    return [tier for tier in (first, later[:_MAX_FALLBACK_QUERIES]) if tier]
 
 
 async def _search(media: str, media_id: str) -> list[dict]:
@@ -409,65 +634,100 @@ async def _search(media: str, media_id: str) -> list[dict]:
     started = time.monotonic()
     try:
         indexers = await _private_torrent_indexers()
-        indexer_ids = set(indexers)
+        # Only trackers that can hold this kind of release: a TV lookup sent to
+        # a games, music or book tracker only spends that tracker's API quota
+        # (GazelleGames rate-limited a show search), and movie-only trackers
+        # never carry episodes.
+        wanted = "movies" if media == "movie" else "tv"
+        indexer_ids = {i for i in indexers
+                       if getattr(_indexer_traits.get(i, _NO_TRAITS), wanted)}
         if not indexer_ids:
-            raise RuntimeError("no enabled private torrent indexers")
+            raise RuntimeError(f"no enabled private {wanted} indexers")
         titles, year = await usenet._expected_info(media, media_id)
         if not titles:
             raise RuntimeError("title metadata unavailable")
         coords = _episode_coords(media, media_id)
-        queries = _query_strings(media, titles, year, coords)
-        batches = await asyncio.gather(
-            *(_prowlarr_query(q, indexer_ids) for q in queries),
-            return_exceptions=True)
-        if all(isinstance(x, BaseException) for x in batches):
-            raise next(x for x in batches if isinstance(x, BaseException))
-        rows = [row for batch in batches if isinstance(batch, list)
-                for row in batch]
-        candidates: list[dict] = []
-        for row in rows:
-            try:
-                indexer_id = int(row.get("indexerId"))
-            except (TypeError, ValueError):
-                continue
-            if indexer_id not in indexer_ids:
-                continue
-            if str(row.get("protocol") or "").lower() != "torrent":
-                continue
-            title = str(row.get("title") or "").strip()
-            download_url = str(row.get("downloadUrl") or "").strip()
-            if not title or not download_url:
-                continue
-            seeders = _nonnegative_int(row.get("seeders"))
-            if seeders < MIN_SEEDERS:
-                continue
-            if not any(usenet._release_title_match(title, wanted)
-                       for wanted in titles if wanted):
-                continue
-            if not usenet._release_year_match(title, titles, year):
-                continue
-            kind = "movie"
-            if coords:
-                kind = classify_release(title, *coords)
-                if not kind or kind not in RELEASE_RANK:
+        accepted_years = await usenet._accepted_years(media, media_id, year)
+        rationed = {i for i in indexer_ids
+                    if _indexer_traits.get(i, _NO_TRAITS).rationed}
+        open_ids = indexer_ids - rationed
+        tiers = (_query_tiers(media, titles, year, coords) if open_ids else [])
+        rationed_tiers = []
+        if rationed:
+            animation = await meta.is_animation(media, media_id.split(":")[0])
+            rationed_tiers = _rationed_tiers(
+                media, media_id, titles, coords, rationed, animation)
+
+        def eligible(rows: list[dict]) -> list[dict]:
+            candidates: list[dict] = []
+            for row in rows:
+                try:
+                    indexer_id = int(row.get("indexerId"))
+                except (TypeError, ValueError):
                     continue
-            size = _nonnegative_int(row.get("size"))
-            if MAX_TORRENT_GB and (not size
-                                   or size > MAX_TORRENT_GB * 1_000_000_000):
+                if indexer_id not in indexer_ids:
+                    continue
+                if str(row.get("protocol") or "").lower() != "torrent":
+                    continue
+                title = str(row.get("title") or "").strip()
+                download_url = str(row.get("downloadUrl") or "").strip()
+                if not title or not download_url:
+                    continue
+                seeders = _nonnegative_int(row.get("seeders"))
+                if seeders < MIN_SEEDERS:
+                    continue
+                if not any(usenet._release_title_match(title, wanted)
+                           for wanted in titles if wanted):
+                    continue
+                if not usenet._release_year_match(title, titles, accepted_years):
+                    continue
+                kind = "movie"
+                if coords:
+                    kind = classify_release(title, *coords)
+                    if not kind or kind not in RELEASE_RANK:
+                        continue
+                size = _nonnegative_int(row.get("size"))
+                if MAX_TORRENT_GB and (not size
+                                       or size > MAX_TORRENT_GB * 1_000_000_000):
+                    continue
+                candidates.append({
+                    "media": media, "media_id": media_id, "title": title,
+                    "kind": kind, "size": size, "seeders": seeders,
+                    # Search payloads normally include ``indexer``; use the
+                    # catalog's ID-to-name map when they do not so every
+                    # result can still identify the exact private tracker it
+                    # came from.
+                    "indexer": _indexer_name(
+                        row.get("indexer"), indexers[indexer_id]),
+                    "indexer_id": indexer_id, "download_url": download_url,
+                    "guid": str(row.get("guid") or "")[:500],
+                    "season": coords[0] if coords else None,
+                    "episode": coords[1] if coords else None,
+                })
+            return candidates
+
+        candidates: list[dict] = []
+        for level in range(max(len(tiers), len(rationed_tiers))):
+            jobs = [_prowlarr_query(q, open_ids)
+                    for q in (tiers[level] if level < len(tiers) else [])]
+            if level < len(rationed_tiers):
+                jobs.append(_rationed_rows(rationed_tiers[level]))
+            if not jobs:
                 continue
-            candidates.append({
-                "media": media, "media_id": media_id, "title": title,
-                "kind": kind, "size": size, "seeders": seeders,
-                # Search payloads normally include ``indexer``; use the
-                # catalog's ID-to-name map when they do not so every result can
-                # still identify the exact private tracker it came from.
-                "indexer": _indexer_name(
-                    row.get("indexer"), indexers[indexer_id]),
-                "indexer_id": indexer_id, "download_url": download_url,
-                "guid": str(row.get("guid") or "")[:500],
-                "season": coords[0] if coords else None,
-                "episode": coords[1] if coords else None,
-            })
+            if level:
+                logger.info("private trackers: nothing eligible for %s; "
+                            "widening to tier %d (%d search(es))",
+                            media_id, level + 1, len(jobs))
+            batches = await asyncio.gather(*jobs, return_exceptions=True)
+            # A tier that failed outright means the search did not run, not
+            # that nothing exists: surface it (uncached) rather than widening
+            # into the same failure or reporting a false "empty".
+            if all(isinstance(x, BaseException) for x in batches):
+                raise next(x for x in batches if isinstance(x, BaseException))
+            candidates = eligible([row for batch in batches
+                                   if isinstance(batch, list) for row in batch])
+            if candidates:
+                break
         dedup: dict[str, dict] = {}
         for cand in candidates:
             identity = cand["guid"] or hashlib.sha256(
@@ -1491,7 +1751,29 @@ async def _prepare_existing(payload: dict) -> tuple[dict, list[dict], dict]:
     return info, files, pick
 
 
+# qBittorrent's "Append .!qB extension to incomplete files" (on in this
+# household's client) keeps a file named `X.mkv.!qB` until *that file*
+# completes, then renames it. Looking only for `X.mkv` made every private play
+# wait for the whole download: sequential download was working the entire
+# time, but the bytes sat under a name nothing read. Measured: Phineas and
+# Ferb Star Wars played 1 s after its 1.2 GB completed, 61 s after the click.
+INCOMPLETE_SUFFIX = ".!qB"
+
+
+def _live_path(path: Path) -> Path | None:
+    """The file as it exists right now: its final name once complete, else
+    qBittorrent's incomplete-suffixed name while it downloads."""
+    if path.is_file():
+        return path
+    partial = path.with_name(path.name + INCOMPLETE_SUFFIX)
+    if partial.is_file():
+        return partial
+    return None
+
+
 def _safe_local_path(torrent_name: str, file_name: str) -> Path:
+    """Final-name path of a torrent file under DOWNLOAD_ROOT (it may still be
+    downloading under INCOMPLETE_SUFFIX — resolve with _live_path)."""
     root = DOWNLOAD_ROOT.resolve()
     options = [root / file_name, root / torrent_name / file_name]
     safe: list[Path] = []
@@ -1500,7 +1782,7 @@ def _safe_local_path(torrent_name: str, file_name: str) -> Path:
         if resolved == root or root not in resolved.parents:
             continue
         safe.append(resolved)
-        if resolved.exists():
+        if _live_path(resolved) is not None:
             return resolved
     if not safe:
         raise RuntimeError("unsafe torrent path")
@@ -1569,13 +1851,19 @@ async def _body(path: Path, info_hash: str, file_offset: int,
             await _wait_available(
                 info_hash, file_offset + pos, file_offset + final, piece_size,
                 time.monotonic() + START_TIMEOUT)
-        while not path.exists():
-            await asyncio.sleep(0.25)
 
-        def read() -> bytes:
-            with path.open("rb") as handle:
-                handle.seek(pos)
-                return handle.read(final - pos + 1)
+        def read() -> bytes | None:
+            # Resolved per chunk: the file is renamed from its .!qB name the
+            # moment it completes, usually while a player is mid-stream.
+            live = _live_path(path)
+            if live is None:
+                return None
+            try:
+                with live.open("rb") as handle:
+                    handle.seek(pos)
+                    return handle.read(final - pos + 1)
+            except FileNotFoundError:     # renamed between resolve and open
+                return None
 
         chunk = await asyncio.to_thread(read)
         if not chunk:
@@ -1587,10 +1875,103 @@ async def _body(path: Path, info_hash: str, file_offset: int,
 
 async def _wait_path(path: Path, deadline: float) -> None:
     while time.monotonic() < deadline:
-        if path.is_file():
+        if _live_path(path) is not None:
             return
         await asyncio.sleep(0.25)
     raise TimeoutError("torrent file is not visible on the read-only mount")
+
+
+async def _contiguous_bytes(info_hash: str, file_offset: int, size: int,
+                            piece_size: int) -> int:
+    """Bytes of the file present from its first byte with no gap — what a
+    player starting at 0 can read before it would have to wait."""
+    response = await _qapi(
+        "GET", "/torrents/pieceStates", params={"hash": info_hash})
+    states = response.json() or []
+    first = file_offset // piece_size
+    last = (file_offset + size - 1) // piece_size
+    done = first
+    while done <= last and done < len(states) and int(states[done]) == 2:
+        done += 1
+    have = done * piece_size - file_offset
+    return max(0, min(size, have))
+
+
+async def _title_runtime(payload: dict) -> float:
+    try:
+        from app import picker
+        return float(await picker._runtime_seconds(
+            payload["media"], payload.get("media_id") or ""))
+    except Exception:
+        return 0.0
+
+
+def _headroom_bytes(size: int, runtime: float, rate: float) -> int:
+    """Head start a sequential download needs so playback never catches it.
+
+    A player at the file's bitrate B, starting at 0, needs B·t bytes by time t;
+    the download offers have + R·t. That holds for the whole file iff
+    have ≥ size·(1 − R/B) when R < B (the worst point is the last byte), and
+    trivially when R ≥ B. R is discounted by HEADROOM_MARGIN because a swarm's
+    rate wobbles, and a floor of START_MIN_SECS of video covers the ramp."""
+    if size <= 0 or runtime <= 0:
+        return 0
+    bitrate = size / runtime
+    floor = int(min(size, bitrate * START_MIN_SECS))
+    effective = rate / HEADROOM_MARGIN
+    if effective >= bitrate:
+        return floor
+    return max(floor, int(size * (1 - effective / bitrate)))
+
+
+class StillBuffering(TimeoutError):
+    """The opening request was held as long as one request may be; the
+    player's retry continues the hold (see _hold_for_headroom)."""
+
+
+async def _hold_for_headroom(payload: dict, info_hash: str, file_offset: int,
+                             size: int, piece_size: int) -> None:
+    """Hold a not-yet-complete file's opening request until the download can
+    stay ahead of playback, so it starts once and never stalls — the viewer's
+    rule: "take a little while to start, but no buffering after it does".
+
+    One request is held at most START_HOLD_SECS (under the player's read
+    timeout), then answered 503 so the player retries; the hold is timed on
+    the capability, so retries continue it rather than restart it. After
+    START_HOLD_TOTAL_SECS playback starts regardless: a player that gives up
+    is worse than an early start on a slow swarm."""
+    now = time.time()
+    since = float(payload.get("_hold_since") or 0)
+    if not since or now - since > START_HOLD_TOTAL_SECS + 300:
+        since = payload["_hold_since"] = now        # a fresh play, not a retry
+    runtime = await _title_runtime(payload)
+    deadline = time.monotonic() + START_HOLD_SECS
+    logged = bool(payload.get("_hold_logged"))
+    while True:
+        info = await _torrent_info(info_hash) or {}
+        rate = float(info.get("dlspeed") or 0)
+        have = await _contiguous_bytes(info_hash, file_offset, size, piece_size)
+        need = _headroom_bytes(size, runtime, rate)
+        if have >= size or have >= need:
+            payload.pop("_hold_since", None)
+            payload.pop("_hold_logged", None)
+            return
+        if not logged:
+            telemetry.record_private_tracker(
+                "start_hold", media_id=payload.get("media_id", ""),
+                bytes_total=need,
+                detail=f"have {have} need {need} at {rate / 1e6:.1f} MB/s")
+            payload["_hold_logged"] = logged = True
+        if time.time() - since >= START_HOLD_TOTAL_SECS:
+            logger.info("private trackers: starting %s with %d of %d head-start "
+                        "bytes after %.0fs", info_hash[:8], have, need,
+                        time.time() - since)
+            payload.pop("_hold_since", None)
+            payload.pop("_hold_logged", None)
+            return
+        if time.monotonic() >= deadline:
+            raise StillBuffering(f"{have} of {need} head-start bytes")
+        await asyncio.sleep(1.0)
 
 
 async def _prepare_rqbit(payload: dict) -> None:
@@ -1709,6 +2090,11 @@ async def serve(token: str, request: Request):
                 payload["hash"], file_offset + start,
                 file_offset + min(end, start + 1024 * 1024 - 1), piece_size,
                 time.monotonic() + START_TIMEOUT)
+            if start == 0:
+                # The opening request decides when playback begins; index
+                # reads and seeks must not be held behind it.
+                await _hold_for_headroom(payload, payload["hash"], file_offset,
+                                         size, piece_size)
         await _wait_path(path, time.monotonic() + START_TIMEOUT)
         headers = {
             "Accept-Ranges": "bytes", "Cache-Control": "no-store",
@@ -1730,6 +2116,11 @@ async def serve(token: str, request: Request):
             status_code=status, headers=headers, media_type=media_type)
     except HTTPException:
         raise
+    except StillBuffering as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Building a head start so playback won't stall; retry shortly",
+            headers={"Retry-After": "2"}) from exc
     except TimeoutError as exc:
         telemetry.record_private_tracker(
             "start_wait", media_id=payload.get("media_id", ""),

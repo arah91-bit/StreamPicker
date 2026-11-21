@@ -151,9 +151,13 @@ def build_stremthru(existing_url: str, debrids: list[tuple[str, str]]) -> str:
         cfg = {"indexers": None, "cached": True}
     cfg["stores"] = [{"c": BY_ID[s]["code"], "t": k}
                      for s, k in debrids if s in BY_ID]
-    b64 = (base64.urlsafe_b64encode(
-        json.dumps(cfg, separators=(",", ":")).encode())
-        .decode().rstrip("="))
+    # Padding kept. StremThru decodes this with Go's padded URL alphabet, so
+    # an unpadded segment fails ("illegal base64 data at input byte N") the
+    # moment the JSON's length is not a multiple of 3 — which a different key
+    # or a second store is enough to cause. Measured on 0.105.3: padded →
+    # decoded, unpadded → HTTP 500.
+    b64 = base64.urlsafe_b64encode(
+        json.dumps(cfg, separators=(",", ":")).encode()).decode()
     return f"{base.rstrip('/')}/stremio/torz/{b64}"
 
 

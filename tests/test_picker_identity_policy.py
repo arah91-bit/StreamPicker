@@ -179,10 +179,23 @@ class PickerIdentityPolicyTests(unittest.TestCase):
                         if s.get("url") == ambiguous["url"])
 
         self.assertEqual(content_identity.COMPATIBLE, assessment.state)
-        self.assertEqual("checking",
-                         assembled[0].get(picker._NOTICE_STATE_KEY))
         self.assertFalse(picker._is_ranked(returned))
         self.assertFalse(content_identity.auto_eligible(returned))
+        self._assert_held_until_settled(assembled, returned)
+
+    def _assert_held_until_settled(self, assembled, returned) -> None:
+        """A playable-but-ambiguous stream is never put in front of an
+        auto-playing player while anything confirmed could still turn up;
+        once everything has settled it is the last thing available."""
+        self.assertTrue(returned.get(picker._TRANSPORT_OK_KEY))
+        self.assertIsNone(assembled[0].get(picker._NOTICE_STATE_KEY),
+                          "no placeholder may lead: Nuvio would play it")
+        with mock.patch.object(picker, "_work_pending", return_value=True):
+            self.assertEqual([], picker._display_gate(
+                "k", "movie", "tt0113568", assembled))
+        with mock.patch.object(picker, "_work_pending", return_value=False):
+            shown = picker._display_gate("k", "movie", "tt0113568", assembled)
+        self.assertEqual(returned["url"], shown[0]["url"])
 
     def test_probe_runtime_promotes_exact_title_but_not_wrong_title(self) -> None:
         exact_title = _stream(
@@ -271,10 +284,9 @@ class PickerIdentityPolicyTests(unittest.TestCase):
         returned = next(s for s in assembled if s.get("url") == forged["url"])
 
         self.assertEqual(content_identity.COMPATIBLE, assessment.state)
-        self.assertEqual("checking",
-                         assembled[0].get(picker._NOTICE_STATE_KEY))
         self.assertFalse(picker._is_ranked(returned))
         self.assertFalse(content_identity.auto_eligible(returned))
+        self._assert_held_until_settled(assembled, returned)
 
 
 if __name__ == "__main__":

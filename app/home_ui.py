@@ -14,8 +14,8 @@ import os
 import time
 from urllib.parse import quote
 
-from app import (adminui, config, overview, proxy, settings_ui, source_health,
-                 telemetry, uitheme, usenet_health)
+from app import (adminui, config, loopwatch, overview, proxy, settings_ui,
+                 source_health, telemetry, uitheme, usenet_health)
 
 ADDON_NAME = os.environ.get("ADDON_NAME", "Auto Stream")
 
@@ -73,6 +73,8 @@ details.ngroup[open]>summary .chev{transform:rotate(90deg)}
 # Probes are cheap and plentiful, so a source has to fail a real run of them
 # before we call it dead rather than unlucky.
 _DEAD_SOURCE_PROBES = 8
+# Searches that must all have failed before a lane counts as down.
+_DEAD_SOURCE_SEARCHES = 5
 # ...and it has to have failed them *lately*. Telemetry is retained for weeks,
 # so without this a source that was removed or repaired days ago keeps raising
 # the alarm until its records age out — the same permanent warning this hero
@@ -109,6 +111,18 @@ def _broken_services(recs: list[dict]) -> list[str]:
     names += [r["key"] for r in
               telemetry.aggregate(probes, "src", min_n=_DEAD_SOURCE_PROBES)
               if r["fail_pct"] >= 100.0 and r["key"] != "(none)"]
+    # A lane whose every *search* fails returns nothing to probe, so the probe
+    # bar above can never see it — StremThru 500'd every request for three
+    # days that way. Searches are their own evidence.
+    searches: dict[str, list[int]] = {}
+    for r in recs:
+        if r.get("kind") == "source_search" and (r.get("ts") or 0) >= cutoff:
+            tally = searches.setdefault(r.get("label") or r.get("source") or "",
+                                        [0, 0])
+            tally[0] += 1
+            tally[1] += r.get("state") == "failed"
+    names += [lane for lane, (n, failed) in searches.items()
+              if lane and n >= _DEAD_SOURCE_SEARCHES and failed == n]
     return sorted({n for n in names if not source_health.state(n)})
 
 
@@ -156,6 +170,19 @@ def _hero(recs: list[dict], blocks: list[dict], names: dict[str, str]) -> str:
             "Torrent and debrid sources are unaffected.",
             f"<a class='btn ghost' href='/health/sources'>"
             f"{uitheme.icon('activity')}See the failures</a>")
+    elif (lag := loopwatch.worst_recent()) and lag["lag"] >= loopwatch.SERIOUS:
+        # One event loop serves every stream; a stall this long froze all of
+        # them at once — a spinner on every screen, blamed on no source.
+        when = time.strftime("%H:%M", time.localtime(lag["ts"]))
+        hint = (f" It began during <code>{_esc(lag['suspects'][-1])}</code>."
+                if lag["suspects"] else "")
+        state, dot, sub, act = (
+            "The server stalled", "warn",
+            f"At {when} the proxy stopped serving for "
+            f"<b>{lag['lag']:.1f} s</b> — every stream paused at once, "
+            f"whatever its source.{hint} Stalls are logged as "
+            "<code>event loop stalled</code>.",
+            "")
     elif playing:
         first = playing[0]
         title = names.get(first.get("media_id", ""),

@@ -313,7 +313,7 @@ async def _jellyfin(overrides: dict) -> dict:
         user_id = str((payload.get("User") or {}).get("Id") or "")
         if not token or not user_id:
             return _fail(t0, "login returned no user session")
-        headers = {"X-Emby-Token": token}
+        headers = {"Authorization": f'{auth}, Token="{token}"'}
         listing = await _client.get(
             f"{base}/Users/{user_id}/Items", headers=headers,
             params={"Recursive": "true", "IncludeItemTypes": "Movie,Episode",

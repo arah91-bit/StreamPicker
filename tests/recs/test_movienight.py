@@ -5,6 +5,7 @@ taste model — "not tonight, with these people" is not "not for me" — and tha
 guest leaves nothing behind.
 """
 
+import asyncio
 import contextlib
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -155,7 +156,7 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
     async def test_every_seat_gets_its_own_unguessable_key(self):
         created = {}
 
-        async def capture(session_id, seats, playlist, ttl):
+        async def capture(session_id, seats, playlist, ttl, kid_age=None):
             created["seats"] = seats
 
         with (patch.object(movienight, "build_playlist",
@@ -171,7 +172,7 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_guest_seat_carries_no_identity(self):
         created = {}
 
-        async def capture(session_id, seats, playlist, ttl):
+        async def capture(session_id, seats, playlist, ttl, kid_age=None):
             created["seats"] = seats
 
         with (patch.object(movienight, "build_playlist",
@@ -218,6 +219,39 @@ class DynamicRankingTests(unittest.IsolatedAsyncioTestCase):
                          AsyncMock(return_value=prints or {})),
         )
 
+    async def test_one_no_is_seen_it_not_a_verdict_on_the_genre(self):
+        """The commonest reason for a thumbs down here is having already seen
+        the film — often one that person loved. Treating that as "no more of
+        this sort of thing" steers the room away from exactly what they like
+        best.
+
+        `_centroid` normalises, so before this a single no pushed against a
+        whole cluster precisely as hard as five did.
+        """
+        one = {0: {"tt-war0": 0}}
+        several = {0: {"tt-war0": 0, "tt-war1": 0, "tt-war2": 0}}
+        scores = {}
+        for label, votes in (("one", one), ("several", several)):
+            with contextlib.ExitStack() as stack:
+                for p in self.patches(votes):
+                    stack.enter_context(p)
+                ranked = await movienight.rank("s", self.playlist, 2)
+            scores[label] = [m["id"] for m in ranked]
+        # After one rejection the remaining war films are still in contention;
+        # after three that agree with each other, they are not.
+        self.assertTrue(scores["one"][0].startswith("tt-war"), scores["one"][:3])
+        self.assertTrue(scores["several"][0].startswith("tt-fun"),
+                        scores["several"][:3])
+
+    async def test_a_no_still_removes_that_film_completely(self):
+        """"Not right now" is still not tonight. Softening what a no says about
+        *other* films must not soften what it says about this one."""
+        with contextlib.ExitStack() as stack:
+            for p in self.patches({0: {"tt-war0": 0}}):
+                stack.enter_context(p)
+            ranked = await movienight.rank("s", self.playlist, 2)
+        self.assertNotIn("tt-war0", [m["id"] for m in ranked])
+
     async def test_a_film_anybody_refused_leaves_the_queue(self):
         """Winning takes a unanimous yes, so one no makes a film
         arithmetically dead. Leaving it in spends everyone else's attention on
@@ -245,7 +279,12 @@ class DynamicRankingTests(unittest.IsolatedAsyncioTestCase):
     async def test_one_persons_enthusiasm_cannot_carry_a_film(self):
         """Seat 0 loves war films, seat 1 has said no to one. The room is
         limited by whoever is hardest to please, so comedy should lead
-        regardless of how keen seat 0 is."""
+        regardless of how keen seat 0 is.
+
+        This is also the test that caught the near-agreement experiment: under
+        that ordering seat 0's yes on a war film pulled it to the front for
+        seat 1, who had just refused three of them.
+        """
         votes = {0: {"tt-war0": 1, "tt-war1": 1, "tt-war3": 1},
                  1: {"tt-war2": 0, "tt-war4": 0, "tt-war0": 0}}
         with contextlib.ExitStack() as stack:
@@ -410,6 +449,177 @@ class AgreementTests(unittest.IsolatedAsyncioTestCase):
                            AsyncMock(return_value=[]))):
             out = await movienight.state(self.seat_row(playlist=playlist))
         self.assertEqual("tt2", out["winner"]["id"])
+
+
+class AdaptivePoolTests(unittest.IsolatedAsyncioTestCase):
+    """The pool is a moving window, not a list decided before anybody spoke.
+
+    A fixed 150 films chosen up front could not contain the answer for every
+    room, and no amount of re-ranking finds a film that was never in it. Worse,
+    they were chosen from the standing taste of the *known* seats, so a table
+    of guests had its evening picked from nothing at all.
+    """
+
+    def film(self, n, tmdb=None):
+        return {"id": f"tt{n}", "tmdb": tmdb if tmdb is not None else n,
+                "media": "movie", "title": f"Film {n}"}
+
+    def meta(self, tid):
+        return {"id": f"tt{tid}", "name": f"Film {tid}", "poster": "p",
+                "genres": ["Drama"], "releaseInfo": "2011", "imdbRating": "7.5"}
+
+    def patches(self, votes, recs, added=None):
+        return (
+            patch.object(movienight.db, "match_votes_for",
+                         AsyncMock(return_value=votes)),
+            patch.object(movienight.tmdb, "tmdb_recommendations",
+                         AsyncMock(return_value=recs)),
+            patch.object(movienight.tmdb, "resolve_meta",
+                         AsyncMock(side_effect=lambda m, tid, **kw:
+                                   self.meta(tid))),
+            patch.object(movienight.db, "extend_match_playlist",
+                         added or AsyncMock(return_value=0)),
+        )
+
+    async def test_more_are_found_from_what_the_room_agreed_on(self):
+        added = AsyncMock(return_value=2)
+        playlist = [self.film(1), self.film(2)]
+        with contextlib.ExitStack() as stack:
+            for p in self.patches({0: {"tt1": 1}, 1: {"tt1": 1}},
+                                  [{"id": 90}, {"id": 91}], added):
+                stack.enter_context(p)
+            n = await movienight.topup("s", playlist, None, limit=2)
+        self.assertEqual(2, n)
+        self.assertEqual(["tt90", "tt91"],
+                         [f["id"] for f in added.await_args.args[1]])
+
+    async def test_the_seed_is_what_the_room_agrees_on_not_one_persons_pick(self):
+        """Two seats on one film outranks one seat on another. That difference
+        is the only thing making this the *group's* signal."""
+        seen = []
+
+        async def recommend(media, tmdb_id):
+            seen.append(tmdb_id)
+            return []
+
+        with (patch.object(movienight.db, "match_votes_for",
+                           AsyncMock(return_value={0: {"tt1": 1, "tt2": 1},
+                                                   1: {"tt2": 1}})),
+              patch.object(movienight.tmdb, "tmdb_recommendations", recommend)):
+            await movienight.topup("s", [self.film(1), self.film(2)], None)
+        self.assertEqual(2, seen[0])          # tt2 has two yeses
+
+    async def test_a_film_anybody_refused_never_seeds_a_search(self):
+        """It is dead as a candidate, and a poor description of common
+        ground."""
+        seen = []
+
+        async def recommend(media, tmdb_id):
+            seen.append(tmdb_id)
+            return []
+
+        with (patch.object(movienight.db, "match_votes_for",
+                           AsyncMock(return_value={0: {"tt1": 1}, 1: {"tt1": 0}})),
+              patch.object(movienight.tmdb, "tmdb_recommendations", recommend)):
+            await movienight.topup("s", [self.film(1)], None)
+        self.assertEqual([], seen)
+
+    async def test_nothing_is_fetched_before_the_room_has_agreed_on_anything(self):
+        """With no yeses there is nothing to search outward from, and the
+        opening batch is still the best guess available."""
+        with (patch.object(movienight.db, "match_votes_for",
+                           AsyncMock(return_value={0: {"tt1": 0}})),
+              patch.object(movienight.tmdb, "tmdb_recommendations",
+                           AsyncMock(side_effect=AssertionError("asked TMDB")))):
+            self.assertEqual(0, await movienight.topup("s", [self.film(1)], None))
+
+    async def test_a_childrens_session_keeps_its_age_ceiling(self):
+        """The pool is no longer chosen once, so the age it was chosen under
+        has to survive with it. Without that a top-up would post adult titles
+        into a kids' night."""
+        seen = {}
+
+        async def resolve(media, tid, **kw):
+            seen.update(kw)
+            return self.meta(tid)
+
+        with (patch.object(movienight.db, "match_votes_for",
+                           AsyncMock(return_value={0: {"tt1": 1}})),
+              patch.object(movienight.tmdb, "tmdb_recommendations",
+                           AsyncMock(return_value=[{"id": 90}])),
+              patch.object(movienight.tmdb, "resolve_meta", resolve),
+              patch.object(movienight.db, "extend_match_playlist",
+                           AsyncMock(return_value=1))):
+            await movienight.topup("s", [self.film(1)], kid_age=8)
+        self.assertEqual(8, seen.get("max_age"))
+
+    async def test_a_film_already_in_the_pool_is_not_added_twice(self):
+        added = AsyncMock(return_value=0)
+        playlist = [self.film(1), self.film(90, tmdb=90)]
+        with contextlib.ExitStack() as stack:
+            for p in self.patches({0: {"tt1": 1}}, [{"id": 90}, {"id": 91}],
+                                  added):
+                stack.enter_context(p)
+            await movienight.topup("s", playlist, None, limit=5)
+        self.assertEqual(["tt91"], [f["id"] for f in added.await_args.args[1]])
+
+    async def test_a_refused_film_is_never_offered_back(self):
+        added = AsyncMock(return_value=0)
+        with contextlib.ExitStack() as stack:
+            for p in self.patches({0: {"tt1": 1}, 1: {"tt90": 0}},
+                                  [{"id": 90}, {"id": 91}], added):
+                stack.enter_context(p)
+            await movienight.topup("s", [self.film(1)], None, limit=5)
+        self.assertEqual(["tt91"], [f["id"] for f in added.await_args.args[1]])
+
+    async def test_the_pool_stops_growing_eventually(self):
+        """A long evening must not grow the row without bound."""
+        big = [self.film(n) for n in range(movienight.MAX_POOL)]
+        with patch.object(movienight.tmdb, "tmdb_recommendations",
+                          AsyncMock(side_effect=AssertionError("asked TMDB"))):
+            self.assertEqual(0, await movienight.topup("s", big, None))
+
+    async def test_a_broken_top_up_costs_options_not_the_evening(self):
+        with (patch.object(movienight.db, "match_votes_for",
+                           AsyncMock(side_effect=RuntimeError("db gone")))):
+            self.assertEqual(0, await movienight.topup("s", [self.film(1)], None))
+
+    async def test_only_one_top_up_runs_per_session(self):
+        """Every seat polls, so without this a room of five fetches the same
+        batch five times over."""
+        movienight._topping_up.clear()
+        movienight._topped_up_at.clear()
+        started = []
+
+        async def slow(session_id, playlist, kid_age, limit=10):
+            started.append(session_id)
+            await asyncio.sleep(0.05)
+            return 0
+
+        with patch.object(movienight, "topup", slow):
+            for _ in range(5):
+                movienight._schedule_topup("s", [], None)
+            await asyncio.sleep(0.12)
+        self.assertEqual(1, len(started))
+
+    async def test_a_room_at_the_end_of_its_batch_does_not_spin(self):
+        """Sitting at the end of a batch is exactly the state that asks for a
+        top-up, and every seat re-asks every few seconds. Without a cooldown a
+        room with nothing agreed yet — where a top-up returns immediately —
+        would pull TMDB for as long as the tab stayed open."""
+        movienight._topping_up.clear()
+        movienight._topped_up_at.clear()
+        started = []
+
+        async def quick(session_id, playlist, kid_age, limit=10):
+            started.append(session_id)
+            return 0
+
+        with patch.object(movienight, "topup", quick):
+            for _ in range(6):
+                movienight._schedule_topup("s", [], None)
+                await asyncio.sleep(0.01)
+        self.assertEqual(1, len(started))
 
 
 if __name__ == "__main__":

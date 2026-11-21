@@ -104,12 +104,39 @@ class ThinResultPolicyTests(unittest.TestCase):
 
 class ReleasePolicyTests(unittest.TestCase):
     def test_foreign_series_searches_canonical_and_native_titles(self):
-        queries = private_trackers._query_strings(
+        first, later = private_trackers._query_tiers(
             "series", ["Kang's Family", "外来媳妇本地郎"], 2000, (1, 1))
-        self.assertIn("Kang's Family S01E01", queries)
+        queries = first + later
+        # Folded first (release names drop the apostrophe), as written after.
+        self.assertIn("Kangs Family S01E01", first)
+        self.assertIn("Kang's Family S01E01", later)
         self.assertIn("外来媳妇本地郎 S01E01", queries)
         self.assertIn("外来媳妇本地郎 S01", queries)
         self.assertIn("外来媳妇本地郎", queries)
+
+    def test_regional_aliases_query_only_the_episode_and_season(self):
+        queries, _later = private_trackers._query_tiers(
+            "series", ["Love Stories in the Countryside", "乡村爱情",
+                       "Rural Love Story"], 2006, (1, 1))
+        self.assertIn("乡村爱情", queries)
+        self.assertIn("Rural Love Story S01E01", queries)
+        self.assertIn("Rural Love Story S01", queries)
+        self.assertNotIn("Rural Love Story", queries)
+        self.assertNotIn("Rural Love Story complete series", queries)
+        self.assertEqual(10, len(queries))
+
+    def test_later_season_episode_is_not_a_season_one_pack(self):
+        # The season parser once backtracked "S18E13" to season 1, filing a
+        # long-running show's recent episodes as packs for its first season.
+        for title in ("Love Stories in the Countryside S18E13 1080p WEB-DL",
+                      "Country Love 2026 S18E12-E13 2160p WEB-DL",
+                      "Show.S12E03.1080p.WEB-DL"):
+            self.assertEqual(
+                "", private_trackers.classify_release(title, 1, 1), title)
+        self.assertEqual("season", private_trackers.classify_release(
+            "Rural Love Story 2006 S01 1080p WEB-DL", 1, 1))
+        self.assertEqual("episode", private_trackers.classify_release(
+            "Show.S12E03.1080p.WEB-DL", 12, 3))
 
     def test_malformed_upstream_counts_become_unknown(self):
         self.assertEqual(0, private_trackers._nonnegative_int(".2.91 GB"))
@@ -229,6 +256,328 @@ def _cand(title, **over):
            "season": 1, "episode": 4}
     row.update(over)
     return row
+
+
+class RationedNetworkTests(unittest.IsolatedAsyncioTestCase):
+    """The AvistaZ network shares one API quota; see _RATIONED_IMPLEMENTATIONS."""
+
+    # AvistaZ 5, CinemaZ 16, PrivateHD 35 take IMDb ids; AnimeZ 28 does not
+    # and carries anime only; M-Team 45 is an ordinary tracker.
+    T = private_trackers._IndexerTraits
+    TRAITS = {5: T(True, True, True), 16: T(True, True, True),
+              35: T(True, True, True), 28: T(True, anime_only=True),
+              45: T()}
+
+    def setUp(self):
+        private_trackers._query_cache.clear()
+        private_trackers._rationed_next = 0.0
+        self._traits = mock.patch.dict(private_trackers._indexer_traits,
+                                       self.TRAITS, clear=True)
+        self._traits.start()
+        # A contended asyncio.Lock binds to its event loop; each test runs in
+        # its own loop, so each gets its own lock.
+        self._lock = mock.patch.object(private_trackers, "_rationed_lock",
+                                       asyncio.Lock())
+        self._lock.start()
+
+    def tearDown(self):
+        self._lock.stop()
+        self._traits.stop()
+        private_trackers._query_cache.clear()
+        private_trackers._rationed_next = 0.0
+
+    def test_rationed_requests_are_one_id_search_and_two_titles(self):
+        requests, _later = private_trackers._rationed_tiers(
+            "series", "tt1395015:17:1",
+            ["Love Stories in the Countryside", "乡村爱情", "Country Love",
+             "Rural Love Story"], (17, 1), {5, 16, 35, 28})
+        self.assertEqual([
+            ("tvsearch", "{ImdbId:tt1395015}{Season:17}", {5, 16, 35}),
+            ("search", "Love Stories in the Countryside", {5, 16, 35, 28}),
+            ("search", "Country Love", {5, 16, 35, 28}),
+        ], requests)
+        movie = private_trackers._rationed_tiers(
+            "movie", "tt6751668", ["Parasite"], None, {5, 28})[0]
+        self.assertEqual([("movie", "{ImdbId:tt6751668}", {5}),
+                          ("search", "Parasite", {5, 28})], movie)
+        # Live action: the anime-only site gets nothing.
+        live = private_trackers._rationed_tiers(
+            "movie", "tt6751668", ["Parasite"], None, {5, 28}, False)[0]
+        self.assertEqual([("movie", "{ImdbId:tt6751668}", {5}),
+                          ("search", "Parasite", {5})], live)
+
+    async def test_search_sends_the_network_only_its_short_list(self):
+        calls = []
+        pack = {"indexerId": 5, "indexer": "AvistaZ", "protocol": "torrent",
+                "title": "The First Frost S01 (2025) 1080p NF WEB-DL AAC2.0 "
+                         "H.265-teamACH",
+                "seeders": 22, "size": 30_000_000_000, "guid": "az-1",
+                "downloadUrl": "http://prowlarr/dl/az-1"}
+
+        async def query(q, ids, kind="search"):
+            calls.append((kind, q, frozenset(ids)))
+            return [pack] if 5 in ids else []
+
+        with mock.patch.object(
+                private_trackers, "_private_torrent_indexers",
+                new=mock.AsyncMock(return_value={
+                    5: "AvistaZ", 16: "CinemaZ", 35: "PrivateHD",
+                    28: "AnimeZ", 45: "M-Team - TP"})), \
+                mock.patch.object(private_trackers, "_prowlarr_query",
+                                  new=query), \
+                mock.patch.object(private_trackers.usenet, "_expected_info",
+                                  new=mock.AsyncMock(return_value=(
+                                      ["The First Frost", "难哄"], 2025))), \
+                mock.patch.object(private_trackers, "MIN_SEEDERS", 1), \
+                mock.patch.object(private_trackers, "RATIONED_SPACING", 0), \
+                mock.patch.object(private_trackers.meta, "is_animation",
+                                  new=mock.AsyncMock(return_value=False)), \
+                mock.patch.object(private_trackers.telemetry,
+                                  "record_private_tracker"):
+            found = await private_trackers._search("series", "tt31887832:1:1")
+        self.assertFalse(any(28 in ids for _, _, ids in calls))
+        rationed = [c for c in calls if c[2] & {5, 16, 35, 28}]
+        self.assertEqual([("tvsearch", "{ImdbId:tt31887832}{Season:1}"),
+                          ("search", "The First Frost")],
+                         [(k, q) for k, q, _ in rationed])
+        self.assertTrue(all(ids <= {5, 16, 35, 28} for _, _, ids in rationed))
+        # The ordinary fan-out still covers every other tracker.
+        self.assertIn(("search", "难哄 S01E01", frozenset({45})), calls)
+        self.assertEqual(["season"], [c["kind"] for c in found])
+
+    async def test_rationed_queries_are_spaced_and_cache_hits_skip_the_queue(self):
+        query = mock.AsyncMock(return_value=[{"title": "x"}])
+        sleep = mock.AsyncMock()
+        with mock.patch.object(private_trackers, "_prowlarr_query", new=query), \
+                mock.patch.object(private_trackers.asyncio, "sleep", new=sleep):
+            await private_trackers._rationed_rows(
+                [("search", "A", {5}), ("search", "B", {5})])
+            self.assertEqual(1, sleep.await_count)
+            self.assertAlmostEqual(private_trackers.RATIONED_SPACING,
+                                   sleep.await_args.args[0], delta=0.5)
+            private_trackers._query_cache[("search", "C", frozenset({5}))] = (
+                private_trackers.time.monotonic() + 60, [{"title": "c"}])
+            rows = await private_trackers._rationed_rows(
+                [("search", "C", {5})])
+        self.assertEqual([{"title": "c"}], rows)
+        self.assertEqual(2, query.await_count)       # C came from the cache
+        self.assertEqual(1, sleep.await_count)
+
+    async def test_rationed_rows_survive_one_failed_query(self):
+        query = mock.AsyncMock(side_effect=[httpx.ReadTimeout("slow"),
+                                            [{"title": "ok"}]])
+        with mock.patch.object(private_trackers, "_prowlarr_query", new=query), \
+                mock.patch.object(private_trackers.asyncio, "sleep",
+                                  new=mock.AsyncMock()):
+            rows = await private_trackers._rationed_rows(
+                [("search", "A", {5}), ("search", "B", {5})])
+        self.assertEqual([{"title": "ok"}], rows)
+
+    async def test_concurrent_lookups_share_one_query_without_waiting_twice(self):
+        # E01 and E02 of one season ask the same season-scoped query at once.
+        calls = 0
+
+        async def get(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            await asyncio.sleep(0.05)
+            return httpx.Response(200, json=[{"title": "pack"}],
+                                  request=httpx.Request("GET", "http://p"))
+
+        request = [("tvsearch", "{ImdbId:tt1}{Season:1}", {5})]
+        with mock.patch.object(private_trackers._client, "get", new=get), \
+                mock.patch.object(private_trackers, "RATIONED_SPACING", 5.0):
+            started = private_trackers.time.monotonic()
+            first, second = await asyncio.gather(
+                private_trackers._rationed_rows(request),
+                private_trackers._rationed_rows(request))
+            elapsed = private_trackers.time.monotonic() - started
+        self.assertEqual(1, calls)
+        self.assertEqual(first, second)
+        self.assertLess(elapsed, 1.0)        # the second never sat out 5 s
+
+    async def test_a_queued_lookup_gives_up_at_its_deadline(self):
+        query = mock.AsyncMock(return_value=[{"title": "x"}])
+        with mock.patch.object(private_trackers, "_prowlarr_query", new=query):
+            await private_trackers._rationed_lock.acquire()
+            try:
+                started = private_trackers.time.monotonic()
+                rows = await private_trackers._rationed_rows(
+                    [("search", "A", {5})], budget=0.2)
+                elapsed = private_trackers.time.monotonic() - started
+            finally:
+                private_trackers._rationed_lock.release()
+        self.assertEqual([], rows)
+        self.assertLess(elapsed, 1.0)
+        query.assert_not_awaited()
+
+    async def test_a_hung_query_returns_what_was_collected(self):
+        async def query(q, ids, kind="search"):
+            if q == "B":
+                await asyncio.Event().wait()     # never answers
+            return [{"title": q}]
+
+        with mock.patch.object(private_trackers, "_prowlarr_query", new=query), \
+                mock.patch.object(private_trackers, "RATIONED_SPACING", 0):
+            started = private_trackers.time.monotonic()
+            rows = await private_trackers._rationed_rows(
+                [("search", "A", {5}), ("search", "B", {5}),
+                 ("search", "C", {5})], budget=0.3)
+            elapsed = private_trackers.time.monotonic() - started
+        self.assertEqual([{"title": "A"}], rows)
+        self.assertLess(elapsed, 1.0)
+
+    async def test_failed_network_keeps_other_trackers_results(self):
+        row = {"indexerId": 45, "indexer": "M-Team - TP", "protocol": "torrent",
+               "title": "The First Frost 2025 S01 2160p WEB-DL H.265 AAC-HHWEB",
+               "seeders": 103, "size": 60_000_000_000, "guid": "mt-1",
+               "downloadUrl": "http://prowlarr/dl/mt-1"}
+
+        async def query(q, ids, kind="search"):
+            if ids & {5, 16, 35, 28}:
+                raise httpx.HTTPStatusError(
+                    "429", request=httpx.Request("GET", "http://p"),
+                    response=httpx.Response(429))
+            return [row]
+
+        with mock.patch.object(
+                private_trackers, "_private_torrent_indexers",
+                new=mock.AsyncMock(return_value={
+                    5: "AvistaZ", 28: "AnimeZ", 45: "M-Team - TP"})), \
+                mock.patch.object(private_trackers, "_prowlarr_query",
+                                  new=query), \
+                mock.patch.object(private_trackers.usenet, "_expected_info",
+                                  new=mock.AsyncMock(return_value=(
+                                      ["The First Frost"], 2025))), \
+                mock.patch.object(private_trackers.meta, "is_animation",
+                                  new=mock.AsyncMock(return_value=None)), \
+                mock.patch.object(private_trackers, "MIN_SEEDERS", 1), \
+                mock.patch.object(private_trackers, "RATIONED_SPACING", 0), \
+                mock.patch.object(private_trackers.telemetry,
+                                  "record_private_tracker"):
+            found = await private_trackers._search("series", "tt31887832:1:1")
+        self.assertEqual([row["title"]], [c["title"] for c in found])
+        self.assertEqual("ok", private_trackers.search_outcome(
+            "series", "tt31887832:1:1")["state"])
+
+    async def test_query_cache_reuses_answers_and_distrusts_empties(self):
+        responses = [httpx.Response(200, json=[{"title": "hit"}],
+                                    request=httpx.Request("GET", "http://p")),
+                     httpx.Response(200, json=[],
+                                    request=httpx.Request("GET", "http://p"))]
+        get = mock.AsyncMock(side_effect=responses)
+        with mock.patch.object(private_trackers._client, "get", new=get):
+            first = await private_trackers._prowlarr_query("Show S01", {45})
+            again = await private_trackers._prowlarr_query("Show S01", {45})
+            await private_trackers._prowlarr_query("Show S02", {45})
+        self.assertEqual(first, again)
+        self.assertEqual(2, get.await_count)
+        full, _ = private_trackers._query_cache[
+            ("search", "Show S01", frozenset({45}))]
+        empty, _ = private_trackers._query_cache[
+            ("search", "Show S02", frozenset({45}))]
+        self.assertLess(empty, full)
+        self.assertLessEqual(empty - private_trackers.time.monotonic(),
+                             private_trackers._EMPTY_QUERY_TTL)
+
+    async def test_indexer_catalogue_records_the_network_and_id_support(self):
+        catalogue = [
+            {"id": 5, "name": "AvistaZ", "implementation": "AvistaZ",
+             "protocol": "torrent", "privacy": "private", "enable": True,
+             "capabilities": {"tvSearchParams": ["q", "season", "imdbId"],
+                              "movieSearchParams": ["q", "imdbId"]}},
+            {"id": 28, "name": "AnimeZ", "implementation": "AnimeZ",
+             "protocol": "torrent", "privacy": "private", "enable": True,
+             "capabilities": {"tvSearchParams": ["q", "season", "ep"]}},
+            {"id": 45, "name": "M-Team - TP", "implementation": "MTeamTp",
+             "protocol": "torrent", "privacy": "private", "enable": True,
+             "capabilities": {"tvSearchParams": ["q", "imdbId"]}},
+        ]
+        get = mock.AsyncMock(return_value=httpx.Response(
+            200, json=catalogue, request=httpx.Request("GET", "http://p")))
+        with mock.patch.object(private_trackers._client, "get", new=get), \
+                mock.patch.object(private_trackers, "_private_indexers", None):
+            await private_trackers._private_torrent_indexers()
+        T = private_trackers._IndexerTraits
+        self.assertEqual(T(True, True, True, False),
+                         private_trackers._indexer_traits[5])
+        self.assertEqual(T(True, False, False, True),
+                         private_trackers._indexer_traits[28])
+        self.assertEqual(T(False, True, False, False),
+                         private_trackers._indexer_traits[45])
+
+
+class VideoTrackerFilterTests(unittest.IsolatedAsyncioTestCase):
+    """Games, music and book trackers are never searched, and a lookup only
+    goes to trackers that can carry that kind of release."""
+
+    CATALOGUE = [
+        ("M-Team - TP", 45, [{"id": 2000}, {"id": 5000}]),
+        ("GazelleGames", 23, [{"id": 4000}, {"id": 1000}]),
+        ("Redacted", 10, [{"id": 3000}, {"id": 7000}]),
+        ("GreatPosterWall", 25, [{"id": 2000, "subCategories": [{"id": 2040}]}]),
+        ("Nebulance", 20, [{"id": 100000, "subCategories": [{"id": 5040}]}]),
+        ("Unlisted", 99, []),
+    ]
+
+    def setUp(self):
+        private_trackers._query_cache.clear()
+        private_trackers._search_outcomes.clear()
+        self._traits = mock.patch.dict(private_trackers._indexer_traits, {},
+                                       clear=True)
+        self._traits.start()
+
+    def tearDown(self):
+        self._traits.stop()
+
+    async def _load_catalogue(self):
+        rows = [{"id": i, "name": name, "implementation": name,
+                 "protocol": "torrent", "privacy": "private", "enable": True,
+                 "capabilities": {"categories": cats}}
+                for name, i, cats in self.CATALOGUE]
+        get = mock.AsyncMock(return_value=httpx.Response(
+            200, json=rows, request=httpx.Request("GET", "http://p")))
+        with mock.patch.object(private_trackers._client, "get", new=get), \
+                mock.patch.object(private_trackers, "_private_indexers", None):
+            return await private_trackers._private_torrent_indexers()
+
+    async def test_categories_decide_movies_and_tv(self):
+        await self._load_catalogue()
+        traits = private_trackers._indexer_traits
+        self.assertEqual((True, True), (traits[45].movies, traits[45].tv))
+        self.assertEqual((False, False), (traits[23].movies, traits[23].tv))
+        self.assertEqual((False, False), (traits[10].movies, traits[10].tv))
+        self.assertEqual((True, False), (traits[25].movies, traits[25].tv))
+        self.assertEqual((False, True), (traits[20].movies, traits[20].tv))
+        # No category data: kept, a catalogue gap must not hide a source.
+        self.assertEqual((True, True), (traits[99].movies, traits[99].tv))
+
+    async def test_each_lookup_asks_only_trackers_that_can_have_it(self):
+        indexers = await self._load_catalogue()
+        asked: dict[str, set] = {}
+
+        async def query(q, ids, kind="search"):
+            asked.setdefault(media, set()).update(ids)
+            return []
+
+        for media, media_id, titles in (
+                ("series", "tt1:1:1", ["Some Show"]),
+                ("movie", "tt2", ["Some Film"])):
+            with mock.patch.object(private_trackers, "_private_torrent_indexers",
+                                   new=mock.AsyncMock(return_value=indexers)), \
+                    mock.patch.object(private_trackers, "_prowlarr_query",
+                                      new=query), \
+                    mock.patch.object(private_trackers.usenet, "_expected_info",
+                                      new=mock.AsyncMock(
+                                          return_value=(titles, 2020))), \
+                    mock.patch.object(private_trackers.usenet, "_accepted_years",
+                                      new=mock.AsyncMock(
+                                          return_value=frozenset({2020}))), \
+                    mock.patch.object(private_trackers.telemetry,
+                                      "record_private_tracker"):
+                await private_trackers._search(media, media_id)
+        self.assertEqual({45, 20, 99}, asked["series"])
+        self.assertEqual({45, 25, 99}, asked["movie"])
 
 
 class AlreadyDownloadedOrderingTests(unittest.TestCase):
@@ -845,6 +1194,38 @@ class PrivateSetupTests(unittest.IsolatedAsyncioTestCase):
                 os.environ.pop("CONFIG_FILE", None)
             else:
                 os.environ["CONFIG_FILE"] = old
+
+    async def test_release_filed_under_a_regional_alias_is_admitted(self):
+        # Real M-Team names for 乡村爱情 S01. None carries an IMDb id, and none
+        # uses TMDB's English title for the first season.
+        def row(title, seeders=20):
+            return {"indexerId": 45, "indexer": "M-Team - TP",
+                    "protocol": "torrent", "title": title, "seeders": seeders,
+                    "size": 20_000_000_000, "guid": title,
+                    "downloadUrl": "http://prowlarr/dl/" + title}
+        rows = [row("Rural Love Story S01 2006 Complete 2160p WEB-DL HEVC AAC-DBTV"),
+                row("Country Love 2006 S01 Complete 2160p WEB-DL H.265 AAC 2.0-UBWEB"),
+                row("Love Stories in the Countryside S18E13 1080p YOUKU WEB-DL"),
+                row("Lovecraft Country S01 1080p WEB-DL"),
+                row("Rural Love Story 2023 S01 2160p WEB-DL H265 HQ AAC-HHWEB")]
+        titles = ["Love Stories in the Countryside", "乡村爱情",
+                  "Country Love", "Rural Love Story"]
+        with mock.patch.object(
+                private_trackers, "_private_torrent_indexers",
+                new=mock.AsyncMock(return_value={45: "M-Team - TP"})), \
+                mock.patch.object(private_trackers, "_prowlarr_query",
+                                  new=mock.AsyncMock(return_value=rows)), \
+                mock.patch.object(private_trackers.usenet, "_expected_info",
+                                  new=mock.AsyncMock(
+                                      return_value=(titles, 2006))), \
+                mock.patch.object(private_trackers, "MIN_SEEDERS", 1), \
+                mock.patch.object(private_trackers.telemetry,
+                                  "record_private_tracker"):
+            found = await private_trackers._search("series", "tt1395015:1:1")
+        self.assertEqual(
+            {"Rural Love Story S01 2006 Complete 2160p WEB-DL HEVC AAC-DBTV",
+             "Country Love 2006 S01 Complete 2160p WEB-DL H.265 AAC 2.0-UBWEB"},
+            {c["title"] for c in found})
 
     async def test_indexer_preferences_merge_stored_scores(self):
         with mock.patch.object(

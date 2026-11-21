@@ -86,6 +86,7 @@ class BackgroundTaskTests(unittest.IsolatedAsyncioTestCase):
             return _run
 
         from unittest.mock import AsyncMock, patch
+        self.enterContext(patch.dict(os.environ, {"RECS_BACKGROUND_JOBS": "1"}))
         from app.recs import (dramas, kids_catalogs, playhistory,
                               profile_streaming, scheduler, watching)
         with (

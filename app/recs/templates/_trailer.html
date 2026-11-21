@@ -1,0 +1,112 @@
+<!-- Trailer playback, shared by the taste page and movie night.
+
+     Folded into both by main.py rather than imported, because these pages are
+     deliberately single self-contained documents. (The placeholder token is
+     spelled out in main.py, not here — repeating it in this comment would ship
+     a live-looking placeholder inside the substituted result.) One copy so the
+     ad-free path cannot drift between them: an embed cannot be made ad-free
+     (ads are the uploader's monetisation setting, not a player flag), so the
+     player is skipped and the file behind it is served instead. Ads live in
+     the player, so there is nothing left to block.
+
+     The host page must set TRAILER_BASE to a URL taking /{media}/{tmdb_id},
+     which is what keeps the seat-scoped and token-scoped endpoints apart. -->
+<style>
+.card img{cursor:pointer}
+/* A poster that plays something has to say so — otherwise the only way to
+   find out is to press a picture that has never done anything before. */
+.playhint{position:absolute;top:10px;right:10px;z-index:2;display:flex;
+  align-items:center;gap:5px;padding:5px 10px;border-radius:999px;
+  background:rgba(13,17,23,.72);color:var(--ink);font-size:.75rem;
+  font-weight:600;pointer-events:none;backdrop-filter:blur(3px)}
+/* Inside the page on purpose: sending somebody to YouTube to watch a trailer
+   loses the deck, the session, and usually the person. */
+.sheet{position:fixed;inset:0;z-index:50;background:rgba(3,5,8,.92);
+  display:flex;align-items:center;justify-content:center;padding:16px}
+.sheet video{width:100%;max-width:min(100%,900px);max-height:78vh;
+  border-radius:12px;background:#000}
+.sheet .msg{color:var(--dim);font-size:.92rem;text-align:center;max-width:20rem}
+.sheetclose{position:absolute;top:max(10px,env(safe-area-inset-top));right:12px;
+  width:44px;height:44px;border-radius:50%;border:1px solid var(--line);
+  background:var(--card);color:var(--ink);font-size:1.1rem;font-family:inherit;
+  cursor:pointer;display:flex;align-items:center;justify-content:center}
+</style>
+<script>
+// tmdb id -> the URL to play, or null for "this title has none". Asked once
+// per title however many times somebody presses the poster.
+const trailerCache = new Map();
+let sheet = null;
+
+function closeSheet() {
+  if (!sheet) return;
+  // Explicitly emptied: a <video> left in a detached node can keep pulling
+  // bytes, and on a phone that is somebody's data allowance.
+  const v = sheet.querySelector("video");
+  if (v) { v.pause(); v.removeAttribute("src"); v.load(); }
+  sheet.remove();
+  sheet = null;
+}
+
+function openSheet(inner) {
+  closeSheet();
+  sheet = document.createElement("div");
+  sheet.className = "sheet";
+  sheet.innerHTML = `<button class="sheetclose" aria-label="Close">✕</button>`;
+  sheet.appendChild(inner);
+  // The backdrop closes it; the video does not — otherwise every tap on the
+  // scrubber shuts the thing you are trying to watch.
+  sheet.onclick = e => { if (e.target === sheet) closeSheet(); };
+  sheet.querySelector(".sheetclose").onclick = closeSheet;
+  document.body.appendChild(sheet);
+}
+
+addEventListener("keydown", e => { if (e.key === "Escape") closeSheet(); });
+
+// Cards dealt before this feature existed carry no tmdb id, and a session
+// already in progress keeps its stored playlist — so this has to stay silent
+// rather than offer a button that cannot work.
+function hasTrailer(card) { return !!(card && card.tmdb); }
+
+async function playTrailer(card) {
+  if (!hasTrailer(card)) return;
+  const waiting = document.createElement("p");
+  waiting.className = "msg";
+  waiting.textContent = "Finding a trailer…";
+  openSheet(waiting);
+  const mine = sheet;
+
+  let url = trailerCache.get(card.tmdb);
+  if (url === undefined) {
+    try {
+      const r = await fetch(
+        `${TRAILER_BASE}/${card.media || "movie"}/${card.tmdb}`);
+      url = (await r.json()).trailer || null;
+    } catch (e) { url = null; }
+    trailerCache.set(card.tmdb, url);
+  }
+  // They may have closed it, or moved on, while we were asking.
+  if (sheet !== mine) return;
+  if (!url) { waiting.textContent = "No trailer for this one."; return; }
+
+  const video = document.createElement("video");
+  video.controls = true;
+  video.autoplay = true;
+  video.playsInline = true;
+  video.src = url;
+  video.onerror = () => {
+    if (sheet !== mine) return;
+    video.replaceWith(Object.assign(document.createElement("p"),
+      {className: "msg", textContent: "That trailer would not load."}));
+  };
+  waiting.replaceWith(video);
+}
+
+// Wire a freshly built card up to its trailer, or strip the affordance when
+// there is nothing to play.
+function attachTrailer(el, card) {
+  const img = el.querySelector("img");
+  const hint = el.querySelector(".playhint");
+  if (!img || !hasTrailer(card)) { if (hint) hint.remove(); return; }
+  img.onclick = () => playTrailer(card);
+}
+</script>

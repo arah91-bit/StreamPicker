@@ -324,7 +324,10 @@ class ProxyAsyncSafetyTests(unittest.IsolatedAsyncioTestCase):
                               "lbl": "short", "nzb_indexers": []},
                              "video/mp4", 100, "fast", "tt1")
             e.consumers = 1
+            # A source that never comes back still fails the entry — after
+            # the resume budget, which a test need not sit through.
             with (patch.object(proxy, "_connect_resume", new=AsyncMock(return_value=None)),
+                  patch.object(proxy, "BUFFER_RESUME_BUDGET", 0.0),
                   patch("app.proxy.telemetry.record_buffer"),
                   patch("app.proxy.reputation.observe"),
                   patch("app.proxy.reputation.cooldown")):
@@ -586,6 +589,7 @@ class ActiveStreamDetailsTests(unittest.TestCase):
         watched.node = "node-1.example.com"
         idle = proxy._Entry("sig2", "/tmp/sig2", [], None, None, None,
                             "fast", "tt1")            # producer alive, no reader
+        idle.last = time.time() - 600                 # ...and none for ten minutes
         proxy._entries.update({"sig1": watched, "sig2": idle})
 
         out = proxy.active_stream_details()
@@ -599,6 +603,30 @@ class ActiveStreamDetailsTests(unittest.TestCase):
         self.assertEqual(1_000_000_000, d["avail"])
         self.assertEqual(8_000_000_000, d["total"])
         self.assertEqual(2, d["consumers"])
+
+    def test_a_player_between_range_requests_is_still_playing(self):
+        """No connection open, read five seconds ago: someone is watching.
+        The restart warning used to say nobody was."""
+        between = proxy._Entry("sig4", "/tmp/sig4", [], {"lbl": "X"}, None,
+                               None, "fast", "tt4")
+        between.consumers, between.last = 0, time.time() - 5
+        gone = proxy._Entry("sig5", "/tmp/sig5", [], {"lbl": "Y"}, None,
+                            None, "fast", "tt5")
+        gone.consumers, gone.last = 0, time.time() - 600
+        proxy._entries.update({"sig4": between, "sig5": gone})
+
+        self.assertEqual(["tt4"],
+                         [d["media_id"] for d in proxy.active_stream_details()])
+        with patch.dict(proxy.hlsproxy._active, {}, clear=True):
+            self.assertEqual(1, proxy.active_streams())
+
+    def test_direct_and_hls_count_toward_the_restart_warning(self):
+        proxy._direct[1] = {"media_id": "tt7", "mode": "direct"}
+        recent = {"_hls": {"last": time.monotonic() - 3}}
+        stale = {"_hls": {"last": time.monotonic() - 600}}
+        with patch.dict(proxy.hlsproxy._active, {"a": recent, "b": stale},
+                        clear=True):
+            self.assertEqual(2, proxy.active_streams())
 
     def test_sparse_entry_with_reader_does_not_raise(self):
         bare = proxy._Entry("sig3", "/tmp/sig3", [], None, None, None, "", None)
@@ -697,6 +725,21 @@ class _StartResponse:
         return gen()
 
 
+class _StallAfterFirst(_StartResponse):
+    """An upstream that sends one chunk promptly, then goes silent."""
+
+    def __init__(self, first: bytes, stall: float):
+        super().__init__([first])
+        self._first, self._after = first, stall
+
+    def aiter_raw(self):
+        async def gen():
+            yield self._first
+            await asyncio.sleep(self._after)
+            yield b"\0" * 1024
+        return gen()
+
+
 class DeadStartTests(unittest.TestCase):
     """A source that delivers no bytes is a corpse, not a slow link.
 
@@ -767,6 +810,48 @@ class DeadStartTests(unittest.TestCase):
 
         self.assertLess(elapsed, 5.0, "dead source held the start gate open")
 
+    def test_a_source_that_starts_then_goes_silent_is_refused_in_the_window(self):
+        """Byte one arrives, then nothing. EVAL_DEADLINE used to be checked only
+        when a chunk landed, so this held the gate for the client's 60 s read
+        timeout and — under 512 KB, so never rate-checked — was then served
+        (reproduced: 20 s against an 8 s window, accepted, zero strikes)."""
+        c, rep = dict(self._cand(), need=3_000_000), self._rep()
+        resp = _StallAfterFirst(b"\x1aE\xdf\xa3" + b"\0" * (64 * 1024), stall=30.0)
+
+        t0 = time.monotonic()
+        with patch("app.proxy._send", AsyncMock(return_value=resp)), \
+             patch("app.proxy.EVAL_DEADLINE", 1.0):
+            got = self._select([c], rep)
+        elapsed = time.monotonic() - t0
+
+        self.assertIsNone(got)
+        self.assertLess(elapsed, 5.0, "a silent source held the start gate open")
+        self.assertTrue(resp.closed)
+        self.assertEqual("dead", rep.observe.call_args.args[2])
+        self.assertTrue(rep.observe.call_args.kwargs["extreme"])
+
+    def test_a_size_less_silent_start_is_judged_against_the_floor(self):
+        c, rep = self._cand(), self._rep()          # no need, no runtime
+        resp = _StallAfterFirst(b"\x1aE\xdf\xa3" + b"\0" * 4096, stall=30.0)
+
+        with patch("app.proxy._send", AsyncMock(return_value=resp)), \
+             patch("app.proxy.EVAL_DEADLINE", 1.0):
+            self.assertIsNone(self._select([c], rep))
+        self.assertEqual("dead", rep.observe.call_args.args[2])
+
+    def test_a_fast_burst_with_a_trailing_gap_still_starts(self):
+        """A gap is only a verdict when the window as a whole is too slow."""
+        c, rep = dict(self._cand(), need=100_000), self._rep()
+        resp = _StallAfterFirst(
+            b"\x1aE\xdf\xa3" + b"\0" * (1536 * 1024), stall=30.0)
+
+        with patch("app.proxy._send", AsyncMock(return_value=resp)), \
+             patch("app.proxy.EVAL_DEADLINE", 1.0):
+            got = self._select([c], rep)
+
+        self.assertIsNotNone(got)
+        rep.observe.assert_not_called()
+
     def test_a_live_source_after_a_dead_one_still_gets_served(self):
         """Failing fast is only worth anything if the failover still lands."""
         dead, live = self._cand(), dict(self._cand(), sig="file:" + "b" * 64,
@@ -785,3 +870,134 @@ class DeadStartTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _SpliceResponse:
+    """A range response that streams real bytes, like a live upstream."""
+
+    def __init__(self, body: bytes, start: int, total: int, chunk: int = 7):
+        self.status_code = 206
+        self.headers = {"content-range": f"bytes {start}-{total - 1}/{total}"}
+        self._body, self._chunk = body, chunk
+        self.closed = False
+
+    async def aiter_raw(self):
+        for i in range(0, len(self._body), self._chunk):
+            yield self._body[i:i + self._chunk]
+
+    async def aclose(self):
+        self.closed = True
+
+
+class VerifiedSpliceTests(unittest.IsolatedAsyncioTestCase):
+    """A replacement source may finish the film only if it proves, against bytes
+    already on disk, that it is the same file. See _open_verified."""
+
+    TOTAL = 4096
+    OFFSET = 2048
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.data = bytes((i * 7 + 11) % 251 for i in range(self.TOTAL))
+        self.path = os.path.join(self.dir.name, "buf.bin")
+        with open(self.path, "wb") as f:
+            f.write(self.data[:self.OFFSET])
+        self.verify = patch.object(proxy, "SPLICE_VERIFY_BYTES", 64)
+        self.verify.start()
+        self.addCleanup(self.verify.stop)
+
+    def _entry(self):
+        e = proxy._Entry("url:a", self.path, [{"u": "https://a/x.mkv"}],
+                         {"u": "https://a/x.mkv"}, "video/x-matroska",
+                         self.TOTAL, "fast", "tt1",
+                         pool=[{"u": "https://a/x.mkv", "lbl": "a"},
+                               {"u": "https://b/x.mkv", "lbl": "b"}])
+        e.avail = self.OFFSET
+        return e
+
+    async def test_matching_bytes_splice_and_resume_at_the_write_head(self):
+        e = self._entry()
+        start = self.OFFSET - 64
+        resp = _SpliceResponse(self.data[start:], start, self.TOTAL)
+
+        with patch("app.proxy._send", AsyncMock(return_value=resp)):
+            got = await proxy._open_verified(e, {"u": "https://b/x.mkv"},
+                                             self.OFFSET)
+
+        self.assertIsNotNone(got, "identical bytes must be allowed to splice")
+        rest = b"".join([chunk async for chunk in got[2]])
+        # The verification window is consumed, not replayed to the player: the
+        # stream must continue at exactly the write head, with no gap or repeat.
+        self.assertEqual(self.data[self.OFFSET:], rest)
+        self.assertFalse(resp.closed)
+
+    async def test_a_different_file_of_the_same_length_is_refused(self):
+        e = self._entry()
+        start = self.OFFSET - 64
+        other = bytes((b + 1) % 256 for b in self.data)      # same size, not same file
+        resp = _SpliceResponse(other[start:], start, self.TOTAL)
+
+        with patch("app.proxy._send", AsyncMock(return_value=resp)):
+            got = await proxy._open_verified(e, {"u": "https://b/x.mkv"},
+                                             self.OFFSET)
+
+        self.assertIsNone(got, "matching length is not proof of matching bytes")
+        self.assertTrue(resp.closed, "a refused candidate must not leak its socket")
+
+    async def test_resume_elsewhere_walks_the_pool_past_a_bad_match(self):
+        e = self._entry()
+        e.pool = [{"u": "https://bad/x.mkv", "lbl": "bad"},
+                  {"u": "https://good/x.mkv", "lbl": "good"}]
+        start = self.OFFSET - 64
+        wrong = bytes((b + 1) % 256 for b in self.data)
+        responses = [_SpliceResponse(wrong[start:], start, self.TOTAL),
+                     _SpliceResponse(self.data[start:], start, self.TOTAL)]
+
+        with patch("app.proxy._send", AsyncMock(side_effect=responses)):
+            got = await proxy._resume_elsewhere(e, set())
+
+        self.assertIsNotNone(got)
+        self.assertEqual("https://good/x.mkv", got[0]["u"])
+        self.assertEqual(e.source["u"], "https://good/x.mkv")
+
+    async def test_no_splice_without_cached_bytes_to_prove_against(self):
+        """At byte 0 there is nothing to compare, so nothing may be assumed."""
+        e = self._entry()
+        e.avail = 0
+        with patch("app.proxy._send", AsyncMock()) as send:
+            self.assertIsNone(await proxy._resume_elsewhere(e, set()))
+        send.assert_not_awaited()
+
+
+class HeadConsistencyTests(unittest.IsolatedAsyncioTestCase):
+    """HEAD must describe the file GET will serve — see _head."""
+
+    async def test_head_skips_a_cooled_candidate_that_get_would_skip(self):
+        cooled = {"u": "https://a/x.mkv", "sig": "file:" + "a" * 64, "rh": {}}
+        live = {"u": "https://b/y.mkv", "sig": "file:" + "b" * 64, "rh": {}}
+        resp = _Response(206, content_range="bytes 0-0/555")
+        resp.aclose = AsyncMock()
+
+        with patch.object(proxy.reputation, "blocked", return_value=False), \
+             patch.object(proxy.reputation, "cooled",
+                          side_effect=lambda s: s == cooled["sig"]), \
+             patch("app.proxy._send", AsyncMock(return_value=resp)) as send:
+            out = await proxy._head({"cands": [cooled, live]})
+
+        self.assertEqual("555", out.headers["Content-Length"])
+        self.assertEqual(live["u"], send.await_args.args[0]["u"])
+
+    async def test_head_reports_the_length_of_the_buffer_already_playing(self):
+        e = proxy._Entry("url:head", "/nonexistent", [], {}, "video/x-matroska",
+                         1234, "fast", "tt1")
+        proxy._entries["url:head"] = e
+        self.addCleanup(proxy._entries.pop, "url:head", None)
+
+        with patch("app.proxy._send", AsyncMock()) as send:
+            out = await proxy._head({"cands": [{"u": "https://a/x", "sig": ""}],
+                                     "bufcid": "url:head"})
+
+        self.assertEqual("1234", out.headers["Content-Length"])
+        self.assertEqual("video/x-matroska", out.headers["Content-Type"])
+        send.assert_not_awaited()

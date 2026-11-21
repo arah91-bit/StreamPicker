@@ -241,6 +241,9 @@ const ROW_SPECS = [
   {id: "nr-watch-history", key: "watch_history_row",
    title: "Watch history",
    desc: "Everything recently watched, newest first, one card per title."},
+  {id: "nr-watchlist", key: "watchlist_row",
+   title: "Want to watch",
+   desc: "Titles you saved from the taste page, newest first. Cards drop off once you have watched them."},
 ];
 
 function renderBuilder(users) {
@@ -323,10 +326,10 @@ async function loadUsers() {
       <div class="meta-line">${u.catalogs} home catalogs${u.streaming_catalogs ? ` · ${u.streaming_catalogs} collection-only streaming lists` : ""} · refreshed ${fmtAgo(u.last_generated_at)} · opened ${fmtAgo(u.last_served_at)}${u.refresh_queued ? " · refresh queued" : ""}${measurementLine}</div>
       <div class="url-label">Private Daily Picks addon</div>
       <a class="url" target="_blank" rel="noopener"></a>
-      ${u.streaming_collection_url ? `<div class="url-label">Streaming collection file</div><div class="collection-note">Download this JSON file, then upload it under Nuvio Collections. It uses the same Daily Picks add-on.</div>` : ""}
+      ${u.collection_url ? `<div class="url-label">Nuvio collection file</div><div class="collection-note">Download this JSON file, then upload it under Nuvio Collections. It carries whichever collections this viewer is opted into — streaming services, Asian dramas — and all of them resolve through the same Daily Picks add-on.</div>` : ""}
       <div class="row-btns">
         <button class="copy-btn">Copy addon URL</button>
-        ${u.streaming_collection_url ? `<button class="secondary collection-download-btn">Download collection file</button>` : ""}
+        ${u.collection_url ? `<button class="secondary collection-download-btn">Download collection file</button>` : ""}
         <button class="secondary refresh-btn">Refresh now</button>
         <button class="secondary preference-btn">Taste controls</button>
         <button class="secondary kid-toggle-btn"></button>
@@ -349,7 +352,7 @@ async function loadUsers() {
     };
     const collectionDownload = div.querySelector(".collection-download-btn");
     if (collectionDownload) collectionDownload.onclick = () => {
-      downloadCollectionFile(u.streaming_collection_url, u.collection_filename);
+      downloadCollectionFile(u.collection_url, u.collection_filename);
     };
     div.querySelector(".refresh-btn").onclick = async e => {
       e.target.disabled = true; e.target.textContent = "Refreshing…";
@@ -460,8 +463,8 @@ async function pollReady() {
       '<span class="ok">' + d.catalogs + ' catalogs ready.</span>' +
       ' Paste the add-on URL below under Nuvio Add-ons.';
     $("install").classList.remove("hidden");
-    if (d.streaming_collection_url) {
-      showStreamingCollection(d.streaming_collection_url, d.collection_filename);
+    if (d.collection_url) {
+      showStreamingCollection(d.collection_url, d.collection_filename);
     } else if (d.streaming_profile_configured || newStreamingConfigured) {
       const status = $("streaming-status");
       status.textContent = "Building the streaming collection…";
@@ -485,8 +488,8 @@ async function pollStreamingReady() {
   if (!newToken) return;
   const r = await fetch("/api/status/" + newToken);
   const d = await r.json();
-  if (d.streaming_collection_url) {
-    showStreamingCollection(d.streaming_collection_url);
+  if (d.collection_url) {
+    showStreamingCollection(d.collection_url);
     loadUsers();
   } else if (d.streaming_profile_configured) {
     setTimeout(pollStreamingReady, 4000);

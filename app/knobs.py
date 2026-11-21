@@ -40,6 +40,7 @@ EXCLUDE = {
     "DB_PATH": "Daily Picks database path; set via the volume mount",
     "CATALOGS_DIR": "Daily Picks catalog packs; set via the volume mount",
     "SETUP_SECRET": "the gate to viewer onboarding — set it in .env only",
+    "RECS_BACKGROUND_JOBS": "test-harness switch; production always runs them",
 }
 
 # Advanced groups render in this order. (id, title)
@@ -91,14 +92,13 @@ CATALOG = [
     ("PROBE_HOST_BENCH", "fast", "num", "3", "",
      "Probe failures (with no pass) before a host is skipped for the rest of "
      "that pick. 0 disables."),
-    ("TOTAL_DEADLINE", "fast", "num", "120", _S,
+    ("TOTAL_DEADLINE", "fast", "num", "55", _S,
      "Player-safe outer ceiling on a fast request. Under ten seconds is only "
      "the target; the picker keeps waiting for a verified playable stream, "
-     "because hitting this ceiling means serving the 'Finding Best Stream' "
-     "placeholder — which an auto-playing player plays instead of a film. "
-     "Bounded by your player's own HTTP timeout, which is not measured: if "
-     "playback starts erroring instead of showing the placeholder, lower it."),
-    ("FAST_RACE_DEADLINE", "fast", "num", "120", _S,
+     "and with none by this ceiling it answers with nothing rather than a "
+     "placeholder an auto-playing player would play. Nuvio gives an addon 60 s "
+     "(its HTTP read timeout and its auto-play limit), so keep this under it."),
+    ("FAST_RACE_DEADLINE", "fast", "num", "55", _S,
      "Second player-safety cap on the fast race. The effective limit is the "
      "smaller of this and TOTAL_DEADLINE, so raise them together."),
     ("FAST_4K_GRACE", "fast", "num", "4", _S,
@@ -118,8 +118,6 @@ CATALOG = [
      "How long a usenet mount may keep filling the shared cache after answer."),
     ("CACHE_TTL", "fast", "num", "21600", _S,
      "How long a picker's answer for a title is reused."),
-    ("CHECKING_NOTICE_TTL", "fast", "num", "180", _S,
-     "How long the 'still checking' placeholder is cached before re-picking."),
     ("RAW_CACHE_TTL", "fast", "num", "21600", _S,
      "How long a non-empty upstream search result is shared between pickers."),
     ("RAW_NEG_TTL", "fast", "num", "90", _S,
@@ -137,6 +135,11 @@ CATALOG = [
      "ffprobe timeout when measuring true video bitrate."),
     ("GOOD_TTFB", "fast", "num", "4.0", _S,
      "First-byte time target; above it a source counts as a slow start."),
+    ("PROBE_MP4_INDEX_TIMEOUT", "fast", "num", "8", _S,
+     "Budget for reading an MP4's end-of-file index during a probe. Only "
+     "done for foreign-language titles, where the track table decides "
+     "whether a release carries switchable subtitles or burned-in ones; an "
+     "MP4 that keeps its index at EOF tells the 2 MB head sniff nothing."),
     ("PROBE_CODEC_SNIFF", "fast", "bool", "1", "",
      "ffprobe the bytes each passing probe already pulled to learn real "
      "codecs, feeding the decode-compatibility demotion."),
@@ -235,6 +238,36 @@ CATALOG = [
      "Players read the container index (MKV cues, MP4 moov) from the end of "
      "the file on every open and seek; serving those bytes warm removes an "
      "upstream round-trip from each. 0 disables."),
+    ("STREAM_STALL_SECS", "proxy", "num", "12", _S,
+     "How long an HTTP source (debrid CDN, Easynews) may go silent mid-stream "
+     "before the proxy reconnects at the same byte. The HTTP client's own "
+     "read timeout is 60s — longer than a player's buffer (~13-45s), so a "
+     "stalled CDN connection used to surface as a mid-episode spinner before "
+     "anything retried. Usenet sources are exempt: InfiniDysk's article fetches "
+     "legitimately pause, and a reconnect there re-runs a costly seek. "
+     "0 disables (wait out the client timeout)."),
+    ("PROXY_START_BUDGET", "proxy", "num", "20", _S,
+     "The whole time the proxy may spend choosing a source for an opening "
+     "request, across every candidate. Tried one by one, four bad candidates "
+     "could take over a minute — long after the player had given up. "
+     "0 = unbounded."),
+    ("PROXY_START_STAGGER", "proxy", "num", "2.5", _S,
+     "When the leading candidate has not decided within this long, the next "
+     "one starts beside it so its latency is already paid if the leader "
+     "fails. Ranking still decides — a backup is served only once everything "
+     "above it has failed. Never for usenet, Easynews or uncached debrid "
+     "links. 0 = strictly one at a time."),
+    ("BUFFER_MIN_FREE_GB", "proxy", "num", "5", "GB",
+     "Free space the read-ahead cache always leaves on its volume, whatever "
+     "BUFFER_CACHE_GB says: idle entries are evicted to keep it, and when "
+     "nothing idle is left new streams play unbuffered instead of failing. "
+     "A full disk used to crash every producer and truncate every stream."),
+    ("BUFFER_RESUME_BUDGET", "proxy", "num", "45", _S,
+     "How long the read-ahead buffer keeps retrying a dropped source (same "
+     "source, byte-identical twins, then any copy that replays the cached "
+     "bytes exactly) before giving up on the file. Readers behind the write "
+     "head keep playing from disk meanwhile. One refused reconnect used to "
+     "end the buffer, leaving the rest of the film to cold fetches."),
     ("NZB_START_RETRY_SECS", "proxy", "num", "2", _S,
      "One extra chance for a direct-usenet source that failed to start, after "
      "this pause. InfiniDysk mount readiness can flap for a few seconds while an "
@@ -258,6 +291,14 @@ CATALOG = [
      "Window over which slowness is measured before a proactive twin switch."),
     ("TWIN_SPLICE_MARGIN", "proxy", "num", "0.9", "",
      "Fraction of required bitrate below which a source counts as too slow."),
+    ("SPLICE_VERIFY", "proxy", "bool", "1", "",
+     "When no byte-identical twin can resume, let any other candidate for the "
+     "title take over mid-stream if it replays bytes already cached."),
+    ("SPLICE_VERIFY_KB", "proxy", "num", "64", "",
+     "Cached bytes a replacement source must reproduce exactly before it is "
+     "allowed to feed the rest of the file."),
+    ("SPLICE_VERIFY_MAX", "proxy", "num", "4", "",
+     "Candidates tried per cross-source resume attempt."),
     ("BUFFER_TTL_SECONDS", "proxy", "num", "86400", _S,
      "How long an idle cached buffer survives before reaping."),
     ("BUFFER_WAIT_TIMEOUT", "proxy", "num", "45", _S,
@@ -340,6 +381,16 @@ CATALOG = [
      "container index at EOF, and the fill starts at byte 0, so the fill can "
      "afford to wait and the index cannot. 0 lets them race (the old "
      "behaviour, which cost ~50s of black screen on Easynews)."),
+    ("PROXY_WARM", "proxy", "bool", "1", "",
+     "Let a player warm its top pick before Play (POST /proxy/<token>/warm): "
+     "the start gate chooses a source, the producer warms the file's index "
+     "and reads a little ahead, and nothing is judged — no strike, no "
+     "cooldown, no play record. 0 answers 204 and does nothing."),
+    ("BUFFER_WARM_MB", "proxy", "num", "64", "MB",
+     "Read-ahead a warm may fill before anyone presses Play, on top of the "
+     "index (BUFFER_TAIL_MB). Also bounded by the idle grace — about 10s on "
+     "Easynews — after which the warm lets go of its source until a reader "
+     "arrives."),
     ("EASYNEWS_MAX_PROBES", "easynews", "num", "1", "",
      "Easynews candidates probed at once. An Easynews account caps concurrent "
      "transfers and the cap is low — measured: 4 fine, 6 makes the worst TTFB "
@@ -512,8 +563,14 @@ CATALOG = [
      "Record probe/playback telemetry that powers the Source health page."),
     ("TELEMETRY_MAX_BYTES", "telemetry", "num", "1073741824", _B,
      "Rotate the telemetry log past this size."),
-    ("TELEMETRY_SEGMENTS", "telemetry", "num", "8", "",
-     "How many rotated telemetry segments to keep."),
+    ("LOOP_LAG_WARN_SECS", "telemetry", "num", "0.25", _S,
+     "An event-loop stall at least this long is logged and recorded with the "
+     "requests that began just before it. One loop serves every stream, so a "
+     "stall freezes all of them at once; Home warns about any over a second."),
+    ("TELEMETRY_LOAD_TTL", "telemetry", "num", "60", _S,
+     "How long dashboard pages reuse one parse of the telemetry log. Parsing "
+     "the whole retained log takes seconds on a busy install, so it runs off "
+     "the playback path and is shared; a cheap parse is never reused."),
     ("STATS_SLOW_MBPS", "telemetry", "num", "4.0", "MB/s",
      "Delivery below this on the Source health page is flagged as slow."),
 

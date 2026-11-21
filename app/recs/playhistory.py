@@ -24,7 +24,7 @@ import queue
 import re
 import time
 
-from app.recs import db
+from app.recs import config, db
 
 logger = logging.getLogger("nuvio-recs")
 
@@ -104,6 +104,46 @@ def sink(record: dict, entry: dict) -> None:
             logger.warning("play history: queue full, dropped %d plays", _dropped)
 
 
+# Rebuilds owed to viewers who just started something new, one per profile.
+_rebuilds: dict[str, asyncio.Task] = {}
+
+
+async def _note_new_watch(event: dict) -> None:
+    """Rebuild a viewer's picks soon after they start a title new to them.
+
+    Without this, a new show only reached Top Picks at the next 4:30 rebuild.
+    Debounced twice: the rebuild waits NEW_WATCH_REBUILD_DELAY_SECONDS so a
+    session's first few plays land in one build, and it is skipped when the
+    slate is younger than NEW_WATCH_MIN_GAP_HOURS.
+    """
+    if event.get("seconds", 0) < config.NEW_WATCH_MIN_SECONDS:
+        return
+    if not await db.is_new_title(event["viewer_key"], event["imdb_id"],
+                                 event["played_at"], config.NEW_WATCH_MIN_SECONDS):
+        return
+    from app.recs.profile_streaming import private_namespace_for_user
+    user = next((u for u in await db.all_users()
+                 if private_namespace_for_user(u) == event["viewer_key"]), None)
+    if user is None or user["token"] in _rebuilds:
+        return
+    if time.time() - (user.get("last_generated_at") or 0) < (
+            config.NEW_WATCH_MIN_GAP_HOURS * 3600):
+        return
+
+    async def rebuild(token: str) -> None:
+        from app.recs.catalogs import generate_for_user
+        try:
+            await asyncio.sleep(config.NEW_WATCH_REBUILD_DELAY_SECONDS)
+            fresh = await db.get_user(token)
+            if fresh:
+                logger.info("[%s] new title started — rebuilding picks", token[:8])
+                await generate_for_user(fresh, trigger="new-watch")
+        finally:
+            _rebuilds.pop(token, None)
+
+    _rebuilds[user["token"]] = asyncio.create_task(rebuild(user["token"]))
+
+
 async def drain_once() -> int:
     """Write everything currently queued. Returns how many rows were stored."""
     stored = 0
@@ -117,6 +157,11 @@ async def drain_once() -> int:
             stored += 1
         except Exception:
             logger.exception("play history: could not store a play")
+            continue
+        try:
+            await _note_new_watch(event)
+        except Exception:
+            logger.debug("play history: new-watch check failed", exc_info=True)
     return stored
 
 

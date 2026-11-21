@@ -31,11 +31,14 @@ services:
       - ALL
     # Used only by app.entrypoint to repair fresh/legacy bind-mount ownership
     # and drop to UID/GID 1000. The serving process retains no capabilities.
+    # KILL lets init (tini, root) forward SIGTERM to the UID-1000 app; without
+    # it tini dies with EPERM and every stop skips the graceful shutdown.
     cap_add:
       - CHOWN
       - DAC_OVERRIDE
       - SETGID
       - SETUID
+      - KILL
     security_opt:
       - no-new-privileges:true
     pids_limit: 512

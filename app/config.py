@@ -84,6 +84,14 @@ SETTINGS = [
          desc="Bare DV (no HDR10 base layer) shows green/purple tints on "
               "non-DV displays. 'Drop all DV' is for players that tint even "
               "on Profile 8."),
+    dict(key="HDR_DEMOTE", group="picking", type="choice", default="off",
+         choices=[("off", "Prefer HDR (HDR display)"),
+                  ("sdr-first", "Prefer SDR (SDR display / projector)")],
+         label="Display tone handling",
+         desc="HDR is graded for 1000+ nits. A screen that can't reach that "
+              "renders it dark and flat, and ExoPlayer won't tone map. "
+              "'Prefer SDR' sorts HDR below every SDR release — it is never "
+              "dropped, so an HDR-only title still plays."),
     dict(key="VERIFIED_WANT", group="picking", type="number", default="2",
          min=1, max=4, step=1, unit="",
          label="Verified streams wanted",
@@ -268,7 +276,7 @@ SETTINGS = [
          hidden=True, default="1",
          label="Download whole private torrent (100%)"),
     dict(key="PRIVATE_TRACKER_SEARCH_TIMEOUT", group="identity", type="number",
-         hidden=True, default="45", min=2, max=180,
+         hidden=True, default="120", min=2, max=180,
          label="Private search timeout"),
     dict(key="PRIVATE_TRACKER_START_TIMEOUT", group="identity", type="number",
          hidden=True, default="90", min=5, max=600,
@@ -276,6 +284,12 @@ SETTINGS = [
     dict(key="PRIVATE_TRACKER_SEARCH_TTL", group="identity", type="number",
          hidden=True, default="10800", min=60, max=86400,
          label="Private search cache TTL"),
+    dict(key="PRIVATE_TRACKER_START_HOLD", group="identity", type="number",
+         hidden=True, default="12", min=0, max=60,
+         label="Private head-start hold per request (seconds)"),
+    dict(key="PRIVATE_TRACKER_START_HOLD_TOTAL", group="identity",
+         type="number", hidden=True, default="120", min=0, max=900,
+         label="Private head-start hold across retries (seconds)"),
     # Managed by the "Sources" scraper catalog, not generic rows (hence hidden).
     # EXTRA_ADDONS carries the minted/custom addon URLs the picker races;
     # SCRAPERS records which catalog engines are enabled so the panel round-trips.
@@ -384,7 +398,7 @@ _INT_KEYS = {
     "NZB_LANE_REGISTRY_MAX", "TMDB_DIGITAL_ASSUME_DAYS",
     "OMDB_DAILY_BUDGET",
     "REPUTATION_MAX_ENTRIES", "MIN_BLOCK_SESSIONS", "TELEMETRY_MAX_BYTES",
-    "TELEMETRY_SEGMENTS", "MAX_BITRATE_MBPS",
+    "MAX_BITRATE_MBPS",
     "PROWLARR_RESOLVE_MAX", "PROWLARR_RESOLVE_CONCURRENCY", "PROWLARR_MIN_SEEDERS",
     "PRIVATE_TRACKER_CANDIDATES", "PRIVATE_TRACKER_MIN_SEEDERS",
     "PRIVATE_TRACKER_MAX_ACTIVE_DOWNLOADS", "PRIVATE_TRACKER_MIN_SOURCES",
@@ -454,6 +468,7 @@ _RETIRED_KEYS = {
     "JELLIO_URL", "JELLIO_DIRECT_PLAY", "JELLIO_ENRICH",
     "JELLIO_CACHE_TTL", "JELLIO_NEG_TTL", "JELLIO_TIMEOUT",
     "FAST_SD_BEFORE_YEAR",   # replaced by FAST_VERIFIED_GRACE (grace timer)
+    "TELEMETRY_SEGMENTS",    # telemetry moved from rotated JSONL to SQLite
 }
 
 
@@ -474,7 +489,31 @@ def _quarantine(path: str, reason: Exception | str) -> None:
                          path, reason)
 
 
-def _read(*, migrate_plaintext: bool = False) -> dict[str, str]:
+_warned: set[str] = set()
+
+
+def _warn_once(message: str) -> None:
+    if message not in _warned:
+        _warned.add(message)
+        logger.warning(message)
+
+
+def _read(*, migrate_plaintext: bool = False, quarantine: bool = True,
+          strict: bool = False) -> dict[str, str]:
+    """The store's effective, validated settings.
+
+    Entries this build cannot apply — a key it does not know, or a value it
+    cannot accept — are skipped with a warning and left *dormant* in the file
+    (see _write), never fatal. They are almost always written by a newer build:
+    booting a rollback image against a config saved by its successor used to
+    quarantine the whole file and silently restart on defaults, losing every
+    saved debrid key and indexer for the sake of one new knob.
+
+    Only an unparseable file is quarantined, and only by callers about to
+    replace or apply it (`quarantine=True`). Read-only callers — the readiness
+    probe polls this every 30 s — must never move the operator's file; with
+    `strict` they raise ValueError instead so the problem is reported.
+    """
     path = _path()
     try:
         with open(path, encoding="utf-8") as f:
@@ -488,17 +527,26 @@ def _read(*, migrate_plaintext: bool = False) -> dict[str, str]:
             if key in _RETIRED_KEYS:
                 logger.warning("config: ignoring retired setting %s", key)
                 continue
-            if not isinstance(key, str) or key not in _SPECS:
-                raise ValueError(f"unknown setting in store: {str(key)[:40]}")
+            if not isinstance(key, str):
+                raise ValueError("setting names must be strings")
             if isinstance(value, (dict, list)) or value is None:
-                raise ValueError(f"{key}: stored value must be scalar")
+                raise ValueError(f"{key[:40]}: stored value must be scalar")
+            if key not in _SPECS:
+                _warn_once(f"config: {key[:40]} is not a setting this build "
+                           "knows; left in the file, not applied")
+                continue
             raw = str(value)
             if is_secret(key):
                 if secret_store.is_encrypted(raw):
                     raw = secret_store.decrypt(key, raw, path)
                 elif raw:
                     plaintext_sensitive = True
-            norm = _normalize(_SPECS[key], raw)
+            try:
+                norm = _normalize(_SPECS[key], raw)
+            except ValueError as exc:
+                _warn_once(f"config: stored {key} is not valid for this build "
+                           f"({exc}); left in the file, not applied")
+                continue
             if norm == "" and _SPECS[key].get("type") == "number":
                 logger.warning("config: ignoring blank numeric override %s", key)
                 continue
@@ -518,20 +566,60 @@ def _read(*, migrate_plaintext: bool = False) -> dict[str, str]:
         if isinstance(exc, OSError):
             logger.error("config: cannot read %s; using environment/defaults: %s",
                          path, exc)
-        else:
+        elif quarantine:
             _quarantine(path, exc)
+        elif strict:
+            raise ValueError(f"{os.path.basename(path)} is unreadable: {exc}") from exc
+        else:
+            _warn_once(f"config: {path} is unreadable ({exc}); "
+                       "using environment/defaults")
         return {}
 
 
-def _write(store: dict[str, str]) -> None:
+def _dormant(path: str) -> dict[str, str]:
+    """Raw entries in the file that this build does not apply — unknown keys and
+    values it cannot accept — so a rewrite carries them through unchanged and a
+    later build that understands them still finds them."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    env = data.get("env") if isinstance(data, dict) else None
+    if not isinstance(env, dict):
+        return {}
+    out = {}
+    for key, value in env.items():
+        if (not isinstance(key, str) or key in _RETIRED_KEYS
+                or isinstance(value, (dict, list)) or value is None):
+            continue
+        raw = str(value)
+        if key not in _SPECS:
+            out[key] = raw
+            continue
+        if is_secret(key) and secret_store.is_encrypted(raw):
+            continue                  # readable or not, never second-guessed
+        try:
+            _normalize(_SPECS[key], raw)
+        except ValueError:
+            out[key] = raw
+    return out
+
+
+def _write(store: dict[str, str], touched: set[str] | frozenset = frozenset()
+           ) -> None:
+    """Replace the store. Dormant entries survive unless `touched` names them
+    (the operator just saved or cleared that key, which supersedes it)."""
     path = _path()
     directory = os.path.dirname(path) or "."
     os.makedirs(directory, exist_ok=True)
-    persisted = {
+    persisted = {key: value for key, value in _dormant(path).items()
+                 if key not in store and key not in touched}
+    persisted.update({
         key: (secret_store.encrypt(key, value, path)
               if value and is_secret(key) else value)
         for key, value in store.items()
-    }
+    })
     encoded = json.dumps({"env": persisted}, indent=1, sort_keys=True)
     if len(encoded.encode("utf-8")) > 256 * 1024:
         raise ValueError("configuration exceeds 256 KiB")
@@ -596,7 +684,7 @@ def running(key: str) -> str:
 def stored(key: str) -> str:
     """The raw override saved in config.json, or '' if the key isn't overridden
     (i.e. it's running on its env/code default)."""
-    return _read().get(key, "")
+    return _read(quarantine=False).get(key, "")
 
 
 def default(key: str) -> str:
@@ -606,14 +694,14 @@ def default(key: str) -> str:
 
 def pending(key: str) -> str:
     """The value the NEXT start will use: store > env > code default."""
-    store = _read()
+    store = _read(quarantine=False)
     if key in store:
         return store[key]
     return running(key)
 
 
 def restart_pending() -> bool:
-    store = _read()
+    store = _read(quarantine=False)
     return any(pending_from(store, k) != running(k) for k in _SPECS)
 
 
@@ -931,7 +1019,7 @@ def _validate_effective(store: dict[str, str]) -> dict[str, str]:
 
 def validate_pending() -> dict[str, str]:
     """Raise ValueError unless the entire next-start configuration is valid."""
-    return _validate_effective(_read())
+    return _validate_effective(_read(quarantine=False, strict=True))
 
 
 def ensure_storage() -> str:
@@ -1014,7 +1102,7 @@ def save(values: dict[str, str]) -> dict:
     # field. This catches cross-setting contradictions before restart.
     _validate_effective(store)
     if changed:
-        _write(store)
+        _write(store, touched=set(values))
     return {"changed": changed, "restart_needed": restart_pending()}
 
 
@@ -1040,5 +1128,5 @@ def clear(keys: list[str]) -> dict:
             removed.append(key)
     _validate_effective(store)
     if removed:
-        _write(store)
+        _write(store, touched=set(keys))
     return {"cleared": removed, "restart_needed": restart_pending()}

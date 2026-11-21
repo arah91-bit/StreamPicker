@@ -51,12 +51,35 @@ EASYNEWS = "easynews"
 _SOURCE_TRUST_KEY = "_source_trust"
 _NZB_TRUST_SENTINEL = object()
 
+_TORZ_MARKER = "/stremio/torz/"
+_B64URL_RE = re.compile(r"[A-Za-z0-9_-]+")
+
+
+def _torz_padded(url: str) -> str:
+    """A StremThru Torz URL with its config segment's base64 padding restored.
+
+    StremThru decodes that segment with Go's padded URL alphabet, and the
+    builders here used to strip the padding — so a saved URL whose JSON length
+    is not a multiple of 3 got HTTP 500 "illegal base64 data at input byte N"
+    on every request. Repairing it on load means a URL
+    saved by an older build works without anyone re-saving it."""
+    i = url.find(_TORZ_MARKER)
+    if i == -1:
+        return url
+    head, rest = url[:i + len(_TORZ_MARKER)], url[i + len(_TORZ_MARKER):]
+    seg, sep, tail = rest.partition("/")
+    if seg and len(seg) % 4 and _B64URL_RE.fullmatch(seg):
+        seg += "=" * (-len(seg) % 4)
+    return head + seg + sep + tail
+
+
 _BASES = {
     FAST: (os.environ.get("FAST_BASE_URL") or "").rstrip("/") or None,
     # StremThru Torz — the long-tail online source (replaced AIOStreams). Its
     # crowdsourced public hash index + TorBox cache-check answers fast (~2s) with
     # deep coverage, so it races alongside Comet in the fast lane, not just slow.
-    STREMTHRU: (os.environ.get("STREMTHRU_BASE_URL") or "").rstrip("/") or None,
+    STREMTHRU: _torz_padded(
+        (os.environ.get("STREMTHRU_BASE_URL") or "").rstrip("/")) or None,
     # Broad debrid-safe source: on-demand scrape of the public-only Prowlarr.
     # First hit for a title live-scrapes (~20s) then caches, so it feeds the
     # slow/quality build and later fast requests, not the first fast answer.
@@ -112,7 +135,7 @@ def _load_extras() -> None:
     for it in items if isinstance(items, list) else []:
         if not isinstance(it, dict):
             continue
-        base = _base_of(str(it.get("url", "")))
+        base = _torz_padded(_base_of(str(it.get("url", ""))))
         if not base.startswith(("http://", "https://")):
             continue
         name = str(it.get("name", "")).strip() or base
@@ -131,6 +154,18 @@ def _load_extras() -> None:
 
 
 _load_extras()
+
+
+_LABELS = {FAST: "Comet", STREMTHRU: "StremThru", MEDIAFUSION: "MediaFusion",
+           NZB: "Usenet", PROWLARR: "Prowlarr", EASYNEWS: "Easynews"}
+
+
+def label(source: str) -> str:
+    """The name a person knows a lane by."""
+    if source in _LABELS:
+        return _LABELS[source]
+    meta = next((m for m in EXTRA_META if m["key"] == source), None)
+    return meta["name"] if meta else str(source)
 
 
 def search_all() -> list[str]:
@@ -294,6 +329,8 @@ async def _run(key: tuple, base: str, media: str, media_id: str,
         _outcomes.pop(old, None)
     logger.info(f"shared {source} {media}/{media_id}: {len(streams)} streams "
                 f"in {time.monotonic() - t0:.1f}s")
+    telemetry.record_source_search(source, label(source), state, detail,
+                                   time.monotonic() - t0, len(streams))
     return streams
 
 
@@ -433,7 +470,17 @@ async def get(source: str, media: str, media_id: str,
         return peek(source, media, media_id) or []
     try:
         return await asyncio.wait_for(asyncio.shield(task), max(wait, 0.1))
-    except (asyncio.TimeoutError, asyncio.CancelledError):
+    except asyncio.TimeoutError:
+        return peek(source, media, media_id) or []
+    except asyncio.CancelledError:
+        # Two different events arrive as the same exception. The shared search
+        # being cancelled under us (shutdown, a reloader) is the search's
+        # business: answer with what we have. *This caller* being cancelled is
+        # not ours to swallow — doing so turned a cancelled waiter into a
+        # normal return, which defeats every timeout and shutdown above it.
+        current = asyncio.current_task()
+        if current is not None and current.cancelling():
+            raise
         return peek(source, media, media_id) or []
 
 

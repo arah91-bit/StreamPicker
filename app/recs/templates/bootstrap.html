@@ -8,6 +8,7 @@
   color-scheme:dark;
   --bg:#0d1117; --card:#161b22; --line:#262d38; --ink:#e6edf3; --dim:#8b949e;
   --yes:#3fb950; --no:#d4675e; --maybe:#6e7681; --accent:#e0a33e;
+  --save:#58a6ff;
 }
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 body{margin:0;background:var(--bg);color:var(--ink);
@@ -17,7 +18,13 @@ body{margin:0;background:var(--bg);color:var(--ink);
   padding:max(16px,env(safe-area-inset-top)) 16px
           max(16px,env(safe-area-inset-bottom));
   display:flex;flex-direction:column;gap:16px}
-header{display:flex;flex-direction:column;gap:4px}
+header{display:flex;flex-direction:column;gap:4px;margin-bottom:12px}
+/* The deck step is the flex context the card grows inside. Without this it was
+   a plain block, `.deck{flex:1}` below had nothing to take a share of, and the
+   card was pinned at its min-height with the slack collecting under the wheel
+   instead of going to the poster. `min-height:0` so a tall card can shrink
+   rather than push the wheel off a short screen. */
+#step-deck{flex:1;min-height:0;display:flex;flex-direction:column;gap:16px}
 h1{margin:0;font-size:1.35rem;letter-spacing:-.01em}
 .who{color:var(--dim);font-size:.9rem}
 .hint{color:var(--dim);font-size:.92rem;margin:0}
@@ -45,7 +52,7 @@ button.primary:disabled{background:#30363d;color:var(--dim)}
    so with `min-height:0` this collapsed to nothing and the card, being
    absolutely positioned inside it, rendered 0x0. The page looked empty while
    the API was returning a full deck. */
-.deck{position:relative;flex:1;min-height:clamp(260px,52vh,460px)}
+.deck{position:relative;flex:1;min-height:clamp(220px,46vh,480px)}
 .card{position:absolute;inset:0;background:var(--card);border:1px solid var(--line);
   border-radius:16px;overflow:hidden;display:flex;flex-direction:column}
 /* `contain`, not `cover`: a poster is the thing being judged, and cropping
@@ -56,44 +63,98 @@ button.primary:disabled{background:#30363d;color:var(--dim)}
 .info{padding:12px 14px 14px;display:flex;flex-direction:column;gap:5px}
 .t{font-weight:700;line-height:1.25}
 .sub{color:var(--dim);font-size:.85rem;display:flex;gap:8px;flex-wrap:wrap}
-.acts{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
-.acts button{padding:14px 6px;border-radius:12px;border:1px solid var(--line);
-  background:var(--card);color:var(--ink);font-size:.85rem;font-weight:600;
-  font-family:inherit;cursor:pointer;display:flex;flex-direction:column;
-  align-items:center;gap:4px}
-.acts .em{font-size:1.3rem;line-height:1}
-.acts .no{border-color:#5a2f2b;color:var(--no)}
-.acts .yes{border-color:#22562f;color:var(--yes)}
-.acts .meh{color:var(--dim)}
-.seenlbl{margin:0;font-size:.8rem;color:var(--dim);letter-spacing:.02em}
-/* Wider and quieter than the verdicts: it is the honest answer to most of a
-   deck, so it has to be the easiest thing to hit, without looking like an
-   opinion. */
-.skip{width:100%;padding:13px;border-radius:12px;border:1px dashed var(--line);
-  background:transparent;color:var(--dim);font-size:.92rem;font-weight:600;
-  font-family:inherit;cursor:pointer}
-.bar{height:5px;background:#21262d;border-radius:3px;overflow:hidden}
-.bar i{display:block;height:100%;background:var(--accent);width:0;
-  transition:width .25s}
-.count{color:var(--dim);font-size:.85rem;display:flex;
-  justify-content:space-between}
-#saved{margin:0;text-align:center;font-size:.85rem}
+/* The answer wheel.
+
+   Five stacked buttons was a column of small rectangles that pushed the poster
+   off a phone screen, and every one of them needed aiming at. A wheel is one
+   shape the thumb can learn: four quarters at up/down/left/right plus a hub,
+   each a big target in a fixed direction, so answering fast stops being a
+   matter of reading labels.
+
+   Geometry: each wedge is a full-size button clipped to a triangle from the
+   centre to two corners; the container's border-radius plus overflow:hidden
+   turns each triangle into a quarter-circle sector. clip-path takes hit
+   testing with it, so the visible shape is exactly the tappable one. */
+/* `clip-path` as well as `border-radius`, and it is not belt and braces:
+   overflow:hidden clips what gets *painted* but not what gets *hit*, so the
+   four corners outside the circle stayed tappable while looking like page
+   background. A tap there registered an answer nobody meant to give.
+   clip-path clips both. */
+.wheel{position:relative;flex:none;align-self:center;
+  width:min(74vw,32vh,270px);aspect-ratio:1;border-radius:50%;overflow:hidden;
+  clip-path:circle(50%);background:var(--card);border:1px solid var(--line)}
+.wedge{position:absolute;inset:0;border:0;font-family:inherit;font-size:.72rem;
+  font-weight:650;line-height:1.15;cursor:pointer;display:flex;padding:8px;
+  text-align:center}
+/* The two side labels sit on the horizontal midline, which is exactly where
+   the hub is, so their width is not a matter of taste: anything wider than the
+   gap between the rim and the hub gets covered by it. Measured in percentages
+   of the wheel so it holds at every size — at the smallest, "Not for me" was
+   rendering as "Not for m". */
+.wedge span{display:flex;flex-direction:column;align-items:center;gap:3px;
+  max-width:56%}
+.w-left span,.w-right span{max-width:32%}
+.wedge .em{font-size:1.3rem;line-height:1}
+.w-up{clip-path:polygon(50% 50%,0 0,100% 0);
+  align-items:flex-start;justify-content:center;
+  background:#12233a;color:var(--save)}
+.w-right{clip-path:polygon(50% 50%,100% 0,100% 100%);
+  align-items:center;justify-content:flex-end;
+  background:#132b1a;color:var(--yes)}
+.w-down{clip-path:polygon(50% 50%,100% 100%,0 100%);
+  align-items:flex-end;justify-content:center;
+  background:#1b2029;color:var(--dim)}
+.w-left{clip-path:polygon(50% 50%,0 100%,0 0);
+  align-items:center;justify-content:flex-start;
+  background:#2e1917;color:var(--no)}
+/* Two bars on the diagonals. A bar as long as the container, rotated 45° about
+   its own centre, spans the circle exactly — the circle's diameter is the
+   container's side. */
+.spoke{position:absolute;left:50%;top:0;bottom:0;width:2px;margin-left:-1px;
+  background:var(--bg);pointer-events:none;z-index:1}
+.spoke.a{transform:rotate(45deg)}
+.spoke.b{transform:rotate(-45deg)}
+.hub{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);
+  width:31%;aspect-ratio:1;border-radius:50%;z-index:2;
+  border:2px solid var(--line);background:var(--card);color:var(--dim);
+  font-family:inherit;font-size:.72rem;font-weight:650;line-height:1.1;
+  cursor:pointer;display:flex;flex-direction:column;align-items:center;
+  justify-content:center;gap:2px;padding:4px}
+.hub .em{font-size:1.15rem;line-height:1}
+.wedge:active,.hub:active{filter:brightness(1.45)}
+/* There is deliberately no progress bar, tally or standing instruction here.
+   The card and the wheel are the whole screen: the poster is what somebody is
+   judging and the wheel is how they answer, and everything else was furniture
+   competing with them for a phone-sized viewport. Counting up to a target also
+   framed the session as a chore with a finish line, which is the opposite of
+   how it wants to be used — the answers are worth having whether somebody
+   gives twelve or two hundred. Nothing is lost by not saying so: each tap is
+   saved on its own and the next card arriving is the acknowledgement. */
+/* The card leaves in the direction of the button that answered it, so the
+   gesture and the wheel teach each other. */
 @media (prefers-reduced-motion:no-preference){
   .card{transition:transform .18s ease,opacity .18s ease}
   .card.out-left{transform:translateX(-32px) rotate(-4deg);opacity:0}
   .card.out-right{transform:translateX(32px) rotate(4deg);opacity:0}
-  .card.out-up{transform:translateY(-24px);opacity:0}
+  .card.out-up{transform:translateY(-28px);opacity:0}
+  .card.out-down{transform:translateY(24px);opacity:0}
+  .card.out-fade{transform:scale(.96);opacity:0}
 }
 :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 </style></head>
 <body><div class="wrap">
 
-<header>
-  <h1>Set up your taste</h1>
-  <p class="who">for <b>__VIEWER__</b></p>
-</header>
-
 <section id="step-picks">
+  <!-- The title and the name live here rather than above both steps. On the
+       deck they were furniture stealing height from the poster; here they are
+       load-bearing, because this is the screen every visit lands on and a
+       household has one of these links per person. Somebody opening the wrong
+       one would train the wrong profile, and nothing else on the page says
+       whose it is. -->
+  <header>
+    <h1>Set up your taste</h1>
+    <p class="who">for <b>__VIEWER__</b></p>
+  </header>
   <p class="hint">Pick a few things you enjoy. This just decides what you get
     asked about next — you can change it later by opening this link again.</p>
   <p class="lbl">Genres</p>
@@ -104,26 +165,41 @@ button.primary:disabled{background:#30363d;color:var(--dim)}
 </section>
 
 <section id="step-deck" class="hide">
-  <div class="bar"><i id="fill"></i></div>
-  <div class="count"><span id="tally">No answers yet</span>
-    <span id="remain"></span></div>
   <div class="deck" id="deck"></div>
-  <p class="seenlbl">Seen it? How was it —</p>
-  <div class="acts">
-    <button class="no" data-v="disliked"><span class="em">👎</span>Not for me</button>
-    <button class="meh" data-v="seen"><span class="em">😐</span>It was fine</button>
-    <button class="yes" data-v="liked"><span class="em">👍</span>Liked it</button>
+  <div class="wheel">
+    <button class="wedge w-up" data-v="watchlist" type="button"
+      aria-label="Add to my Want to Watch list">
+      <span><span class="em">🔖</span>Want to watch</span></button>
+    <button class="wedge w-right" data-v="liked" type="button"
+      aria-label="I liked it">
+      <span><span class="em">👍</span>Liked it</span></button>
+    <button class="wedge w-down" data-v="unknown" type="button"
+      aria-label="I have never seen it">
+      <span><span class="em">🤷</span>Never seen it</span></button>
+    <button class="wedge w-left" data-v="disliked" type="button"
+      aria-label="Not for me">
+      <span><span class="em">👎</span>Not for me</span></button>
+    <i class="spoke a"></i><i class="spoke b"></i>
+    <button class="hub" data-v="seen" type="button"
+      aria-label="I have seen it and it was fine">
+      <span class="em">😐</span>It was fine</button>
   </div>
-  <button class="skip" data-v="unknown">🤷 Never seen it</button>
-  <p class="hint" id="saved">Every answer is saved as you tap — close this
-    whenever you like.</p>
 </section>
 
 </div>
 <script>
 const base = location.pathname.replace(/\/taste\/?$/, "") + "/taste/api";
+// Where the shared trailer code looks things up. Token-scoped here, seat-scoped
+// on movie night — same fragment, different authority.
+const TRAILER_BASE = base + "/trailer";
+</script>
+__TRAILER__
+<script>
 const $ = id => document.getElementById(id);
 const picked = {genres: new Set(), countries: new Set()};
+// `progress` is tracked but never rendered — nothing on this screen counts up
+// at you. It survives because the end-of-session beacon needs to know whether
+// there is anything worth rebuilding for.
 let queue = [], progress = {rated: 0}, busy = false;
 
 function chip(label, value, bucket) {
@@ -174,6 +250,14 @@ $("start").onclick = async () => {
 const dealt = new Set();
 let refilling = null;
 
+// Consecutive refills that produced nothing new. Somebody who has answered
+// hundreds of titles runs out of famous ones in their genres, and at that
+// point every refill legitimately returns nothing usable — so an empty deck
+// asking for more, on receiving more, is a loop that hammers the server for as
+// long as the tab is open. Two empty answers is enough to call it.
+let barren = 0;
+const BARREN_LIMIT = 2;
+
 function refill() {
   // Concurrent refills were their own duplicate source: running low fires one,
   // the answer handler fires another, and both ask before either has added to
@@ -185,11 +269,14 @@ function refill() {
         method: "POST", headers: {"Content-Type": "application/json"},
         body: JSON.stringify({have: [...dealt]})});
       const d = await r.json();
+      let added = 0;
       for (const c of d.cards || []) {
         if (dealt.has(c.id)) continue;
         dealt.add(c.id);
         queue.push(c);
+        added++;
       }
+      barren = added ? 0 : barren + 1;
       progress = d.progress || progress;
     } catch (e) { /* keep whatever is queued */ }
     refilling = null;
@@ -202,54 +289,52 @@ function render() {
   deck.innerHTML = "";
   const card = queue[0];
   if (!card) {
+    if (barren >= BARREN_LIMIT) {
+      deck.innerHTML = '<p class="hint">That is everything we can find for '
+        + 'now — you have been through the lot. Come back tomorrow, or open '
+        + 'this link again and pick a few more genres.</p>';
+      return;
+    }
     deck.innerHTML = '<p class="hint">Looking for more titles…</p>';
     refill().then(render);
     return;
   }
   const el = document.createElement("article");
   el.className = "card";
-  el.innerHTML = `<img alt="" loading="eager">
+  el.innerHTML = `<span class="playhint">▶ Trailer</span>
+    <img alt="" loading="eager">
     <div class="info"><div class="t"></div>
       <div class="sub"><span class="yr"></span><span class="gn"></span>
       <span class="rt"></span></div></div>`;
   const img = el.querySelector("img");
   if (card.poster) img.src = card.poster; else img.remove();
+  attachTrailer(el, card);
   el.querySelector(".t").textContent = card.title || "";
   el.querySelector(".yr").textContent = card.year || "";
   el.querySelector(".gn").textContent = (card.genres || []).join(" · ");
   el.querySelector(".rt").textContent = card.rating ? "★ " + card.rating : "";
   deck.appendChild(el);
-  tally();
   if (queue.length < 6) refill();
 }
 
-function tally() {
-  const p = progress;
-  const bits = [];
-  if (p.liked) bits.push(p.liked + " liked");
-  if (p.disliked) bits.push(p.disliked + " not for you");
-  if (p.seen) bits.push(p.seen + " just fine");
-  $("tally").textContent = bits.length ? bits.join(" · ") : "No answers yet";
-  // Only liked and not-for-me move the bar. "It was fine" and "never seen it"
-  // are both real answers and neither says which way your taste runs, so
-  // neither can be what completes the session.
-  $("remain").textContent = p.enough ? "Enough to work with 🎉"
-    : `${Math.max(0, 12 - p.rated)} more likes or dislikes`;
-  $("fill").style.width = Math.min(100, (p.rated / 12) * 100) + "%";
-  if (p.rebuilding)
-    $("saved").textContent = "Saved — your rows are rebuilding now.";
-}
+// Which way the card leaves, matched to the wedge that answered it.
+const EXITS = {liked: "out-right", disliked: "out-left",
+               watchlist: "out-up", unknown: "out-down", seen: "out-fade"};
 
 async function answer(verdict) {
   if (busy || !queue.length) return;
   busy = true;
+  // Answering is a decision about the card underneath; leaving its trailer
+  // playing over the next one is not what anybody meant.
+  closeSheet();
   const card = queue.shift();
   const el = document.querySelector(".card");
-  if (el) el.classList.add(verdict === "liked" ? "out-right"
-    : verdict === "disliked" ? "out-left" : "out-up");
+  if (el) el.classList.add(EXITS[verdict] || "out-fade");
   // "It was fine" is not a taste signal, but it is still something they have
   // seen — so it stops the title being recommended back, the same as the two
-  // verdicts that do carry a direction.
+  // verdicts that do carry a direction. "Want to watch" is not a verdict at
+  // all: the server files it in the watchlist instead, which is what stocks
+  // the row of the same name.
   try {
     const r = await fetch(base + "/verdict", {
       method: "POST", headers: {"Content-Type": "application/json"},

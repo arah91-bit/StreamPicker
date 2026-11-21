@@ -10,8 +10,9 @@ import signal
 from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel
 from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
-                               PlainTextResponse, RedirectResponse)
+                               PlainTextResponse, RedirectResponse, Response)
 
 from app import config
 
@@ -29,7 +30,9 @@ except ValueError as exc:
     raise RuntimeError(f"invalid stream-picker configuration: {exc}") from exc
 
 from app import (acquire, admin_auth, adminui, anime, connect_ui, connections,  # noqa: E402
-                 dashboard, easynews, envref, home_ui, library, meta, picker, picks_ui,
+                 dashboard, decode_health, display_caps, easynews, envref,
+                 home_ui, library, loopwatch,
+                 meta, picker, picks_ui,
                  private_trackers, private_ui, probe, prowlarr, proxy,
                  recs_mount, reputation, scrapers, source_health, source_ui,
                  sources, tbcache, telemetry, tune_ui, usenet, usenet_health,
@@ -62,6 +65,8 @@ async def _lifespan(_app: FastAPI):
     if await adminui.migrate_legacy():
         logger.info("admin: migrated explicit dashboard credentials to scrypt")
     proxy.load()
+    loopwatch.start()
+    await telemetry.startup()
     await private_trackers.startup()
     # Daily Picks runs in this process now. Its failure must not take the
     # playback path down with it: a broken recommendation build should cost
@@ -91,7 +96,8 @@ async def _lifespan(_app: FastAPI):
             ("video probe", vprobe), ("sources", sources), ("usenet", usenet),
             ("prowlarr", prowlarr), ("easynews", easynews),
             ("tbcache", tbcache), ("anime", anime),
-            ("private trackers", private_trackers),
+            ("private trackers", private_trackers), ("loop watch", loopwatch),
+            ("telemetry", telemetry),
         ):
             shutdown = getattr(module, "shutdown", None)
             if shutdown is not None:
@@ -125,6 +131,7 @@ async def _log_request(request: Request, call_next):
     # Logs the real client (Caddy forwards X-Forwarded-For) and the User-Agent
     # so we can tell which app is actually hitting which endpoint — e.g. whether
     # Nuvio is querying /slow/ at all, vs. bots hitting the bare domain.
+    loopwatch.note_request(request.method, _masked_path(request.url.path))
     resp = await call_next(request)
     resp.headers.setdefault("X-Content-Type-Options", "nosniff")
     resp.headers.setdefault("Referrer-Policy", "no-referrer")
@@ -145,13 +152,29 @@ async def _log_request(request: Request, call_next):
     # The addon secret is a path segment — mask it so logs can't leak an
     # installable addon URL.  Proxy tokens are short-lived playback capabilities
     # and must be masked for the same reason.
-    path = request.url.path.replace(SECRET, "<secret>")
-    path = re.sub(r"^/proxy/[^/]+", "/proxy/<token>", path)
-    path = re.sub(r"^/library/[^/]+", "/library/<token>", path)
-    path = re.sub(r"^/private/[^/]+", "/private/<token>", path)
+    path = _masked_path(request.url.path)
     logger.info(f'req {client} "{request.method} {path}" '
                 f'{resp.status_code} ua="{ua}"')
     return resp
+
+
+# A Daily Picks viewer's personal addon token is as installable as the shared
+# secret — it was logged in full on every catalog, manifest and stream request.
+_VIEWER_TOKEN_RE = re.compile(
+    r"^/[A-Za-z0-9_-]{16,}(?=/(?:manifest\.json|mobile/|slow/|stream/|"
+    r"playback/|catalog/|collections\.json|refresh|"
+    r"streaming-collection\.json|taste))")
+
+
+def _masked_path(path: str) -> str:
+    """A request path safe to log: no addon secret, no viewer token, no
+    playback capability."""
+    path = path.replace(SECRET, "<secret>")
+    path = _VIEWER_TOKEN_RE.sub("/<token>", path)
+    path = re.sub(r"^/proxy/[^/]+", "/proxy/<token>", path)
+    path = re.sub(r"^/library/[^/]+", "/library/<token>", path)
+    path = re.sub(r"^/private/[^/]+", "/private/<token>", path)
+    return path
 
 SLOW_NAME = os.environ.get("SLOW_ADDON_NAME", f"{ADDON_NAME} (Best Quality)")
 
@@ -313,9 +336,19 @@ async def manifest_slow_mobile(secret: str):
 
 
 async def _streams(media: str, media_id: str, profile: str, slow: bool = False,
-                   viewer: dict | None = None):
+                   viewer: dict | None = None, request: Request | None = None):
     if media not in ("movie", "series"):
         return JSONResponse({"streams": []})
+    # What the screen at the other end can render, if the player bothered to
+    # say. Absent — every stock player — this is None and picking falls back to
+    # the configured DV_REJECT / HDR_DEMOTE defaults, unchanged. Set before the
+    # pick so the background finisher inherits it along with the context.
+    caps = display_caps.parse(request.headers.get("x-display-caps")
+                              if request is not None else None)
+    display_caps.current_caps.set(caps)
+    if caps is not None:
+        logger.info(f"display caps for {media}/{media_id}: "
+                    f"{display_caps.describe(caps)}")
     # Tag every probe this request spawns with what's being watched + which
     # picker, so the telemetry log can attribute a slow source to a title.
     # `viewer` is the Daily Picks token when the request came through someone's
@@ -337,45 +370,95 @@ async def _streams(media: str, media_id: str, profile: str, slow: bool = False,
     streams = proxy.wrap(streams, media, media_id, picker_label,
                          viewer=(viewer or {}).get("name") or "",
                          viewer_key=recs_mount.viewer_key(viewer))  # → /proxy URLs
+    streams = picker.binge_groups(streams, picker_label)
     return JSONResponse({"streams": picker.clean_output(streams)})
 
 
 @app.get("/{secret}/stream/{media}/{media_id}.json")
-async def stream(secret: str, media: str, media_id: str):
+async def stream(secret: str, media: str, media_id: str, request: Request):
     # A personal addon's stream request carries that viewer's token, which is
     # the whole reason catalogs and streams had to become one addon: it is the
     # only point where a play can be tied to a person.
     viewer = await recs_mount.viewer_for(secret, SECRET)
     if viewer:
-        return await _streams(media, media_id, "full", viewer=viewer)
+        return await _streams(media, media_id, "full", viewer=viewer,
+                              request=request)
     _check(secret)
-    return await _streams(media, media_id, "full")
+    return await _streams(media, media_id, "full", request=request)
+
+
+class DecodeFailureBody(BaseModel):
+    """What one television could not play, in its own words."""
+    device: str = ""
+    vcodec: str = ""            # "h264-10bit", "av1", …
+    acodecs: list[str] = []
+    label: str = ""             # release name, for diagnosing the store later
+
+
+@app.post("/{secret}/playback/decode-failure")
+async def decode_failure(secret: str, body: DecodeFailureBody):
+    """A player reporting a format its decoder refused.
+
+    The proxy already infers rejection from traffic shape, but inference needs
+    the player to *behave* like it is rejecting — silence, or a retry loop —
+    and a hardware decoder that refuses a profile outright does neither. It
+    reads the format, fails, and stops. Nothing about that is visible from the
+    byte stream, which is why 10-bit AVC could keep being offered to a box that
+    has never once managed it.
+
+    Scoped to the reporting device: one APK now runs on several televisions and
+    what they can decode differs, so a Shield refusing High 10 AVC must not stop
+    an LG panel being offered it. Unsigned and unauthenticated beyond the addon
+    secret, deliberately — the worst a forged report can do is demote a codec
+    for one made-up device id, and a play credits it straight back.
+    """
+    if not await recs_mount.viewer_for(secret, SECRET):
+        _check(secret)
+    vcodec = (body.vcodec or "").strip().lower()[:40]
+    acodecs = [a.strip().lower()[:40] for a in (body.acodecs or []) if a.strip()][:8]
+    if not vcodec and not acodecs:
+        return {"ok": False, "reason": "nothing reported"}
+    decode_health.record_reject(acodecs, vcodec, label=(body.label or "")[:120],
+                                device=(body.device or "").strip())
+    logger.info("decode failure from device %s: v=%s a=%s (%s)",
+                (body.device or "?")[:12], vcodec or "-",
+                ",".join(acodecs) or "-", (body.label or "")[:60])
+    return {"ok": True}
 
 
 @app.get("/{secret}/mobile/stream/{media}/{media_id}.json")
-async def stream_mobile(secret: str, media: str, media_id: str):
+async def stream_mobile(secret: str, media: str, media_id: str, request: Request):
     _check(secret)
-    return await _streams(media, media_id, "mobile")
+    return await _streams(media, media_id, "mobile", request=request)
 
 
 @app.get("/{secret}/slow/stream/{media}/{media_id}.json")
-async def stream_slow(secret: str, media: str, media_id: str):
+async def stream_slow(secret: str, media: str, media_id: str, request: Request):
     viewer = await recs_mount.viewer_for(secret, SECRET)
     if viewer:
-        return await _streams(media, media_id, "full", slow=True, viewer=viewer)
+        return await _streams(media, media_id, "full", slow=True,
+                              viewer=viewer, request=request)
     _check(secret)
-    return await _streams(media, media_id, "full", slow=True)
+    return await _streams(media, media_id, "full", slow=True, request=request)
 
 
 @app.get("/{secret}/slow/mobile/stream/{media}/{media_id}.json")
-async def stream_slow_mobile(secret: str, media: str, media_id: str):
+async def stream_slow_mobile(secret: str, media: str, media_id: str,
+                             request: Request):
     _check(secret)
-    return await _streams(media, media_id, "mobile", slow=True)
+    return await _streams(media, media_id, "mobile", slow=True, request=request)
 
 
 @app.api_route("/library/{token}", methods=["GET", "HEAD"])
 async def library_playback(token: str, request: Request):
     """Opaque native-Jellyfin playback URL; credentials stay server-side."""
+    return await library.serve(token, request)
+
+
+@app.api_route("/library/{token}/master.m3u8", methods=["GET", "HEAD"])
+async def library_transcode(token: str, request: Request):
+    """The same capability for the transcode lane, spelled so that players
+    recognise HLS from the URL (see library._mint)."""
     return await library.serve(token, request)
 
 
@@ -414,7 +497,7 @@ async def dash_home(request: Request):
         # empty ledger, so the home tab walks through setup instead.
         return HTMLResponse(wizard.render())
     blocks = reputation.listing() + usenet_health.blocked_listing()
-    return HTMLResponse(home_ui.render(telemetry.load(),
+    return HTMLResponse(home_ui.render(await telemetry.load_async(),
                                        addons=_addon_links(request),
                                        blocks=blocks))
 
@@ -439,7 +522,8 @@ async def health_page(request: Request, min_n: int = 3):
     # ungated contract for container healthchecks and external monitors.
     await _admin(request)
     blocks = reputation.listing() + usenet_health.blocked_listing()
-    return HTMLResponse(dashboard.render(telemetry.load(), blocks, min_n=min_n))
+    return HTMLResponse(dashboard.render(await telemetry.load_async(), blocks,
+                                         min_n=min_n))
 
 
 @app.get("/health/source/{name:path}")
@@ -447,7 +531,7 @@ async def source_page(request: Request, name: str):
     """One source's own page. The home-page warning names a source; landing
     that link on the full health dump leaves you to find it again yourself."""
     await _admin(request)
-    return HTMLResponse(source_ui.render(name, telemetry.load()))
+    return HTMLResponse(source_ui.render(name, await telemetry.load_async()))
 
 
 @app.get("/connections")
@@ -518,7 +602,8 @@ async def admin_setup(request: Request):
 @app.get("/private-trackers")
 async def private_trackers_page(request: Request):
     await _admin(request)
-    metrics = telemetry.aggregate_private_trackers(telemetry.load())
+    metrics = telemetry.aggregate_private_trackers(
+        await telemetry.load_async(kinds=("private_tracker",)))
     return HTMLResponse(private_ui.render(metrics))
 
 
@@ -544,7 +629,8 @@ async def private_trackers_setup_page(request: Request):
 async def private_trackers_status(request: Request):
     await _admin(request)
     current = await private_trackers.status()
-    current["metrics"] = telemetry.aggregate_private_trackers(telemetry.load())
+    current["metrics"] = telemetry.aggregate_private_trackers(
+        await telemetry.load_async(kinds=("private_tracker",)))
     return current
 
 
@@ -590,7 +676,7 @@ async def private_trackers_test(request: Request):
 @app.get("/api/stats.json")
 async def stats_json(request: Request, min_n: int = 3):
     await _admin(request)
-    recs = telemetry.load()
+    recs = await telemetry.load_async()
     return {
         "records": len(recs),
         "by_source": telemetry.aggregate(recs, "src", min_n=min_n),
@@ -784,6 +870,32 @@ async def proxy_stream(token: str, request: Request):
     # No secret gate: the token itself is an unguessable capability, and the
     # player must fetch it without our addon secret.
     return await proxy.serve(token, request)
+
+
+@app.get("/proxy/{token}/standby.json")
+async def proxy_standby(token: str):
+    # The same capability as the stream itself: whoever may play it may ask
+    # what to switch to. Read by a player that wants to re-open a different
+    # copy at the same timestamp after a stall or an error.
+    answer = proxy.standby(token)
+    if answer is None:
+        return JSONResponse({"standby": []}, status_code=410,
+                            headers={"Cache-Control": "no-store"})
+    return JSONResponse(answer, headers={"Cache-Control": "no-store"})
+
+
+@app.post("/proxy/{token}/warm")
+async def proxy_warm(token: str):
+    # The same capability again: whoever may play it may ask for it to be got
+    # ready. Answers at once; the start gate, tail warm and a short read-ahead
+    # run server-side and never judge a release (see proxy.warm).
+    status, body = proxy.warm(token)
+    headers = {"Cache-Control": "no-store"}
+    if status == 204:
+        return Response(status_code=204, headers=headers)
+    if status == 429:
+        headers["Retry-After"] = str(body.get("retry_after", 30))
+    return JSONResponse(body, status_code=status, headers=headers)
 
 
 @app.api_route("/proxy/{token}/hls", methods=["GET", "HEAD"])

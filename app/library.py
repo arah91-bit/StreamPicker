@@ -6,7 +6,7 @@ matched strictly by season/episode coordinates.  No Jellio plugin is involved.
 
 Jellyfin user tokens never leave this process.  Stream rows contain an opaque,
 HMAC-signed URL on StreamPicker; :func:`serve` validates that capability and
-range-proxies the exact item/media-source while injecting ``X-Emby-Token`` on
+range-proxies the exact item/media-source while injecting the user token on
 the internal upstream request.  This preserves direct-play seeking without
 putting a Jellyfin bearer token in player URLs, logs, or proxy sessions.
 
@@ -82,9 +82,27 @@ _AUTHORIZATION = (
     f'MediaBrowser Client="StreamPicker", Device="StreamPicker Server", '
     f'DeviceId="{_DEVICE_ID}", Version="1.0"')
 
+def auth_headers(token: str) -> dict[str, str]:
+    """Headers that authenticate one request with a user access token.
+
+    The ``Authorization: MediaBrowser …, Token="…"`` form, not the legacy
+    ``X-Emby-Token`` header: newer Jellyfin (this house runs 12.x) rejects the
+    legacy header by default, and it did so silently here — the login
+    succeeded, every library query came back 401, and the native library
+    quietly contributed nothing for every title."""
+    return {"Authorization": f'{_AUTHORIZATION}, Token="{token}"'}
+
+
+# Playback bodies get a read timeout too. `read=None` meant a Jellyfin that
+# stopped sending — a NAS whose NFS mount hung, a transcoder that died — held
+# the request and its upstream connection open forever, long after the player
+# had given up. Generous, because a transcode's first segment can take a while.
+PLAYBACK_READ_TIMEOUT = 90.0
+
 _client = httpx.AsyncClient(
     follow_redirects=True,
-    timeout=httpx.Timeout(connect=TIMEOUT, read=None, write=TIMEOUT, pool=TIMEOUT),
+    timeout=httpx.Timeout(connect=TIMEOUT, read=PLAYBACK_READ_TIMEOUT,
+                          write=TIMEOUT, pool=TIMEOUT),
     headers={"User-Agent": "StreamPicker/1.0"},
 )
 _auth_lock = asyncio.Lock()
@@ -156,7 +174,7 @@ async def _api(method: str, path: str, **kwargs) -> httpx.Response:
         token, _ = await _authenticate(
             force=attempt == 1, stale_token=failed_token)
         headers = dict(kwargs.pop("headers", {}) or {})
-        headers["X-Emby-Token"] = token
+        headers.update(auth_headers(token))
         response = await _client.request(
             method, f"{JELLYFIN_URL}{path}", headers=headers,
             timeout=kwargs.pop("timeout", TIMEOUT), **kwargs)
@@ -284,6 +302,14 @@ def _mint(item_id: str, source_id: str, container: str,
     signature = _b64(hmac.new(
         _ADDON_SECRET, b"jellyfin-playback/v1/" + body.encode("ascii"),
         hashlib.sha256).digest())
+    if mode == "h":
+        # The transcode lane answers with an HLS playlist, and the URL has to
+        # say so. Players decide HLS-vs-file before fetching anything: Nuvio
+        # checks the filename and the URL for an adaptive extension, then falls
+        # back to the *filename's* extension — the original .mkv/.mpg — and
+        # opened the playlist as a Matroska file. That was the transcode that
+        # sat on the loading screen forever.
+        return f"{PUBLIC_URL}/library/{body}.{signature}/master.m3u8"
     return f"{PUBLIC_URL}/library/{body}.{signature}"
 
 
@@ -458,7 +484,7 @@ async def _open_upstream(method: str, url: str,
     for attempt in range(2):
         token, _ = await _authenticate(
             force=attempt == 1, stale_token=failed_token)
-        headers = {"X-Emby-Token": token, **request_headers}
+        headers = {**request_headers, **auth_headers(token)}
         upstream = _client.build_request(
             method, url, params=params, headers=headers)
         response = await _client.send(upstream, stream=True)
@@ -491,7 +517,7 @@ async def _open_playback(method: str, capability: dict,
 # ladder. Its playlists reference variants/segments with the access token baked
 # into every URL. We fetch the master server-side, strip the token, and rewrite
 # each URI to a signed, host-relative /library/{token}?u=…&s=… proxy URL. The
-# player only ever talks to us; we re-inject the token via X-Emby-Token when we
+# player only ever talks to us; we re-inject the token (auth_headers) when we
 # fetch upstream. The signature (ADDON_SECRET over the capability token + the
 # Jellyfin-relative path) means only URLs this process minted are fetchable, so
 # the endpoint can never be used as an open proxy.

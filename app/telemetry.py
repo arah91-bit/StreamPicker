@@ -16,15 +16,20 @@ the file size. Those are what we bucket on.
 Privacy: stream URLs carry debrid API keys, so we record only the URL's bare
 host (no path/query) plus the human labels — never the raw URL.
 
-Records are newline-delimited JSON at $TELEMETRY_DIR/probes.jsonl (one rotated
-backup). Writing is best-effort and must never break a pick.
+Records live in SQLite at $TELEMETRY_DIR/telemetry.sqlite3, one JSON document
+per row, indexed by kind and time so each dashboard reads only the kinds it
+uses. (They were newline-delimited JSON in probes.jsonl; an existing ledger is
+imported once at startup and set aside as *.migrated.) Writing is best-effort
+and must never break a pick.
 """
 
+import asyncio
 import json
 import hashlib
 import logging
 import os
 import re
+import sqlite3
 import statistics
 import threading
 import time
@@ -35,14 +40,26 @@ logger = logging.getLogger("stream-picker")
 
 ENABLED = os.environ.get("TELEMETRY", "1") not in ("0", "false", "")
 _DIR = os.environ.get("TELEMETRY_DIR", "/data")
-_PATH = os.path.join(_DIR, "probes.jsonl")
-# Total raw-telemetry budget, split into bounded segments.  A 1 GiB default
-# retains long-term evidence without making the stats endpoint read 1 GiB just
-# to return its recent window.
+_DB_PATH = os.path.join(_DIR, "telemetry.sqlite3")
+# The JSONL ledger this store replaced, and its rotated segments; imported
+# once by migrate_legacy().
+_LEGACY_PATH = os.path.join(_DIR, "probes.jsonl")
+_LEGACY_SEGMENTS = 64
+# Total telemetry budget. Kept by deleting the oldest rows a chunk at a time
+# on the write path, so it never costs one long pause.
 _MAX_BYTES = int(os.environ.get("TELEMETRY_MAX_BYTES", str(1024 * 1024 * 1024)))
-_SEGMENTS = min(64, max(2, int(os.environ.get("TELEMETRY_SEGMENTS", "8"))))
-_SEGMENT_BYTES = max(1024 * 1024, _MAX_BYTES // _SEGMENTS)
+# Identity records are parser diagnostics no dashboard reads, and they were
+# 72 % of the ledger (163k of 228k rows on the live box) — crowding probe and
+# play history out of every bounded read. They get a budget of their own.
+_IDENTITY_MAX_ROWS = 100_000
+_PRUNE_EVERY = 2000                # inserts between retention passes
+_PRUNE_CHUNK = 5000                # rows deleted per pass, at most
 _write_lock = threading.Lock()
+_conn: sqlite3.Connection | None = None
+_inserts = 0
+# The kinds a dashboard ever reads: everything but identity diagnostics.
+DASHBOARD_KINDS = ("probe", "play", "served", "buffer", "nzb_failure", "cache",
+                   "private_tracker", "tbcache", "loop_lag", "source_search")
 
 # Per-request context (media/id/picker), set once in the request handler and
 # read here; asyncio copies it into the probe tasks the request spawns.
@@ -293,38 +310,146 @@ def _base(stream: dict) -> dict:
 
 
 # ── writing ──────────────────────────────────────────────────────────────────
+def _open_writer() -> sqlite3.Connection:
+    os.makedirs(_DIR, exist_ok=True)
+    conn = sqlite3.connect(_DB_PATH, timeout=5, check_same_thread=False,
+                           isolation_level=None)
+    # auto_vacuum must be chosen before the first table exists.
+    conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("CREATE TABLE IF NOT EXISTS events ("
+                 "id INTEGER PRIMARY KEY, ts REAL NOT NULL, "
+                 "kind TEXT NOT NULL, rec TEXT NOT NULL)")
+    conn.execute("CREATE INDEX IF NOT EXISTS events_kind_ts ON events(kind, ts)")
+    conn.execute("CREATE INDEX IF NOT EXISTS events_ts ON events(ts)")
+    try:
+        os.chmod(_DB_PATH, 0o600)
+    except OSError:
+        pass
+    return conn
+
+
+def _writer() -> sqlite3.Connection:
+    global _conn
+    if _conn is None:
+        _conn = _open_writer()
+    return _conn
+
+
+def _prune(conn: sqlite3.Connection) -> None:
+    """One bounded retention pass: the identity budget, then the byte budget,
+    then hand freed pages back. Chunked so no single write pays for a purge."""
+    conn.execute(
+        "DELETE FROM events WHERE id IN (SELECT id FROM events "
+        "WHERE kind = 'identity' ORDER BY ts DESC LIMIT ? OFFSET ?)",
+        (_PRUNE_CHUNK, _IDENTITY_MAX_ROWS))
+    page = conn.execute("PRAGMA page_size").fetchone()[0]
+    pages = conn.execute("PRAGMA page_count").fetchone()[0]
+    free = conn.execute("PRAGMA freelist_count").fetchone()[0]
+    if (pages - free) * page > _MAX_BYTES:
+        conn.execute("DELETE FROM events WHERE id IN (SELECT id FROM events "
+                     "ORDER BY ts LIMIT ?)", (_PRUNE_CHUNK,))
+    conn.execute("PRAGMA incremental_vacuum(4096)")
+
+
 def _append(rec: dict) -> None:
     if not ENABLED:
         return
+    global _inserts
     try:
-        line = json.dumps(rec, separators=(",", ":")) + "\n"
+        line = json.dumps(rec, separators=(",", ":"))
         with _write_lock:
-            os.makedirs(_DIR, exist_ok=True)
-            try:
-                rotate = os.path.getsize(_PATH) + len(line.encode()) > _SEGMENT_BYTES
-            except FileNotFoundError:
-                rotate = False
-            if rotate:
-                oldest = f"{_PATH}.{_SEGMENTS - 1}"
-                try:
-                    os.remove(oldest)
-                except FileNotFoundError:
-                    pass
-                for i in range(_SEGMENTS - 2, 0, -1):
-                    src, dst = f"{_PATH}.{i}", f"{_PATH}.{i + 1}"
-                    try:
-                        os.replace(src, dst)
-                    except FileNotFoundError:
-                        pass
-                try:
-                    os.replace(_PATH, _PATH + ".1")
-                except FileNotFoundError:
-                    pass
-            with open(_PATH, "a") as f:
-                f.write(line)
-            os.chmod(_PATH, 0o600)
+            conn = _writer()
+            conn.execute("INSERT INTO events (ts, kind, rec) VALUES (?, ?, ?)",
+                         (float(rec.get("ts") or time.time()),
+                          str(rec.get("kind") or ""), line))
+            _inserts += 1
+            if _inserts % _PRUNE_EVERY == 0:
+                _prune(conn)
     except Exception:
         logger.debug("telemetry write failed", exc_info=True)
+
+
+_TS_RE = re.compile(rb'"ts":\s*([0-9.]+)')
+_KIND_RE = re.compile(rb'"kind":\s*"([a-z_]+)"')
+
+
+def migrate_legacy() -> int:
+    """Import the JSONL ledger (oldest segment first) into the database once,
+    then set each file aside as *.migrated. Returns the rows imported. Safe to
+    run beside live writes: it commits in small batches, and readers order by
+    each record's own timestamp, not insertion order."""
+    paths = [f"{_LEGACY_PATH}.{i}" for i in range(_LEGACY_SEGMENTS, 0, -1)]
+    paths = [p for p in paths + [_LEGACY_PATH] if os.path.exists(p)]
+    if not paths or not ENABLED:
+        return 0
+    conn = _open_writer()
+    imported = 0
+    try:
+        for path in paths:
+            batch: list[tuple[float, str, str]] = []
+
+            def flush() -> None:
+                conn.execute("BEGIN")
+                conn.executemany(
+                    "INSERT INTO events (ts, kind, rec) VALUES (?, ?, ?)", batch)
+                conn.execute("COMMIT")
+                batch.clear()
+
+            with open(path, "rb") as f:
+                for raw in f:
+                    raw = raw.strip()
+                    ts, kind = _TS_RE.search(raw), _KIND_RE.search(raw)
+                    if not raw or ts is None:
+                        continue
+                    try:
+                        text = raw.decode("utf-8")
+                    except UnicodeDecodeError:
+                        continue
+                    batch.append((float(ts.group(1)),
+                                  kind.group(1).decode() if kind else "", text))
+                    if len(batch) >= 5000:
+                        imported += len(batch)
+                        flush()
+            if batch:
+                imported += len(batch)
+                flush()
+            os.replace(path, path + ".migrated")
+        while conn.execute("SELECT COUNT(*) FROM events WHERE kind = 'identity'"
+                           ).fetchone()[0] > _IDENTITY_MAX_ROWS:
+            _prune(conn)
+        logger.info("telemetry: imported %d records from %d JSONL file(s) into "
+                    "%s; the originals are kept as *.migrated", imported,
+                    len(paths), _DB_PATH)
+    finally:
+        conn.close()
+    return imported
+
+
+_migration: asyncio.Task | None = None
+
+
+async def startup() -> None:
+    """Start the one-time JSONL import in a worker thread, off the loop."""
+    global _migration
+    if _migration is None and ENABLED and os.path.exists(_LEGACY_PATH):
+        _migration = asyncio.create_task(asyncio.to_thread(migrate_legacy))
+
+
+async def shutdown() -> None:
+    global _conn
+    if _migration is not None and not _migration.done():
+        try:
+            await asyncio.wait_for(asyncio.shield(_migration), 30)
+        except Exception:
+            pass
+    with _write_lock:
+        if _conn is not None:
+            try:
+                _conn.close()
+            finally:
+                _conn = None
 
 
 def record(stream: dict, result) -> None:
@@ -370,50 +495,86 @@ def record_served(stream: dict) -> None:
 
 
 # ── reading / aggregation (for the /stats dashboard) ─────────────────────────
-def _tail_lines(path: str, limit: int) -> list[bytes]:
-    """Read at most the last `limit` lines without scanning a large segment."""
-    if limit <= 0:
+def load(limit: int = 300_000, kinds: tuple[str, ...] = (),
+         since: float | None = None) -> list[dict]:
+    """The newest `limit` records, returned in chronological order. Blocking —
+    dashboards call load_async(). `kinds` and `since` (a wall-clock cutoff)
+    are answered by the index, so a page reads only what it renders."""
+    if limit <= 0 or not os.path.exists(_DB_PATH):
+        return []
+    where, args = [], []
+    if kinds:
+        where.append(f"kind IN ({','.join('?' * len(kinds))})")
+        args.extend(kinds)
+    if since is not None:
+        where.append("ts >= ?")
+        args.append(float(since))
+    sql = ("SELECT rec FROM events"
+           + (" WHERE " + " AND ".join(where) if where else "")
+           + " ORDER BY ts DESC, id DESC LIMIT ?")
+    try:
+        # A plain connection used only to read: a URI read-only open of a WAL
+        # database fails whenever its -shm file has not been created yet.
+        conn = sqlite3.connect(_DB_PATH, timeout=5)
+    except sqlite3.Error:
         return []
     try:
-        with open(path, "rb") as f:
-            f.seek(0, os.SEEK_END)
-            pos = f.tell()
-            chunks: list[bytes] = []
-            newlines = 0
-            while pos > 0 and newlines <= limit:
-                n = min(64 * 1024, pos)
-                pos -= n
-                f.seek(pos)
-                chunk = f.read(n)
-                chunks.append(chunk)
-                newlines += chunk.count(b"\n")
-        return b"".join(reversed(chunks)).splitlines()[-limit:]
-    except FileNotFoundError:
+        rows = conn.execute(sql, (*args, int(limit))).fetchall()
+    except sqlite3.Error:
+        logger.debug("telemetry read failed", exc_info=True)
         return []
-
-
-def load(limit: int = 300_000) -> list[dict]:
-    if limit <= 0:
-        return []
-    # Newest file first while collecting, then reverse the file groups so the
-    # returned records remain chronological.
-    groups: list[list[bytes]] = []
-    remaining = limit
-    for p in [_PATH] + [f"{_PATH}.{i}" for i in range(1, _SEGMENTS)]:
-        lines = _tail_lines(p, remaining)
-        if lines:
-            groups.append(lines)
-            remaining -= len(lines)
-        if remaining <= 0:
-            break
+    finally:
+        conn.close()
     recs: list[dict] = []
-    for lines in reversed(groups):
-        for line in lines:
-            try:
-                recs.append(json.loads(line))
-            except Exception:
-                pass
-    return recs[-limit:]
+    for (text,) in reversed(rows):
+        try:
+            recs.append(json.loads(text))
+        except ValueError:
+            continue
+    return recs
+
+
+# Dashboard reads parse the retained ledger: ~230k JSON lines, 2.5-3.8 s of CPU
+# measured against the live store. Inline, that froze every stream in the
+# process for the duration — one event loop serves them all — and the pages
+# that read it refresh themselves: Home every 30 s while something is playing,
+# the Private Trackers status every 10 s. So: parse in a worker thread, share
+# one parse between concurrent callers, and reuse an *expensive* parse for
+# LOAD_TTL. A dashboard a minute stale costs nothing; a frozen stream does. A
+# cheap parse (a small store, every test) is never reused, so it is always
+# exact.
+LOAD_TTL = float(os.environ.get("TELEMETRY_LOAD_TTL", "60"))
+_LOAD_REUSE_COST = 0.25            # seconds of parsing worth remembering
+_load_cache: dict[tuple, tuple[float, list[dict]]] = {}
+_load_inflight: dict[tuple, asyncio.Task] = {}
+
+
+async def load_async(limit: int = 300_000,
+                     kinds: tuple[str, ...] = DASHBOARD_KINDS,
+                     since: float | None = None) -> list[dict]:
+    """load(), off the event loop, single-flight, cached when expensive.
+    Defaults to the kinds a dashboard reads (no identity diagnostics).
+
+    The returned list is shared with other callers: treat it as read-only."""
+    key = (limit, tuple(sorted(kinds)), since)
+    hit = _load_cache.get(key)
+    if hit is not None and time.monotonic() - hit[0] < LOAD_TTL:
+        return hit[1]
+    task = _load_inflight.get(key)
+    if task is None:
+        async def parse() -> list[dict]:
+            t0 = time.monotonic()
+            recs = await asyncio.to_thread(load, limit, kinds, since)
+            if time.monotonic() - t0 >= _LOAD_REUSE_COST:
+                _load_cache[key] = (time.monotonic(), recs)
+            else:
+                _load_cache.pop(key, None)
+            return recs
+
+        task = asyncio.create_task(parse())
+        _load_inflight[key] = task
+        task.add_done_callback(lambda _t, key=key: _load_inflight.pop(key, None))
+    return await asyncio.shield(task)
 
 
 def aggregate_usenet_failures(recs: list[dict], limit: int = 200) -> list[dict]:
@@ -503,10 +664,12 @@ def add_play_sink(sink) -> None:
 def record_play(entry: dict, cand: dict, idx: int, *, served: int, dur: float,
                 ttfb: float, reconnects: int, reason: str, net: dict | None = None,
                 session: str = "", up_mbps: float | None = None,
-                slow: bool = False) -> None:
+                slow: bool = False, waits: dict | None = None) -> None:
     """One record per actual playback through the proxy — real delivery to the
     device: which candidate served (idx>0 = we auto-switched), throughput, how
-    it ended, how much got watched, and the delivery node it came from."""
+    it ended, how much got watched, and the delivery node it came from.
+    `waits` (waits / wait_secs / max_wait) is how long the player sat waiting
+    on *us* for bytes — the server's share of any buffering it saw."""
     size = cand.get("size")
     net = net or {}
     rec = {
@@ -544,6 +707,9 @@ def record_play(entry: dict, cand: dict, idx: int, *, served: int, dur: float,
         "pos": int(entry.get("pos") or 0) + int(served or 0),
         "total": entry.get("total") or size,
     }
+    if waits and waits.get("waits"):
+        rec.update({k: waits[k] for k in ("waits", "wait_secs", "max_wait")
+                    if k in waits})
     _append(rec)
     for sink in _play_sinks:
         try:
@@ -643,6 +809,33 @@ def aggregate_private_trackers(recs: list[dict]) -> dict:
         })
     return {"events": events, "bytes_added": bytes_added,
             "recent": recent[-30:]}
+
+
+def record_source_search(source: str, label: str, state: str, detail: str,
+                         seconds: float, count: int) -> None:
+    """One upstream search: which lane, how it ended, how long, how many rows.
+
+    A lane that fails every *search* returns nothing to probe, so the probe
+    ledger never saw it and Home never flagged it: StremThru answered HTTP 500
+    to every request for three days (2026-10) while every pick quietly went
+    without it."""
+    ctx = request_ctx.get()
+    _append({"ts": round(time.time(), 1), "kind": "source_search",
+             "source": str(source or "")[:60], "label": str(label or "")[:60],
+             "state": re.sub(r"[^a-z_]", "", (state or "").lower())[:20],
+             "detail": sanitize_failure_detail(detail or "", 160),
+             "secs": round(max(0.0, float(seconds)), 2),
+             "count": max(0, int(count or 0)),
+             "id": str(ctx.get("media_id", ""))[:80]})
+
+
+def record_loop_lag(lag: float, suspects: list[str]) -> None:
+    """One event-loop stall: how long every stream in the process was frozen,
+    and the requests that began just before it (see app.loopwatch)."""
+    _append({"ts": round(time.time(), 1), "kind": "loop_lag",
+             "seconds": round(max(0.0, float(lag)), 3),
+             "suspects": [re.sub(r"[^A-Za-z0-9 /._:?=&<>-]", "", str(x))[:120]
+                          for x in (suspects or [])][:5]})
 
 
 def record_cache_event(event: str, *, target_id: str = "",

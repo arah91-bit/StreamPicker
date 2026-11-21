@@ -31,6 +31,13 @@ and bitrate. Only candidates that pass get served — and the #1 result is a
 link that has *already proven it plays*. That's the whole trick behind the
 99.9%.
 
+**It never answers with a placeholder.** Players like Nuvio auto-play the
+first stream either addon returns, so a "still checking…" splash would be
+played instead of the film. Until something has proven it plays, an addon
+returns nothing and keeps verifying in the background; the next open gets the
+verified answer. "Nothing found" is said only once every source — private
+trackers included — has come back empty.
+
 **Two addons, one search.**
 
 - The **fast picker** answers in about 4 seconds on average, with results
@@ -87,8 +94,16 @@ streams in any setup, and a lot of work went into them specifically:
 that rejection is remembered and matching releases get demoted — for that
 device — instead of being offered again. Same for bare Dolby Vision
 profiles that tint green/purple on non-DV screens, and releases with
-burned-in hardcoded subs. An audio-language gate demotes releases whose
-only audio is neither English nor the title's original language.
+burned-in hardcoded subs — recognised from the name, and for a foreign-language
+title from the file itself: a release with no switchable subtitle track (read
+from an MP4's end-of-file index when that is where it keeps it) ranks below
+every one that has them, and the fast race keeps looking for a clean copy
+rather than stopping on a burned-in 4K. An audio-language gate puts releases whose
+only audio is neither English nor the title's original language at the very
+bottom (a French-only dub of an English kids' show plays only if nothing else
+exists), and the fast race keeps looking rather than stopping on one. For a
+foreign-language title subtitles are ranked too: switchable subtitles, then
+none, then burned in.
 
 **It fills its own gaps.** If nothing playable exists anywhere:
 

@@ -253,6 +253,23 @@ host, uncomment the `networks:` blocks in `docker-compose.yml` and set the name
 to that project's network (`docker network ls`). Otherwise give the dashboard
 a reachable URL for each service.
 
+## AI Search in Daily Picks
+
+When enabled with `AI_SEARCH_ENABLED=true`, the search-only **AI Search** catalog
+accepts plain-English movie and TV requests. A local Ollama model interprets
+uncertain titles and topics; TMDB search and Discover establish candidate
+identity, dates, genres, and related titles. Exact release dates, explicit
+movie/TV requests, and exclusions remain filters across retrieval paths.
+The catalog resolves each result through the existing age, adult-content,
+IMDb-ID, and home-release checks before returning it.
+
+Broad category searches use multiple TMDB pages and can backfill after
+unavailable titles are removed. Remembered years are clues unless the request
+explicitly requires a release year. If Ollama is unavailable, deterministic
+interpretation still handles clear titles, years, decades, and genres. Search
+results are cached per query, age policy, model, and pipeline version. Config
+changes loaded at startup require the normal service restart.
+
 ## Notes
 
 - `ADDON_SECRET` gates addon installation and is not accepted as the dashboard

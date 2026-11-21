@@ -166,7 +166,7 @@ async def _search(query: str) -> list[dict]:
 
 def _candidates(results: list[dict], titles: list[str],
                 season_episode: tuple[int, int] | None,
-                year: int | None = None) -> list[dict]:
+                year: int | frozenset[int] | None = None) -> list[dict]:
     """Torrent releases with a hash whose title matches the requested one (and
     episode, for a series), best-first by seeders then size. The title gate is
     the same one the usenet lane relies on to never play wrong content."""
@@ -325,7 +325,8 @@ async def streams(media: str, media_id: str) -> list[dict]:
         _record(media, media_id, "failed", type(e).__name__)
         return []
 
-    cands = _candidates(results, titles, season_episode, year)
+    cands = _candidates(results, titles, season_episode,
+                        await usenet._accepted_years(media, media_id, year))
     if not cands:
         _record(media, media_id, "empty", "no matching torrents")
         return []

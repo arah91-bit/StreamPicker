@@ -101,6 +101,14 @@ def summarize(name: str, recs: list[dict]) -> dict:
     reasons = collections.Counter(
         (r.get("reason") or r.get("err") or "unknown") for r in probes
         if not r.get("ok"))
+    # The lane's own searches, when this name is a lane: a search that fails
+    # leaves nothing to probe, so without these the page would show no errors
+    # for a source that answers none of its requests.
+    searches = [r for r in recs if r.get("kind") == "source_search"
+                and (r.get("label") or "") == name]
+    failed_searches = [r for r in searches if r.get("state") == "failed"]
+    reasons.update(f"search: {r.get('detail') or 'failed'}"
+                   for r in failed_searches)
     return {
         "name": name,
         "probes": len(probes),
@@ -111,6 +119,8 @@ def summarize(name: str, recs: list[dict]) -> dict:
         "last_ts": max(stamps) if stamps else 0,
         "last_ok_ts": max((r.get("ts") or 0 for r in ok), default=0),
         "reasons": reasons.most_common(8),
+        "searches": len(searches),
+        "searches_failed": len(failed_searches),
         "history": sorted(probes, key=lambda r: r.get("ts") or 0,
                           reverse=True)[:HISTORY_ROWS],
         "addon": addon_for(name, recs),
@@ -121,7 +131,12 @@ def summarize(name: str, recs: list[dict]) -> dict:
 
 def _facts(s: dict, now: float) -> str:
     fail_class = "bad" if s["fail_pct"] >= 50 else "ok" if s["probes"] else ""
-    tiles = [
+    tiles = []
+    if s.get("searches"):
+        tiles.append(("searches failed",
+                      f"{s['searches_failed']}/{s['searches']}",
+                      "bad" if s["searches_failed"] == s["searches"] else ""))
+    tiles += [
         ("probes", str(s["probes"]), ""),
         ("failed", f"{s['fail_pct']}%", fail_class),
         ("last tried", _ago(s["last_ts"], now), ""),

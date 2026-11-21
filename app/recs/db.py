@@ -4,6 +4,7 @@ data can never be read while serving another user's request."""
 import asyncio
 import hashlib
 import json
+import logging
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -11,6 +12,8 @@ from typing import Any
 import aiosqlite
 
 from app.recs import config
+
+logger = logging.getLogger("nuvio-recs")
 
 _conn: aiosqlite.Connection | None = None
 
@@ -52,6 +55,18 @@ CREATE TABLE IF NOT EXISTS recommendation_exposure (
 );
 CREATE INDEX IF NOT EXISTS idx_recommendation_exposure_recent
     ON recommendation_exposure (user_token, last_shown_at);
+-- Top Picks turns: how many days a viewer has actually seen a title near the
+-- front of the row, and when it may come back after resting. Days are local
+-- dates on which the row was delivered, so a viewer who does not open the app
+-- uses up nothing.
+CREATE TABLE IF NOT EXISTS top_picks_turns (
+    user_token TEXT NOT NULL,
+    imdb_id TEXT NOT NULL,
+    seen_days INTEGER NOT NULL DEFAULT 0,
+    last_seen_day TEXT,
+    rested_until INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (user_token, imdb_id)
+);
 -- Plays observed through this service's own addon. This is the successor to
 -- Trakt as a history source: Trakt limits a free account to one connected
 -- application, and that slot is wanted for the client's own sync, so the
@@ -123,6 +138,52 @@ CREATE TABLE IF NOT EXISTS taste_feedback (
 CREATE INDEX IF NOT EXISTS idx_taste_feedback_user
     ON taste_feedback (user_token, verdict);
 
+-- "Want to watch": a title somebody saved for later, and the backing store of
+-- the row of the same name.
+--
+-- Deliberately not a fifth verdict in `taste_feedback`. That table holds one
+-- directional claim per title and replaces on conflict, so a save would be
+-- destroyed the moment the same title was later rated — which is precisely the
+-- moment it matters most. And every reader of it treats a row as "they have
+-- seen this, keep it out of the recommendations", which is the exact opposite
+-- of what a save means. This is the only thing in the system that says "put
+-- this in front of me again".
+--
+-- Trakt used to be the one source of a watchlist, and it went with Trakt. This
+-- is the replacement, owned here.
+CREATE TABLE IF NOT EXISTS taste_watchlist (
+    user_token TEXT NOT NULL,
+    imdb_id TEXT NOT NULL,
+    media_type TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'bootstrap',
+    added_at INTEGER NOT NULL,
+    PRIMARY KEY (user_token, imdb_id)
+);
+CREATE INDEX IF NOT EXISTS idx_taste_watchlist_user
+    ON taste_watchlist (user_token, added_at DESC);
+
+-- Cards the bootstrapper has put on screen, answered or not.
+--
+-- The verdicts already stop an *answered* title coming back. This stops an
+-- unanswered one coming back, which is a different and more visible problem: a
+-- deck is dealt 24 at a time and most sessions answer a handful, so on the
+-- next visit the other twenty were the first thing offered again. The client
+-- tracks what it holds and sends it back, but that lives in a page variable —
+-- one reload, one phone deciding to reclaim a background tab, and it is gone.
+--
+-- Deliberately expiring (TASTE_DEALT_HOURS) rather than permanent: a title
+-- somebody was shown and did not answer is still a perfectly good question,
+-- and a heavy rater would otherwise exhaust the pool of famous titles and be
+-- left with an empty deck for good.
+CREATE TABLE IF NOT EXISTS taste_dealt (
+    user_token TEXT NOT NULL,
+    imdb_id TEXT NOT NULL,
+    dealt_at INTEGER NOT NULL,
+    PRIMARY KEY (user_token, imdb_id)
+);
+CREATE INDEX IF NOT EXISTS idx_taste_dealt_user
+    ON taste_dealt (user_token, dealt_at);
+
 -- Movie night. A shared deck several people vote on at once, ending the
 -- moment one title has a yes from everybody.
 --
@@ -137,7 +198,12 @@ CREATE TABLE IF NOT EXISTS match_sessions (
     seats INTEGER NOT NULL,
     playlist TEXT NOT NULL,
     winner_imdb TEXT,
-    winner_at INTEGER
+    winner_at INTEGER,
+    -- The age ceiling the pool was built under. Stored because the pool is no
+    -- longer built once: it is topped up mid-session from what the room votes
+    -- for, and a top-up that could not see this would happily post adult
+    -- titles into a children's movie night.
+    kid_age INTEGER
 );
 CREATE TABLE IF NOT EXISTS match_seats (
     session_id TEXT NOT NULL,
@@ -339,6 +405,12 @@ MIGRATIONS = [
     "ALTER TABLE users ADD COLUMN streaming_catalogs_row INTEGER NOT NULL DEFAULT 0",
     # Asian Dramas, formerly its own shared-secret addon and container.
     "ALTER TABLE users ADD COLUMN asian_dramas_row INTEGER NOT NULL DEFAULT 0",
+    # Which streaming services this viewer's rows cover, as a CSV of provider
+    # ids. NULL means "all of them" — the behaviour before the per-provider
+    # switches existed, and therefore what every existing profile keeps until
+    # someone unticks one. An empty string is a real answer ("none"), which is
+    # why this is nullable rather than defaulted to the full list.
+    "ALTER TABLE users ADD COLUMN streaming_providers TEXT",
     # Resume position, added after the table shipped with delivered-bytes only.
     "ALTER TABLE play_history ADD COLUMN position_bytes INTEGER",
     "ALTER TABLE play_history ADD COLUMN total_bytes INTEGER",
@@ -362,6 +434,16 @@ MIGRATIONS = [
     # and then rated nothing.
     "ALTER TABLE users ADD COLUMN bootstrap_genres TEXT",
     "ALTER TABLE users ADD COLUMN bootstrap_countries TEXT",
+    # The "Want to Watch" row. On by default, unlike the other two live rows:
+    # those put the viewer's own backlog on top of a surface they did not ask
+    # for, whereas this one only ever holds titles somebody explicitly saved.
+    # An empty watchlist renders as no row at all, so defaulting it on costs
+    # nothing to a profile that never uses it.
+    "ALTER TABLE users ADD COLUMN watchlist_row INTEGER NOT NULL DEFAULT 1",
+    # The age ceiling a movie night was built under. Needed now that the pool
+    # is topped up mid-session rather than chosen once: a top-up that cannot
+    # see this would post adult titles into a children's session.
+    "ALTER TABLE match_sessions ADD COLUMN kid_age INTEGER",
 ]
 
 # Applied before SCHEMA, unlike MIGRATIONS. `CREATE TABLE IF NOT EXISTS` would
@@ -433,6 +515,54 @@ async def init() -> None:
     if migration.rowcount:
         await _conn.execute("DELETE FROM recommendation_exposure")
     await _conn.commit()
+    # Top Picks turns start from what was really delivered, not from zero:
+    # otherwise titles already in the front of the row for weeks would get a
+    # full turn more on the day this ships.
+    migration = await _conn.execute(
+        "INSERT INTO storage_migrations (id, applied_at) VALUES (?,?)"
+        " ON CONFLICT(id) DO NOTHING",
+        ("top-picks-turns-from-deliveries-v1", int(time.time())),
+    )
+    await _conn.commit()
+    if migration.rowcount:
+        await backfill_top_picks_turns()
+
+
+async def backfill_top_picks_turns(top_picks_id: str = "nr-top-picks") -> int:
+    """Replay recent Top Picks deliveries into the turn ledger, in order.
+
+    Each delivery counts its generation's front cards for that delivery's
+    local day, exactly as serving does now. Returns the deliveries replayed.
+    """
+    now = int(time.time())
+    cutoff = now - (config.TOP_PICKS_REST_DAYS + 7) * 86400
+    async with conn().execute(
+        "SELECT user_token, requested_at, generation_id"
+        " FROM recommendation_deliveries"
+        " WHERE catalog_id=? AND requested_at>=? AND generation_id IS NOT NULL"
+        " ORDER BY requested_at",
+        (top_picks_id, cutoff),
+    ) as cur:
+        deliveries = [tuple(r) for r in await cur.fetchall()]
+    fronts: dict[int, list[str]] = {}
+    for user_token, requested_at, generation_id in deliveries:
+        if generation_id not in fronts:
+            async with conn().execute(
+                "SELECT content_id FROM recommendation_generation_items"
+                " WHERE generation_id=? AND catalog_id=? AND item_position<?"
+                " AND content_id IS NOT NULL ORDER BY item_position",
+                (generation_id, top_picks_id, config.TOP_PICKS_SEEN_POSITIONS),
+            ) as cur:
+                fronts[generation_id] = [r[0] for r in await cur.fetchall()]
+        await record_top_picks_seen(
+            user_token, fronts[generation_id],
+            day=datetime.fromtimestamp(requested_at).date().isoformat(),
+            now=requested_at, turn_days=config.TOP_PICKS_TURN_DAYS,
+            rest_days=config.TOP_PICKS_REST_DAYS)
+    if deliveries:
+        logger.info("top picks: replayed %d past deliveries into the turn ledger",
+                    len(deliveries))
+    return len(deliveries)
 
 
 async def close() -> None:
@@ -473,7 +603,8 @@ async def update_kid(token: str, is_kid: bool, kid_age: int | None,
 
 
 WATCHING_ROW_COLUMNS = ("continue_watching_row", "watch_history_row",
-                        "streaming_catalogs_row", "asian_dramas_row")
+                        "watchlist_row", "streaming_catalogs_row",
+                        "asian_dramas_row")
 
 
 async def update_watching_row(token: str, column: str, enabled: bool) -> None:
@@ -485,6 +616,33 @@ async def update_watching_row(token: str, column: str, enabled: bool) -> None:
     await conn().execute(f"UPDATE users SET {column}=? WHERE token=?",
                          (int(enabled), token))
     await conn().commit()
+
+
+async def update_streaming_providers(token: str,
+                                     provider_ids: list[str] | None) -> None:
+    """Set which streaming services one viewer's collection carries.
+
+    `None` restores the default of every service, and is stored as NULL rather
+    than as the full list so a provider added to the catalogue later is picked
+    up by everyone who never expressed a preference.
+    """
+    value = None if provider_ids is None else ",".join(provider_ids)
+    await conn().execute(
+        "UPDATE users SET streaming_providers=? WHERE token=?", (value, token))
+    await conn().commit()
+
+
+async def is_new_title(viewer_key: str, imdb_id: str, played_at: int,
+                       min_seconds: float) -> bool:
+    """True when nothing before ``played_at`` says this viewer already knew
+    the title: no earlier play that ran ``min_seconds`` and no imported one.
+    Index reads and false starts (a few seconds, or none) do not count."""
+    async with conn().execute(
+        "SELECT 1 FROM play_history WHERE viewer_key=? AND imdb_id=?"
+        " AND played_at<? AND (seconds>=? OR picker='trakt-import') LIMIT 1",
+        (viewer_key, imdb_id, int(played_at), float(min_seconds)),
+    ) as cur:
+        return await cur.fetchone() is None
 
 
 async def record_play(event: dict) -> None:
@@ -601,6 +759,8 @@ async def delete_user(token: str) -> None:
     await conn().execute("DELETE FROM catalogs WHERE user_token=?", (token,))
     await conn().execute(
         "DELETE FROM recommendation_exposure WHERE user_token=?", (token,))
+    await conn().execute(
+        "DELETE FROM top_picks_turns WHERE user_token=?", (token,))
     await conn().execute("DELETE FROM users WHERE token=?", (token,))
     await conn().commit()
 
@@ -760,6 +920,79 @@ async def replace_catalogs(
     except Exception:
         await conn().rollback()
         raise
+
+
+async def record_top_picks_seen(user_token: str, imdb_ids: list[str], *,
+                                day: str, now: int | None = None,
+                                turn_days: int, rest_days: int) -> list[str]:
+    """Count one viewing day for each title seen at the front of Top Picks.
+
+    Called on every delivery of the row, so it must be cheap and idempotent
+    within a day: a title already counted for ``day`` is not counted again,
+    and a title resting is not counted at all (the row it sits in predates
+    its rest and has not been rebuilt yet). A title that completes its
+    ``turn_days``-th day starts resting for ``rest_days``. Returns the titles
+    that started resting.
+    """
+    if not imdb_ids:
+        return []
+    at = int(time.time()) if now is None else int(now)
+    wanted = list(dict.fromkeys(i for i in imdb_ids if i))
+    marks = ",".join("?" * len(wanted))
+    async with conn().execute(
+        "SELECT imdb_id, seen_days, last_seen_day, rested_until FROM top_picks_turns"
+        f" WHERE user_token=? AND imdb_id IN ({marks})",
+        (user_token, *wanted),
+    ) as cur:
+        known = {r["imdb_id"]: r for r in await cur.fetchall()}
+    rested: list[str] = []
+    writes: list[tuple] = []
+    for imdb_id in wanted:
+        row = known.get(imdb_id)
+        if row is not None and row["rested_until"] > at:
+            continue
+        if row is not None and row["last_seen_day"] == day:
+            continue
+        # A rest that has run out starts a fresh turn.
+        seen = (row["seen_days"] if row is not None and not row["rested_until"]
+                else 0) + 1
+        rested_until = 0
+        if seen >= turn_days:
+            rested_until = at + rest_days * 86400
+            seen = 0
+            rested.append(imdb_id)
+        writes.append((user_token, imdb_id, seen, day, rested_until))
+    if writes:
+        await conn().executemany(
+            "INSERT INTO top_picks_turns"
+            " (user_token, imdb_id, seen_days, last_seen_day, rested_until)"
+            " VALUES (?,?,?,?,?)"
+            " ON CONFLICT(user_token, imdb_id) DO UPDATE SET"
+            " seen_days=excluded.seen_days, last_seen_day=excluded.last_seen_day,"
+            " rested_until=excluded.rested_until",
+            writes,
+        )
+        await conn().commit()
+    return rested
+
+
+async def top_picks_turns(user_token: str, now: int | None = None
+                          ) -> tuple[dict[str, int], dict[str, int]]:
+    """(titles resting -> rested_until, titles mid-turn -> days seen)."""
+    at = int(time.time()) if now is None else int(now)
+    resting: dict[str, int] = {}
+    seen: dict[str, int] = {}
+    async with conn().execute(
+        "SELECT imdb_id, seen_days, rested_until FROM top_picks_turns"
+        " WHERE user_token=?",
+        (user_token,),
+    ) as cur:
+        for r in await cur.fetchall():
+            if r["rested_until"] > at:
+                resting[r["imdb_id"]] = r["rested_until"]
+            elif r["seen_days"] and not r["rested_until"]:
+                seen[r["imdb_id"]] = r["seen_days"]
+    return resting, seen
 
 
 async def get_recently_shown(user_token: str, days: int = 14) -> dict[str, int]:
@@ -1499,6 +1732,95 @@ async def feedback_counts(user_token: str) -> dict[str, int]:
         return {r["verdict"]: r["n"] for r in await cur.fetchall()}
 
 
+# ── want to watch (saved titles, the one "show me this again" signal) ────
+
+async def add_to_watchlist(user_token: str, imdb_id: str, media_type: str,
+                           source: str = "bootstrap") -> None:
+    """Save a title. Re-saving keeps the original position rather than jumping
+    it to the top: the row is a queue somebody is working through, and a stray
+    second tap should not reorder it."""
+    await conn().execute(
+        "INSERT OR IGNORE INTO taste_watchlist"
+        " (user_token, imdb_id, media_type, source, added_at)"
+        " VALUES (?,?,?,?,?)",
+        (user_token, imdb_id, media_type, source, int(time.time())),
+    )
+    await conn().commit()
+
+
+async def remove_from_watchlist(user_token: str, imdb_id: str) -> None:
+    await conn().execute(
+        "DELETE FROM taste_watchlist WHERE user_token=? AND imdb_id=?",
+        (user_token, imdb_id))
+    await conn().commit()
+
+
+async def watchlist_for(user_token: str, limit: int = 200) -> list[dict]:
+    """Saved titles, newest first.
+
+    `rowid` breaks the tie because `added_at` is whole seconds and somebody
+    tapping through a deck quickly saves two titles inside one — which would
+    otherwise leave their order up to whatever SQLite felt like.
+    """
+    async with conn().execute(
+        "SELECT imdb_id, media_type, added_at FROM taste_watchlist"
+        " WHERE user_token=? ORDER BY added_at DESC, rowid DESC LIMIT ?",
+        (user_token, limit)) as cur:
+        return [{"imdb_id": r["imdb_id"], "media_type": r["media_type"],
+                 "added_at": r["added_at"]} for r in await cur.fetchall()]
+
+
+async def watchlist_ids(user_token: str) -> set[str]:
+    async with conn().execute(
+        "SELECT imdb_id FROM taste_watchlist WHERE user_token=?",
+        (user_token,)) as cur:
+        return {r["imdb_id"] for r in await cur.fetchall()}
+
+
+async def record_dealt(user_token: str, imdb_ids: list[str]) -> None:
+    """Remember that these cards went on screen.
+
+    Replaces rather than ignores on conflict: re-dealing a title after the
+    window lapsed should start its clock again, not leave it stamped with a
+    visit from last week.
+    """
+    ids = [i for i in imdb_ids if i]
+    if not ids:
+        return
+    now = int(time.time())
+    await conn().executemany(
+        "INSERT OR REPLACE INTO taste_dealt (user_token, imdb_id, dealt_at)"
+        " VALUES (?,?,?)", [(user_token, i, now) for i in ids])
+    await conn().commit()
+
+
+async def dealt_recently(user_token: str, hours: int) -> set[str]:
+    """Cards put on screen inside the window, and so not worth repeating."""
+    cutoff = int(time.time()) - hours * 3600
+    async with conn().execute(
+        "SELECT imdb_id FROM taste_dealt WHERE user_token=? AND dealt_at>=?",
+        (user_token, cutoff)) as cur:
+        return {r["imdb_id"] for r in await cur.fetchall()}
+
+
+async def prune_dealt(hours: int) -> int:
+    """Drop expired deal records. They are worthless once out of the window,
+    and this table takes a row per card per viewer."""
+    cutoff = int(time.time()) - hours * 3600
+    cur = await conn().execute(
+        "DELETE FROM taste_dealt WHERE dealt_at<?", (cutoff,))
+    await conn().commit()
+    return cur.rowcount or 0
+
+
+async def watchlist_count(user_token: str) -> int:
+    async with conn().execute(
+        "SELECT COUNT(*) AS n FROM taste_watchlist WHERE user_token=?",
+        (user_token,)) as cur:
+        row = await cur.fetchone()
+    return int(row["n"]) if row else 0
+
+
 async def set_bootstrap_taste(user_token: str, genres: list[str],
                               countries: list[str]) -> None:
     await conn().execute(
@@ -1524,12 +1846,14 @@ def bootstrap_taste(user: dict) -> tuple[list[str], list[str]]:
 # ── movie night (disposable session state, never taste) ─────────────────
 
 async def create_match(session_id: str, seats: list[dict], playlist: list[dict],
-                       ttl_seconds: int) -> None:
+                       ttl_seconds: int, kid_age: int | None = None) -> None:
     now = int(time.time())
     await conn().execute(
         "INSERT INTO match_sessions"
-        " (id, created_at, expires_at, seats, playlist) VALUES (?,?,?,?,?)",
-        (session_id, now, now + ttl_seconds, len(seats), json.dumps(playlist)))
+        " (id, created_at, expires_at, seats, playlist, kid_age)"
+        " VALUES (?,?,?,?,?,?)",
+        (session_id, now, now + ttl_seconds, len(seats), json.dumps(playlist),
+         kid_age))
     for seat in seats:
         await conn().execute(
             "INSERT INTO match_seats"
@@ -1544,13 +1868,40 @@ async def match_by_seat_key(seat_key: str) -> dict | None:
     """The session and seat a participant link addresses, if still live."""
     async with conn().execute(
         "SELECT s.*, m.created_at, m.expires_at, m.seats AS seat_count,"
-        " m.playlist, m.winner_imdb, m.winner_at"
+        " m.playlist, m.winner_imdb, m.winner_at, m.kid_age"
         " FROM match_seats s JOIN match_sessions m ON m.id = s.session_id"
         " WHERE s.seat_key=?", (seat_key,)) as cur:
         row = await cur.fetchone()
     if not row or row["expires_at"] < time.time():
         return None
     return dict(row)
+
+
+async def extend_match_playlist(session_id: str, films: list[dict]) -> int:
+    """Append newly found films to a live session's pool.
+
+    Read-modify-write under the caller's lock. The pool is one JSON column
+    because it was written once and never touched; now that it grows, the
+    alternative is a table per session's films, which is a lot of schema for a
+    list that is deleted in twelve hours.
+
+    Returns how many were actually new.
+    """
+    async with conn().execute(
+        "SELECT playlist FROM match_sessions WHERE id=?", (session_id,)) as cur:
+        row = await cur.fetchone()
+    if not row:
+        return 0
+    playlist = json.loads(row["playlist"])
+    have = {m["id"] for m in playlist}
+    fresh = [f for f in films if f.get("id") and f["id"] not in have]
+    if not fresh:
+        return 0
+    playlist.extend(fresh)
+    await conn().execute("UPDATE match_sessions SET playlist=? WHERE id=?",
+                         (json.dumps(playlist), session_id))
+    await conn().commit()
+    return len(fresh)
 
 
 async def match_seats(session_id: str) -> list[dict]:

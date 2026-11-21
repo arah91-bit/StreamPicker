@@ -1,0 +1,395 @@
+{
+  "reviewed_on": "2026-11-17",
+  "notes": "TMDB IDs and dates checked against TMDB search and detail responses. Broad-query acceptable IDs are reviewed examples, not an exhaustive relevance list. reviewed_imdb adds human judgments for observed first-five results; grade >=2 counts as relevant, 1 is weak, 0 is irrelevant.",
+  "cases": [
+    {
+      "query": "IT 2026",
+      "intent": "remembered_title",
+      "media": [
+        "movie",
+        "tv"
+      ],
+      "date": "preferred:2026",
+      "acceptable": {
+        "movie:1813355": 3,
+        "tv:200875": 2
+      },
+      "prohibited": [
+        "movie:1422011"
+      ]
+    },
+    {
+      "query": "new IT show",
+      "intent": "remembered_title",
+      "media": [
+        "tv"
+      ],
+      "acceptable": {
+        "tv:200875": 3
+      },
+      "prohibited": [
+        "movie:346364"
+      ]
+    },
+    {
+      "query": "that new Pennywise series",
+      "intent": "remembered_title",
+      "media": [
+        "tv"
+      ],
+      "acceptable": {
+        "tv:200875": 3
+      },
+      "prohibited": []
+    },
+    {
+      "query": "IT released only in 2026",
+      "intent": "remembered_title",
+      "media": [
+        "movie",
+        "tv"
+      ],
+      "date": "required:2026",
+      "acceptable": {
+        "movie:1813355": 3
+      },
+      "prohibited": [
+        "movie:346364",
+        "tv:200875"
+      ]
+    },
+    {
+      "query": "scary movies from the 80s",
+      "intent": "browse",
+      "media": [
+        "movie"
+      ],
+      "date": "required:1980-1989",
+      "genre": "horror",
+      "acceptable": {
+        "movie:694": 3,
+        "movie:1091": 3,
+        "movie:377": 3,
+        "movie:4488": 3,
+        "movie:9426": 3,
+        "movie:609": 3,
+        "movie:764": 3,
+        "movie:10585": 3,
+        "movie:1547": 3,
+        "movie:9003": 3
+      },
+      "prohibited": [
+        "movie:348"
+      ],
+      "reviewed_imdb": {
+        "tt0087363": 2,
+        "tt0091064": 3
+      }
+    },
+    {
+      "query": "eighties horror classics",
+      "intent": "browse",
+      "date": "required:1980-1989",
+      "genre": "horror",
+      "acceptable": {
+        "movie:694": 3,
+        "movie:1091": 3,
+        "movie:377": 3,
+        "movie:4488": 3
+      },
+      "prohibited": [
+        "movie:348"
+      ],
+      "reviewed_imdb": {
+        "tt0081505": 3,
+        "tt0084787": 3,
+        "tt0087363": 2,
+        "tt0087800": 3,
+        "tt0091064": 3
+      }
+    },
+    {
+      "query": "horror before 1990",
+      "intent": "browse",
+      "date": "required:before-1990",
+      "genre": "horror",
+      "acceptable": {
+        "movie:694": 3,
+        "movie:1091": 3,
+        "movie:348": 3
+      },
+      "prohibited": [],
+      "reviewed_imdb": {
+        "tt0054215": 3,
+        "tt0073195": 2,
+        "tt0070047": 3
+      }
+    },
+    {
+      "query": "horror set in the 80s",
+      "intent": "browse",
+      "genre": "horror",
+      "setting": "1980s",
+      "acceptable": {},
+      "prohibited": [],
+      "reviewed_imdb": {
+        "tt6998518": 3,
+        "tt22048412": 3,
+        "tt2118624": 3,
+        "tt11426232": 3,
+        "tt11514780": 1
+      }
+    },
+    {
+      "query": "80s horror without vampires",
+      "intent": "browse",
+      "date": "required:1980-1989",
+      "genre": "horror",
+      "excluded_topics": [
+        "vampire"
+      ],
+      "acceptable": {
+        "movie:694": 3,
+        "movie:1091": 3
+      },
+      "prohibited": [
+        "movie:1547"
+      ],
+      "reviewed_imdb": {
+        "tt0087363": 2,
+        "tt0087800": 3,
+        "tt0091064": 3
+      }
+    },
+    {
+      "query": "obscure 80s horror",
+      "intent": "browse",
+      "date": "required:1980-1989",
+      "genre": "horror",
+      "preference": "obscurity",
+      "acceptable": {},
+      "prohibited": [
+        "movie:348"
+      ],
+      "reviewed_imdb": {
+        "tt0135033": 3,
+        "tt0080054": 3,
+        "tt0097444": 2,
+        "tt0089371": 3,
+        "tt0098672": 3
+      }
+    },
+    {
+      "query": "animated movies with cats",
+      "intent": "browse",
+      "media": [
+        "movie"
+      ],
+      "genre": "animation",
+      "acceptable": {
+        "movie:10112": 3,
+        "movie:823219": 3
+      },
+      "prohibited": [],
+      "reviewed_imdb": {
+        "tt2948372": 2,
+        "tt1568921": 2,
+        "tt0347618": 3,
+        "tt11958344": 3
+      }
+    },
+    {
+      "query": "that show with a dog and a cat",
+      "intent": "remembered_title",
+      "media": [
+        "tv"
+      ],
+      "acceptable": {
+        "tv:1567": 3
+      },
+      "prohibited": []
+    },
+    {
+      "query": "stand up comidy",
+      "intent": "browse",
+      "acceptable": {
+        "movie:823754": 3
+      },
+      "prohibited": [],
+      "reviewed_imdb": {
+        "tt1492966": 2,
+        "tt10810424": 3,
+        "tt0092948": 3,
+        "tt1421373": 3
+      }
+    },
+    {
+      "query": "The Thing 1982",
+      "intent": "remembered_title",
+      "date": "preferred:1982",
+      "acceptable": {
+        "movie:1091": 3
+      },
+      "prohibited": [
+        "movie:60935"
+      ]
+    },
+    {
+      "query": "The Thing 2011",
+      "intent": "remembered_title",
+      "date": "preferred:2011",
+      "acceptable": {
+        "movie:60935": 3
+      },
+      "prohibited": []
+    },
+    {
+      "query": "A Nightmare on Elm Street 1984",
+      "intent": "remembered_title",
+      "date": "preferred:1984",
+      "acceptable": {
+        "movie:377": 3
+      },
+      "prohibited": [
+        "movie:23437"
+      ]
+    },
+    {
+      "query": "Friday the 13th 1980",
+      "intent": "remembered_title",
+      "date": "preferred:1980",
+      "acceptable": {
+        "movie:4488": 3
+      },
+      "prohibited": [
+        "movie:13207"
+      ]
+    },
+    {
+      "query": "The Fly 1986",
+      "intent": "remembered_title",
+      "date": "preferred:1986",
+      "acceptable": {
+        "movie:9426": 3
+      },
+      "prohibited": [
+        "movie:11815"
+      ]
+    },
+    {
+      "query": "Poltergeist 1982",
+      "intent": "remembered_title",
+      "date": "preferred:1982",
+      "acceptable": {
+        "movie:609": 3
+      },
+      "prohibited": [
+        "movie:243688"
+      ]
+    },
+    {
+      "query": "Hellraiser 1987",
+      "intent": "remembered_title",
+      "date": "preferred:1987",
+      "acceptable": {
+        "movie:9003": 3
+      },
+      "prohibited": [
+        "movie:338947"
+      ]
+    },
+    {
+      "query": "Child's Play 1988",
+      "intent": "remembered_title",
+      "date": "preferred:1988",
+      "acceptable": {
+        "movie:10585": 3
+      },
+      "prohibited": []
+    },
+    {
+      "query": "Aliens 1986",
+      "intent": "remembered_title",
+      "date": "preferred:1986",
+      "acceptable": {
+        "movie:679": 3
+      },
+      "prohibited": [
+        "movie:348"
+      ]
+    },
+    {
+      "query": "Alien released only in 1979",
+      "intent": "remembered_title",
+      "date": "required:1979",
+      "acceptable": {
+        "movie:348": 3
+      },
+      "prohibited": [
+        "movie:679"
+      ]
+    },
+    {
+      "query": "The Aristocats",
+      "intent": "title_lookup",
+      "acceptable": {
+        "movie:10112": 3
+      },
+      "prohibited": []
+    },
+    {
+      "query": "Flow 2024",
+      "intent": "remembered_title",
+      "date": "preferred:2024",
+      "acceptable": {
+        "movie:823219": 3
+      },
+      "prohibited": []
+    },
+    {
+      "query": "CatDog",
+      "intent": "title_lookup",
+      "acceptable": {
+        "tv:1567": 3
+      },
+      "prohibited": []
+    },
+    {
+      "query": "IT",
+      "intent": "title_lookup",
+      "acceptable": {
+        "movie:346364": 3,
+        "tv:19614": 3
+      },
+      "prohibited": [
+        "movie:1422011"
+      ],
+      "reviewed_imdb": {
+        "tt7349950": 2,
+        "tt19244304": 2
+      }
+    },
+    {
+      "query": "Bo Burnham: Inside",
+      "intent": "title_lookup",
+      "acceptable": {
+        "movie:823754": 3
+      },
+      "prohibited": []
+    },
+    {
+      "query": "IT: Welcome to Derry",
+      "intent": "title_lookup",
+      "acceptable": {
+        "tv:200875": 3
+      },
+      "prohibited": []
+    },
+    {
+      "query": "xyzzy qwerty nonexistent film",
+      "intent": "title_lookup",
+      "acceptable": {},
+      "prohibited": []
+    }
+  ]
+}
