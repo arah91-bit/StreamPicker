@@ -88,7 +88,7 @@ def _f(key: str, label: str, kind: str = "text", placeholder: str = "") -> dict:
 
 SOURCE_CARDS = [
     dict(id="indexers", title="Usenet indexers", test="indexers", source=True,
-         blurb="Newznab indexers you have accounts with. Switch on the nzbdav "
+         blurb="Newznab indexers you have accounts with. Switch on the InfiniDysk "
                "mount below too — the usenet lane needs both to play anything.",
          fields=[_f("NZB_INDEXERS", "Indexers", "indexers")]),
     dict(id="jellyfin", title="Jellyfin library", test="jellyfin", source=True,
@@ -111,11 +111,11 @@ SOURCE_CARDS = [
 ]
 
 HELPER_CARDS = [
-    dict(id="nzbdav", title="nzbdav", test="nzbdav", source=False,
+    dict(id="nzbdav", title="InfiniDysk", test="nzbdav", source=False,
          blurb="Required for the usenet indexers above to play — it mounts "
                "each release so it streams without downloading. Set up both, "
                "or neither works.",
-         fields=[_f("NZBDAV_URL", "Base URL", "url", "http://nzbdav:3000"),
+         fields=[_f("NZBDAV_URL", "Base URL", "url", "http://infinidysk:3000"),
                  _f("NZBDAV_USER", "WebDAV user", "text"),
                  _f("NZBDAV_PASS", "WebDAV password", "secret"),
                  _f("NZBDAV_API_KEY",
@@ -462,7 +462,7 @@ function collect(){
 const NICE={comet:'Torrent lane (Comet)',stremthru:'Torrent lane (StremThru)',
  torbox:'TorBox key',realdebrid:'Real-Debrid key',alldebrid:'AllDebrid key',
  premiumize:'Premiumize key',indexers:'Usenet indexers',jellyfin:'Jellyfin library',
- mediafusion:'MediaFusion',addon:'Custom addon',nzbdav:'nzbdav',radarr:'Radarr',
+ mediafusion:'MediaFusion',addon:'Custom addon',nzbdav:'InfiniDysk',radarr:'Radarr',
  sonarr:'Sonarr',jellyseerr:'Jellyseerr',tmdb:'TMDB',omdb:'OMDb',tvdb:'TVDB'};
 function showChecks(results){
  const box=$('#checks');box.classList.add('show');

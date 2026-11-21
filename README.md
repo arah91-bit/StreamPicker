@@ -66,7 +66,7 @@ Switch on a debrid account and it builds
 and live-tests the two torrent search lanes from just the API key — but a
 debrid isn't required: usenet indexers, a Jellyfin library, MediaFusion, or
 another Stremio addon can each stand alone as your source of streams. Optional
-helpers (nzbdav, Radarr/Sonarr, Jellyseerr) and metadata keys (TMDB, OMDb,
+helpers (InfiniDysk, Radarr/Sonarr, Jellyseerr) and metadata keys (TMDB, OMDb,
 TVDB) are on the same page. Everything you switch on is tested before it's
 saved (keys against the service itself; debrid lanes must actually return
 streams), then it restarts and hands you the install links. The

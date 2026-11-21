@@ -1097,8 +1097,8 @@ def _lane_masters() -> str:
  data-init="{'1' if jellyfin_on else '0'}" {'checked' if jellyfin_on else ''}
  aria-label="Enable Jellyfin library source"></div>
  <div class="lane-master"><div class="mastercopy"><div class="mastertitle">Direct Usenet</div>
- <div class="masterdesc">Enable or disable Newznab search and nzbdav mounting
- without deleting indexer or nzbdav credentials.</div></div>
+ <div class="masterdesc">Enable or disable Newznab search and InfiniDysk mounting
+ without deleting indexer or InfiniDysk credentials.</div></div>
  <span class="masterstate" id="usenet_master_state"></span>
  <input class="swi lane-master-toggle" id="usenet_master" type="checkbox"
  data-key="USENET_ENABLED" data-state="usenet_master_state"

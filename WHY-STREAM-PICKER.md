@@ -110,7 +110,7 @@ only audio is neither English nor the title's original language.
 search lanes. On top of that you can add:
 
 - a **direct usenet lane** — it searches your Newznab indexers, mounts the
-  NZB with [nzbdav](https://github.com/nzbdav-dev/nzbdav), and streams from
+  NZB with [InfiniDysk](https://www.infinidysk.com/), and streams from
   your provider without downloading the release (see
   [USENET-NUVIO-GUIDE.md](USENET-NUVIO-GUIDE.md));
 - MediaFusion or Prowlarr as additional sources;

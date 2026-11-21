@@ -237,7 +237,7 @@ CATALOG = [
      "upstream round-trip from each. 0 disables."),
     ("NZB_START_RETRY_SECS", "proxy", "num", "2", _S,
      "One extra chance for a direct-usenet source that failed to start, after "
-     "this pause. nzbdav mount readiness can flap for a few seconds while an "
+     "this pause. InfiniDysk mount readiness can flap for a few seconds while an "
      "import settles; without the retry that flap surfaces as a 502 the "
      "player has to recover from itself. 0 disables."),
     ("PROXY_SESSION_TTL", "proxy", "num", "86400", _S,
@@ -360,7 +360,7 @@ CATALOG = [
     ("NZB_SEARCH_TIMEOUT", "usenet", "num", "8", _S,
      "Per-indexer Newznab search timeout."),
     ("NZB_MOUNT_WAIT", "usenet", "num", "600", _S,
-     "How long to wait for NZBs to finish mounting in nzbdav."),
+     "How long to wait for NZBs to finish mounting in InfiniDysk."),
     ("NZB_MOUNT_RETURN_WANT", "usenet", "num", "1", "",
      "Mounted candidates to expose immediately before returning."),
     ("NZB_MOUNT_EARLY_WAIT", "usenet", "num", "30", _S,
@@ -368,16 +368,16 @@ CATALOG = [
     ("NZB_MOUNT_STAGGER", "usenet", "num", "0.5", _S,
      "Delay between kicking off successive mounts."),
     ("NZB_PUT_CONCURRENCY", "usenet", "num", "2", "",
-     "Concurrent NZB fetch+PUT writes into nzbdav (shares the NNTP write load); "
+     "Concurrent NZB fetch+PUT writes into InfiniDysk (shares the NNTP write load); "
      "the read-only poll that waits out each import is unbounded. Legacy name: "
      "NZB_IMPORT_CONCURRENCY."),
     ("NZB_IMPORT_CONCURRENCY", "usenet", "num", "2", "",
      "Legacy alias for NZB_PUT_CONCURRENCY (used only when the latter is unset)."),
     ("NZB_MOUNT_POLL_MAX", "usenet", "num", "2.0", _S,
-     "Ceiling on the backoff while polling nzbdav for a mount's video file."),
+     "Ceiling on the backoff while polling InfiniDysk for a mount's video file."),
     ("NZB_HEAD_WARM", "usenet", "bool", "1", "",
      "The moment a fresh mount's video appears, fetch its opening bytes in the "
-     "background so nzbdav assembles the first segments while the race runs, "
+     "background so InfiniDysk assembles the first segments while the race runs, "
      "instead of that ~20-35s assembly landing on the picker's first probe."),
     ("NZB_PREFETCH_MOUNT", "usenet", "bool", "1", "",
      "Pre-mount the next episode when one starts playing, so opening it is an "
@@ -390,7 +390,7 @@ CATALOG = [
      "(unreadable-filename) single video inside its mount, instead of dropping "
      "it. 0 requires echoed Newznab attrs for such files to play."),
     ("NZB_API_POLL_TTL", "usenet", "num", "1.5", _S,
-     "How long one nzbdav status snapshot is shared across concurrent imports."),
+     "How long one InfiniDysk status snapshot is shared across concurrent imports."),
     ("NZB_LANE_MAX_ACTIVE", "usenet", "num", "32", "",
      "Maximum concurrently active direct-usenet lane operations."),
     ("NZB_LANE_REGISTRY_MAX", "usenet", "num", "500", "",

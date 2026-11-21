@@ -314,7 +314,7 @@ CONNECTIONS = [
          role="Direct usenet searches (Newznab)", cat="usenet",
         fields=[dict(key="NZB_INDEXERS", label="Indexers",
                      kind="indexers", sensitive=True)]),
-    dict(id="nzbdav", name="nzbdav",
+    dict(id="nzbdav", name="InfiniDysk",
          role="Mounts NZBs so usenet releases stream directly", cat="usenet",
          fields=[dict(key="NZBDAV_URL", label="Base URL", kind="url"),
                  dict(key="NZBDAV_USER", label="WebDAV user", kind="text"),

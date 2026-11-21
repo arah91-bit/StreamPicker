@@ -151,7 +151,7 @@ def _hero(recs: list[dict], blocks: list[dict], names: dict[str, str]) -> str:
             f"{stalled['releases']} different releases have failed to deliver "
             f"a byte in the last {mins} minute{'s' if mins != 1 else ''}, and "
             "nothing has succeeded in between — that is the connection to your "
-            "news provider, not the releases. Restarting nzbdav clears it; its "
+            "news provider, not the releases. Restarting InfiniDysk clears it; its "
             "connection pool fills with dead sockets over a long uptime. "
             "Torrent and debrid sources are unaffected.",
             f"<a class='btn ghost' href='/health/sources'>"

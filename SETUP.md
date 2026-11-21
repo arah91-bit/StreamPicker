@@ -206,18 +206,18 @@ login stored, so switching back on doesn't mean retyping it.
 > 60-second sample. It is an excellent *first* source, not a complete one — most
 > people run it alongside another lane.
 
-#### B2 · The classic route — provider + indexers + nzbdav
+#### B2 · The classic route — provider + indexers + InfiniDysk
 
 More work, wider coverage. You need three things, and the first two must be in
 place already:
 
 1. A **usenet provider** subscription (where files actually come from).
 2. One or more **Newznab indexers** (how releases are found). Most are paid.
-3. **nzbdav**, a helper that makes usenet downloads look like a normal folder
+3. **InfiniDysk**, a helper that makes usenet downloads look like a normal folder
    so the app can stream them.
 
 In the dashboard, switch on the usenet cards and fill in your indexers
-(`NZB_INDEXERS`) and the nzbdav address and login. Press **Test** on each.
+(`NZB_INDEXERS`) and the InfiniDysk address and login. Press **Test** on each.
 
 > **Set expectations:** usenet releases go missing over time. Roughly 40% of
 > results won't play — this is normal, and the app detects and skips them

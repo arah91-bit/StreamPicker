@@ -1,4 +1,4 @@
-# Usenet streaming with stream-picker, nzbdav, and Caddy
+# Usenet streaming with stream-picker, InfiniDysk, and Caddy
 
 This guide takes you from "I have a Stremio-compatible player with a debrid
 provider and another addon" to a fully self-hosted stack that adds **direct
@@ -8,12 +8,12 @@ Usenet streaming**. By the end you'll have:
   from anywhere.
 - **stream-picker** — the Stremio-compatible picker/proxy addon (shows up in
   your player as "Auto Stream").
-- **nzbdav** — WebDAV mount server that turns NZBs into streamable files
+- **InfiniDysk** — WebDAV mount server that turns NZBs into streamable files
   without downloading them.
 
 Your debrid key, indexer URLs, and NNTP provider credentials are wired in
 through the stream-picker dashboard. stream-picker never speaks NNTP; your
-NNTP logins live only in nzbdav.
+NNTP logins live only in InfiniDysk.
 
 ## Words you'll see in this guide
 
@@ -31,8 +31,8 @@ New to self-hosting? These are the only terms you really need:
   small file that says where a release lives on usenet.
 - **Reverse proxy** — a front door (here, **Caddy**) that adds HTTPS so your
   phone can reach the addon from outside your home.
-- **WebDAV** — how stream-picker hands NZBs to nzbdav and reads the mounted
-  files back. You'll pick a username/password for it inside nzbdav.
+- **WebDAV** — how stream-picker hands NZBs to InfiniDysk and reads the mounted
+  files back. You'll pick a username/password for it inside InfiniDysk.
 
 ## How the pieces fit together
 
@@ -49,8 +49,8 @@ New to self-hosting? These are the only terms you really need:
             │
             └─► direct usenet lane:
                 search your indexers,
-                PUT the NZB into nzbdav,
-                nzbdav mounts and streams
+                PUT the NZB into InfiniDysk,
+                InfiniDysk mounts and streams
                 from your NNTP provider(s)
 ```
 
@@ -59,8 +59,8 @@ For each title you open, stream-picker races all lanes at once:
 - **Torrent lanes** — the setup wizard mints these automatically from just your
   debrid provider's API key.
 - **Direct usenet lane** — stream-picker searches your Newznab indexers itself,
-  PUTs the chosen NZB into nzbdav's WebDAV watch folder (`/nzbs/{movies|tv}/`),
-  and nzbdav mounts it. It streams articles on demand from your NNTP provider(s)
+  PUTs the chosen NZB into InfiniDysk's WebDAV watch folder (`/nzbs/{movies|tv}/`),
+  and InfiniDysk mounts it. It streams articles on demand from your NNTP provider(s)
   instead of downloading the whole release. stream-picker probes the mount for
   real playability and serves it to your player through its own proxy.
 
@@ -116,7 +116,7 @@ stream-picker/
 ├── secrets/
 │   └── stream-picker-config.key
 ├── data/                  (created by stream-picker)
-├── nzbdav-config/         (created by nzbdav)
+├── nzbdav-config/         (created by InfiniDysk)
 ├── caddy-data/            (Caddy certs)
 └── caddy-config/
 ```
@@ -185,9 +185,9 @@ services:
     networks:
       - media
 
-  nzbdav:
-    image: nzbdav/nzbdav:latest
-    container_name: nzbdav
+  infinidysk:
+    image: ghcr.io/infinidysk/infinidysk:latest
+    container_name: infinidysk
     restart: unless-stopped
     environment:
       PUID: "1000"
@@ -195,7 +195,7 @@ services:
     ports:
       - "3000:3000"
     volumes:
-      # nzbdav only needs its settings — it streams without storing anything.
+      # InfiniDysk only needs its settings — it streams without storing anything.
       - ./nzbdav-config:/config
     networks:
       - media
@@ -205,12 +205,12 @@ networks:
     driver: bridge
 ```
 
-> **Security:** always pull a fresh nzbdav image before you start
-> (`docker pull nzbdav/nzbdav:latest`) so you're on the current release, and
-> re-pull whenever you update. Keep nzbdav private: its admin UI is guarded only
+> **Security:** always pull a fresh InfiniDysk image before you start
+> (`docker pull ghcr.io/infinidysk/infinidysk:latest`) so you're on the current release, and
+> re-pull whenever you update. Keep InfiniDysk private: its admin UI is guarded only
 > by the WebDAV login you set in step 5, so never forward port `3000` to the
 > internet. In this stack only Caddy (ports 80/443) faces the internet, and it
-> proxies stream-picker — not nzbdav.
+> proxies stream-picker — not InfiniDysk.
 
 ## 2. `Caddyfile`
 
@@ -288,7 +288,7 @@ until you finish the DNS step (§7)** — that's expected and harmless; nothing
 else depends on it. You can do all of the setup below over your home network
 first and leave turning on outside-the-home access for last.
 
-## 5. Configure nzbdav
+## 5. Configure InfiniDysk
 
 Open `http://<host>:3000` and complete the initial admin account.
 
@@ -298,13 +298,13 @@ Open `http://<host>:3000` and complete the initial admin account.
 2. **Settings → WebDAV** — set a WebDAV username and password. These become
    stream-picker's `NZBDAV_USER` / `NZBDAV_PASS`.
 3. **Settings → SABnzbd** — copy the API key shown here and keep it handy for
-   step 6. Don't let the name fool you: this is the key for nzbdav's *own*
-   SABnzbd-compatible API — nzbdav emulates SABnzbd, and the real SABnzbd plays
-   no part in this setup. Step 6's nzbdav card has an optional **API key** field
+   step 6. Don't let the name fool you: this is the key for InfiniDysk's *own*
+   SABnzbd-compatible API — InfiniDysk emulates SABnzbd, and the real SABnzbd plays
+   no part in this setup. Step 6's InfiniDysk card has an optional **API key** field
    for it; filling it just adds queue/history visibility to the dashboard, so
    skip it if you don't care about that.
 
-nzbdav also supports an rclone sidecar for the *arr "infinite library" flow.
+InfiniDysk also supports an rclone sidecar for the *arr "infinite library" flow.
 You don't need that for this streaming setup — skip it.
 
 ## 6. Configure stream-picker
@@ -324,21 +324,21 @@ You don't need that for this streaming setup — skip it.
      Paste the URL and key from each indexer's profile/API page. The URL must
      be the full Newznab `/api` endpoint (for example:
      `https://api.example-indexer.com/api`).
-   - **nzbdav** — URL `http://nzbdav:3000` (works because both containers
+   - **InfiniDysk** — URL `http://infinidysk:3000` (works because both containers
      share the `media` network), plus the WebDAV username/password you created
-     in nzbdav's UI. The **API key** field is the optional one from step 5 —
+     in InfiniDysk's UI. The **API key** field is the optional one from step 5 —
      leave it blank if you skipped it.
    - **TMDB** (optional, recommended) — free API key for titles/languages.
    - **Watch away from home** — the public address from your `.env`
      (`https://streams.example.com`). Leave it blank if you're home-only.
 3. The wizard live-tests everything before saving: each indexer with a
-   Newznab `t=caps` query, nzbdav with an authenticated WebDAV PROPFIND to
+   Newznab `t=caps` query, InfiniDysk with an authenticated WebDAV PROPFIND to
    `/nzbs/`. Then **Set up my streams** → **Finish** restarts the addon.
 
 Two rules that bite people:
 
 - **The usenet lane needs both halves.** It activates only when the indexers
-  *and* all three nzbdav fields (URL, user, password) are set. Indexers alone
+  *and* all three InfiniDysk fields (URL, user, password) are set. Indexers alone
   silently return nothing.
 - **Stream path must not be "Direct links".** In stream-picker's Settings,
   keep the stream path on **Cache on disk** (best) or **Pass through** —
@@ -393,9 +393,9 @@ untouched — the player shows results from all installed addons together.
 
 1. Play a popular title in your player. Usenet results show up as `NZB` entries
    in the stream list alongside the debrid ones.
-2. First play of a title can take a little while — nzbdav is article-checking
+2. First play of a title can take a little while — InfiniDysk is article-checking
    the release over NNTP (up to `NZB_MOUNT_WAIT=600` seconds worst case).
-   Mounts persist in nzbdav, so re-opening the same title later is instant.
+   Mounts persist in InfiniDysk, so re-opening the same title later is instant.
 3. In the dashboard: the **Overview** tab has a "Direct usenet report card",
    and **Source health** shows your learned indexer order, per-indexer clear
    buttons, and failure evidence.
@@ -411,20 +411,20 @@ mount is tried first.
 
 ## Speeding up first play
 
-The slow part of a *brand-new* usenet title is nzbdav pulling and checking the
+The slow part of a *brand-new* usenet title is InfiniDysk pulling and checking the
 release's articles over your provider — everything downstream is fast once that
 finishes. Two levers help, one on each side:
 
-**In nzbdav (the bigger lever for a cold title):**
+**In InfiniDysk (the bigger lever for a cold title):**
 
 1. **Settings → Usenet → Max connections** — raise this toward the maximum your
-   provider allows (it's on their plan page). nzbdav checks and assembles a
+   provider allows (it's on their plan page). InfiniDysk checks and assembles a
    release faster with more connections, so the first play of a fresh title
    comes sooner.
 2. **Add a second provider** on a different network/backbone. It fills the gaps
    when one provider is missing a release's articles — fewer dead releases, and
    the check runs across both at once.
-3. Keep nzbdav's article/health checks **on**. They're what make ~40% of
+3. Keep InfiniDysk's article/health checks **on**. They're what make ~40% of
    releases that actually play the ones you get, instead of ones that stall.
 
 **In stream-picker (helps automatically, no change needed):**
@@ -436,7 +436,7 @@ finishes. Two levers help, one on each side:
   something playable while the best-quality copy is still coming down.
 
 If a cold, obscure title still takes a bit to start the very first time, that's
-your provider feeding nzbdav — the levers above are where to gain time. The
+your provider feeding InfiniDysk — the levers above are where to gain time. The
 defaults are set for a good balance; you only need the Settings page if you want
 to tune further (it explains each option inline).
 
@@ -458,20 +458,20 @@ Back these up and you can rebuild everything from scratch:
 
 ## Troubleshooting
 
-- **No `NZB` results at all** — check that all three nzbdav fields *and* the
+- **No `NZB` results at all** — check that all three InfiniDysk fields *and* the
   indexers are saved, that the addon was restarted after saving, and that
   the stream path isn't "Direct links".
 - **A source fails its wizard Test** — indexers: confirm the URL is the full
-  Newznab `/api` endpoint and the key is current. nzbdav: confirm the WebDAV
-  user/pass and that `http://nzbdav:3000` resolves (all containers on the
+  Newznab `/api` endpoint and the key is current. InfiniDysk: confirm the WebDAV
+  user/pass and that `http://infinidysk:3000` resolves (all containers on the
   same network).
 - **An indexer suddenly stops contributing** — an indexer whose NZB-fetch
   endpoint fails repeatedly gets suppressed. Clear it from its button on the
   **Source health** tab.
-- **First mount of a title is slow** — normal; nzbdav is checking articles
+- **First mount of a title is slow** — normal; InfiniDysk is checking articles
   over NNTP. Later plays of the same title reuse the mount and start fast.
-- **Playback stalls or mounts crawl** — nzbdav and playback share your
-  provider's NNTP connection cap. Keep connection counts sane in nzbdav's
+- **Playback stalls or mounts crawl** — InfiniDysk and playback share your
+  provider's NNTP connection cap. Keep connection counts sane in InfiniDysk's
   settings rather than maxing them out.
 - **Caddy shows a certificate error** — your DNS A record isn't pointing at
   this host, or ports 80/443 aren't reachable from the internet (check router
@@ -491,11 +491,11 @@ Back these up and you can rebuild everything from scratch:
 
 **Does my debrid provider need to support Usenet?**
 No. stream-picker's Usenet lane is independent: it searches your indexers and
-streams through nzbdav using your NNTP provider(s). Most debrid plans do not
+streams through InfiniDysk using your NNTP provider(s). Most debrid plans do not
 include Usenet anyway; check your provider's docs if you're unsure.
 
 **Why doesn't this setup include SABnzbd (or another downloader)?**
-It isn't needed — nzbdav talks to your provider directly and only *emulates*
+It isn't needed — InfiniDysk talks to your provider directly and only *emulates*
 the SABnzbd API. If you later want permanent, download-and-keep Usenet
 downloads, you can add a classic downloader alongside this stack; it shares
 nothing with the streaming path.
@@ -505,7 +505,7 @@ Optional. Keep it installed as-is, uninstall it, or plug its manifest URL into
 stream-picker's **Custom addons** panel so its results get re-verified by the
 same probe pipeline. Whatever you choose, nothing in this guide breaks it.
 
-**Can I use a provider-specific addon instead of nzbdav?**
+**Can I use a provider-specific addon instead of InfiniDysk?**
 Some NNTP providers offer their own player addon that streams directly from
 their search engine. That's a zero-server alternative, but it's usually limited
 to that provider's own index. The setup in this guide searches all your
@@ -513,7 +513,7 @@ indexers, can pull from multiple providers, verifies playability, and races
 Usenet against your debrid lanes.
 
 **Where do my provider credentials live?**
-Only in nzbdav. stream-picker talks WebDAV/HTTP to nzbdav and never speaks
+Only in InfiniDysk. stream-picker talks WebDAV/HTTP to InfiniDysk and never speaks
 NNTP, so NNTP logins never leave that container.
 
 **Do config changes need a restart?**
