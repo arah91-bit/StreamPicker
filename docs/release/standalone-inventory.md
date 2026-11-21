@@ -19,3 +19,9 @@ The trees diverge: in several areas the public tree is newer than the private co
 No committed standalone code port is selected from this comparison. The independent follow-up slices are (1) public first-run and upgrade review/fixes under the release spec and (2) a separately scoped trailer-resolver feasibility/design decision if a stock-client use case is demonstrated. Neither needs private player code. The unfinished local changes also include player and trailer-service work; they have not been treated as tested or release-ready.
 
 This is a selection inventory, not an assertion that every feature has end-to-end coverage. The release spec's clean Compose, settings, upgrade and playback checks remain separate work.
+
+## Release selection disposition
+
+Ticket #4 selects no additional code changes: the standalone candidates are already public, and the remaining candidates are deferred for the reasons above. In particular, the trailer resolver is a possible future adaptation, not an implementation selected for this release. Its stock-client use case and independent contract must be established before an implementation can be scoped. No implementation child tickets are warranted by this inventory. Setup and upgrade work remains tracked separately under the release spec.
+
+This disposition adds no settings, dependencies, player requirements, or migration. Since no behavior changes, no new behavioral tests are needed; the coverage listed above describes existing tests, not a substitute for the release checks. Review of this inventory and disposition found no private endpoint, credential, personal data, private deployment configuration, or new player-specific dependency. This review covers these documents, not the entire release candidate; the final candidate still needs the review and verification described in the release spec.
