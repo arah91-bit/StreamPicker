@@ -471,17 +471,24 @@ function showChecks(results){
   `${v.ok?'':' — '+(v.detail||'failed').replace(/</g,'&lt;')}</span>`).join('');
 }
 let phase='setup';
+$('#retrysetup').addEventListener('click',()=>{phase='setup';
+ $('#retrysetup').hidden=true;$('#gobtn').textContent='Test and save again';
+ $('#gomsg').textContent='Edit the failed services above, then retry.';});
 $('#gobtn').addEventListener('click',async()=>{
  const btn=$('#gobtn'),msg=$('#gomsg');
  if(phase==='restart'){
   btn.disabled=true;msg.innerHTML='Restarting… this takes a few seconds.';
-  try{await post('/api/settings/restart')}catch(e){}
+  let before;
+  try{before=await (await fetch('/api/settings/status.json',{cache:'no-store'})).json();
+   await post('/api/settings/restart');}
+  catch(e){msg.textContent='Restart failed: '+e.message+' Fix the settings and retry.';btn.disabled=false;return;}
   for(let i=0;i<60;i++){
    await new Promise(r=>setTimeout(r,2000));
    try{const h=await fetch('/health/ready',{cache:'no-store'});
-    if(h.ok){location.href='/';return}}catch(e){}
+    if(h.ok){const status=await (await fetch('/api/settings/status.json',{cache:'no-store'})).json();
+     if(status.boot_id!==before.boot_id&&!status.restart_pending){location.href='/';return;}}}catch(e){}
   }
-  msg.textContent='Still restarting — reload this page in a moment.';return;
+  msg.textContent='Restart was not confirmed. Check container logs and retry.';btn.disabled=false;return;
  }
  const body=collect();
  const bad=v=>msg.innerHTML='<span style="color:var(--bad)">'+v+'</span>';
@@ -495,16 +502,15 @@ $('#gobtn').addEventListener('click',async()=>{
   showChecks(res.results);
   if(res.ok){phase='restart';btn.textContent='Finish →';btn.disabled=false;
    const failed=Object.values(res.results).filter(v=>!v.ok).length;
-   msg.innerHTML=failed?'<b>Ready.</b> Saved what worked; the ✗ items can '+
-    'wait. One restart to finish.':'<b>All set.</b> One restart and your '+
+   $('#retrysetup').hidden=!failed;
+   msg.innerHTML=failed?'<b>Ready.</b> Saved what worked. Edit failed services and retry, or finish now.':'<b>All set.</b> One restart and your '+
     'addon links appear.';}
   else{btn.disabled=false;
    msg.innerHTML='<span style="color:var(--bad)">Nothing playable yet — '+
     'add a debrid, usenet indexers, a Jellyfin library, MediaFusion or '+
     'another addon, then try again.</span>';}
  }catch(e){btn.disabled=false;
-  msg.innerHTML='<span style="color:var(--bad)">'+
-   String(e.message).replace(/</g,'&lt;')+'</span>';}
+  msg.textContent='Could not save: '+e.message+'. Your entries are still here. Check the values and persistent storage, then retry; inspect container logs if it continues.';}
 });
 
 /* Public address: call it and see whether it lands back on this server.
@@ -650,6 +656,7 @@ episode handling.</p>
 <div class="gobar">
  <div id="checks" class="checks"></div>
  <div class="gorow"><span id="gomsg" class="gomsg">Takes about a minute.</span>
+ <button id="retrysetup" class="btn" hidden>Edit and retry</button>
  <button id="gobtn" class="btn">Set up my streams</button></div>
 </div>"""
     head_block = (
