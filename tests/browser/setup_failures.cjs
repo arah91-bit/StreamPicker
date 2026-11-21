@@ -15,17 +15,25 @@ const assert = require('node:assert/strict');
   await page.locator('.card[data-card=addon]').waitFor();
   }
   // Network boundaries simulate a partial source failure and rejected restart.
-  await page.route('**/api/setup/apply', route => route.fulfill({json:{ok:true,results:{addon:{ok:true},tmdb:{ok:false,detail:'Check the API key'}}}}));
+  let applyAttempts = 0;
+  await page.route('**/api/setup/apply', route => {
+   if (++applyAttempts === 1) return route.fulfill({status:500,json:{detail:'fixture save failure'}});
+   return route.fulfill({json:{ok:true,results:{addon:{ok:true},tmdb:{ok:false,detail:'Check the API key'}}}});
+  });
   await page.route('**/api/settings/restart', route => route.fulfill({status:409,json:{detail:'configuration cannot restart: invalid settings'}}));
   const addon = page.locator('.card[data-card=addon]');
   await addon.locator('.swi').check();
   await addon.locator('[data-key="url"]').fill('http://example.test/manifest.json');
+  await page.locator('#gobtn').click();
+  await page.getByText(/Could not save:.*fixture save failure/).waitFor();
+  assert.equal(await addon.locator('[data-key="url"]').inputValue(), 'http://example.test/manifest.json');
+  assert.equal(await page.locator('#gobtn').isEnabled(), true);
   await page.locator('#gobtn').click();
   await page.getByText('Check the API key').waitFor();
   assert.match(await page.locator('#gomsg').innerText(), /retry/i);
   await page.getByRole('button', {name:'Finish →'}).click();
   await page.getByText(/configuration cannot restart/).waitFor({timeout:3000});
   assert.equal(await page.locator('#gobtn').isEnabled(), true);
-  console.log('Browser partial failure and rejected restart: passed');
+  console.log('Browser save failure and retry, partial failure and rejected restart: passed');
  } finally { await browser.close(); }
 })().catch(e=>{ console.error(e); process.exit(1); });

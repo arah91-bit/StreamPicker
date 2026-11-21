@@ -26,6 +26,24 @@ const assert = require('node:assert/strict');
   assert.match(await page.locator('#checks').innerText(), /✓ Jellyfin library/);
   await page.locator('#gobtn').click();
   await page.getByText('Add to Nuvio/Stremio').waitFor({timeout:60000});
-  console.log('Enrollment, source failure and retry, restart and install link passed');
+  // Use the exact URL shown by the dashboard, without printing its secret path.
+  const manifestUrl = (await page.locator('.install .irow .murl').innerText()).trim();
+  assert.match(manifestUrl, /^https?:\/\/.*\/manifest\.json$/);
+  const manifest = await fetch(manifestUrl);
+  assert.equal(manifest.status, 200, 'displayed manifest must be reachable');
+  assert.ok((await manifest.json()).id, 'manifest must identify an addon');
+  const streamUrl = manifestUrl.replace(/manifest\.json$/, 'stream/movie/tt0133093.json');
+  let streams = [];
+  for (let attempt = 0; attempt < 12 && !streams.length; attempt++) {
+   const response = await fetch(streamUrl);
+   assert.equal(response.status, 200, 'stream endpoint must be reachable');
+   streams = (await response.json()).streams || [];
+   if (!streams.length) await new Promise(resolve => setTimeout(resolve, 5000));
+  }
+  assert.ok(streams.length, 'fixture movie must return a stream');
+  const media = await fetch(streams[0].url, {headers:{Range:'bytes=0-65535'}});
+  assert.equal(media.status, 206, 'returned stream must support byte ranges');
+  assert.equal((await media.arrayBuffer()).byteLength, 65536);
+  console.log(`Enrollment, failed check and retry, apply, displayed manifest, ${streams.length} streams and 65536 media bytes passed`);
  } finally { await browser.close(); }
 })().catch(e=>{console.error(e);process.exit(1)});
