@@ -94,3 +94,9 @@ def test_written_decade_is_not_a_topic():
 def test_descriptive_catdog_uses_compound_query_before_raw_phrase():
     i = interpret('that show with a dog and a cat', today=TODAY)
     assert i.entities == () and i.queries == ('CatDog',)
+
+
+def test_family_in_a_title_does_not_start_genre_browse():
+    title = interpret("Family Feud", today=TODAY)
+    assert title.kind == "title_lookup" and title.entities == ("Family Feud",)
+    assert interpret("family movies", today=TODAY).genres == ("family",)

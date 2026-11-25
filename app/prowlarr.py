@@ -34,6 +34,7 @@ expects is the provider id itself (torbox, realdebrid, …).
 from __future__ import annotations
 
 import asyncio
+from datetime import date
 import logging
 import os
 import time
@@ -41,7 +42,7 @@ from urllib.parse import quote
 
 import httpx
 
-from app import debrid, usenet
+from app import debrid, meta, usenet
 
 logger = logging.getLogger("stream-picker")
 
@@ -166,7 +167,8 @@ async def _search(query: str) -> list[dict]:
 
 def _candidates(results: list[dict], titles: list[str],
                 season_episode: tuple[int, int] | None,
-                year: int | frozenset[int] | None = None) -> list[dict]:
+                year: int | frozenset[int] | None = None,
+                air_date: date | None = None) -> list[dict]:
     """Torrent releases with a hash whose title matches the requested one (and
     episode, for a series), best-first by seeders then size. The title gate is
     the same one the usenet lane relies on to never play wrong content."""
@@ -182,9 +184,9 @@ def _candidates(results: list[dict], titles: list[str],
             continue
         if not any(usenet._release_title_match(title, t) for t in titles if t):
             continue
-        if not usenet._release_year_match(title, titles, year):
+        if not usenet._release_year_match(title, titles, year, air_date):
             continue
-        if season_episode and not usenet._episode_match(title, *season_episode):
+        if season_episode and not usenet._episode_match(title, *season_episode, air_date):
             continue
         out.append({"hash": info_hash, "title": title,
                     "size": int(it.get("size") or 0),
@@ -224,7 +226,8 @@ async def _cached_hashes(hashes: list[str], store: str, token: str) -> set[str]:
 
 
 def _pick_file(files: list[dict],
-               season_episode: tuple[int, int] | None) -> dict | None:
+               season_episode: tuple[int, int] | None,
+               air_date: date | None = None) -> dict | None:
     """The file to stream: the episode's own file for a series, else the largest
     video. Falls back to the largest file of any kind when nothing looks video."""
     videos = [f for f in files
@@ -236,7 +239,7 @@ def _pick_file(files: list[dict],
     if season_episode:
         for f in pool:
             name = str(f.get("name") or f.get("path") or "")
-            if usenet._episode_match(name, *season_episode):
+            if usenet._episode_match(name.rsplit("/", 1)[-1], *season_episode, air_date):
                 return f
         if videos:                 # a series pack with no clear episode file
             return None
@@ -244,7 +247,8 @@ def _pick_file(files: list[dict],
 
 
 async def _resolve(cand: dict, store: str, token: str,
-                   season_episode: tuple[int, int] | None) -> dict | None:
+                   season_episode: tuple[int, int] | None,
+                   air_date: date | None = None) -> dict | None:
     """Add a cached magnet, choose the right file, and generate a direct link.
     Returns a Stremio stream dict, or None if it cannot be turned into one."""
     base = _store_base()
@@ -254,7 +258,7 @@ async def _resolve(cand: dict, store: str, token: str,
                                json={"magnet": cand["hash"]}, timeout=30)
         r.raise_for_status()
         magnet = r.json().get("data") or {}
-        pick = _pick_file(magnet.get("files") or [], season_episode)
+        pick = _pick_file(magnet.get("files") or [], season_episode, air_date)
         if not pick or not pick.get("link"):
             return None
         g = await _client.post(f"{base}/v0/store/link/generate", headers=headers,
@@ -308,11 +312,14 @@ async def streams(media: str, media_id: str) -> list[dict]:
         except ValueError:
             season_episode = None
     try:
-        titles, year = await usenet._expected_info(media, media_id)
+        (titles, year), air_date = await asyncio.gather(
+            usenet._expected_info(media, media_id),
+            meta.request_air_date(media, media_id))
         if not titles:
             _record(media, media_id, "failed", "no title metadata")
             return []
-        queries = _queries(media, media_id, titles, year)
+        queries = (_queries(media, media_id, titles, year)
+                   + usenet._episode_date_queries(titles, air_date))
         searched = await asyncio.gather(
             *(_search(query) for query in queries), return_exceptions=True)
         if all(isinstance(batch, BaseException) for batch in searched):
@@ -326,7 +333,7 @@ async def streams(media: str, media_id: str) -> list[dict]:
         return []
 
     cands = _candidates(results, titles, season_episode,
-                        await usenet._accepted_years(media, media_id, year))
+                        await usenet._accepted_years(media, media_id, year), air_date)
     if not cands:
         _record(media, media_id, "empty", "no matching torrents")
         return []
@@ -362,7 +369,7 @@ async def streams(media: str, media_id: str) -> list[dict]:
 
     async def one(c: dict, store: str, token: str) -> dict | None:
         async with sem:
-            return await _resolve(c, store, token, season_episode)
+            return await _resolve(c, store, token, season_episode, air_date)
 
     tasks = [one(c, store, token) for c in wanted
              for store, token in stores_by_hash[c["hash"]]]

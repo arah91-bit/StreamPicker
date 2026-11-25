@@ -31,11 +31,12 @@ import time
 import xml.etree.ElementTree as ET
 from collections.abc import Iterable
 from contextvars import ContextVar
+from datetime import date
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 import httpx
 
-from app import candidate_health, meta, telemetry, textfold, usenet_health
+from app import candidate_health, content_identity, meta, telemetry, textfold, usenet_health
 
 logger = logging.getLogger("stream-picker")
 
@@ -522,7 +523,8 @@ def _release_title_match(release: str, expected: str) -> bool:
 
 
 def _release_year_match(release: str, titles: list[str],
-                        expected_year: int | Iterable[int] | None) -> bool:
+                        expected_year: int | Iterable[int] | None,
+                        air_date: date | None = None) -> bool:
     """Reject an explicit, contradictory year immediately after a title.
 
     Same-name series/remakes are common (and alias fan-out makes finding them
@@ -532,6 +534,10 @@ def _release_year_match(release: str, titles: list[str],
     ``1917`` as the production year. ``expected_year`` may be the set from
     :func:`_accepted_years`; matching any one of them is enough.
     """
+    if air_date is not None:
+        dates, release = content_identity.split_air_dates(release)
+        if dates and dates != {air_date}:
+            return False
     if isinstance(expected_year, int):
         expected_year = (expected_year,)
     wanted_years = {int(y) for y in expected_year or () if y}
@@ -565,8 +571,12 @@ def _release_year_match(release: str, titles: list[str],
     return False
 
 
-def _episode_match(text: str, season: int, episode: int) -> bool:
+def _episode_match(text: str, season: int, episode: int,
+                   air_date: date | None = None) -> bool:
     """Exact SxxExx / x-style episode token; rejects packs and wrong episodes."""
+    if air_date is not None and content_identity.split_air_dates(text)[0]:
+        return content_identity.episode_relation(
+            text, (season, episode), air_date) == "exact"
     match = re.search(
         rf"(?<![A-Za-z0-9])(?:S0*{season}[^A-Za-z0-9]*E0*{episode}|"
         rf"0*{season}x0*{episode})(?!\d)", text or "", re.I)
@@ -702,6 +712,14 @@ def _text_queries(media: str, parts: list[str], titles: list[str],
     return list(dict.fromkeys(queries))
 
 
+def _episode_date_queries(titles: list[str], air_date: date | None) -> list[str]:
+    if air_date is None or air_date > date.today():
+        return []
+    suffix = air_date.strftime("%Y %m %d")
+    return list(dict.fromkeys(f"{_query_text(title)} {suffix}"
+                              for title in _latin_titles(titles)[:2]))
+
+
 def _text_fallback_queries(media: str, parts: list[str], titles: list[str],
                            year: int | None) -> list[str]:
     """The last text pass before the lane gives up: the first two titles as
@@ -761,9 +779,9 @@ async def search(media: str, media_id: str) -> list[dict]:
         titles, year = await _expected_info(media, media_id)
         return titles, year, await _accepted_years(media, media_id, year)
 
-    results, expected = await asyncio.gather(
+    results, expected, air_date = await asyncio.gather(
         asyncio.gather(*(_search_one(n, b, k, params) for n, b, k in INDEXERS)),
-        expected_identity())
+        expected_identity(), meta.request_air_date(media, media_id))
     expected_titles, expected_year, accepted_years = expected
     # Wrong content is worse than no direct-usenet result. If authoritative
     # title metadata is unavailable, leave this optional lane out for now.
@@ -793,11 +811,17 @@ async def search(media: str, media_id: str) -> list[dict]:
                        for title in expected_titles):
                 dropped += 1
                 continue
+            date_tokens, year_text = (content_identity.split_air_dates(it["title"])
+                                      if air_date else (set(), it["title"]))
+            if date_tokens and (date_tokens != {air_date}
+                                or not _episode_match(it["title"], *season_episode, air_date)):
+                dropped += 1
+                continue
             is_pack = False
             pack_media_id = ""
             pack_scope = ""
             if season_episode and not _episode_match(it["title"],
-                                                     *season_episode):
+                                                     *season_episode, air_date):
                 # Packs remain candidates alongside single episodes, but the
                 # exact per-file episode check at mount time is their safety
                 # gate. Scope a whole-show pack to IMDb and a season pack to
@@ -815,7 +839,7 @@ async def search(media: str, media_id: str) -> list[dict]:
                     media, pack_media_id)
             if accepted_years:
                 years = {int(y) for y in re.findall(r"(?<!\d)((?:19|20)\d{2})(?!\d)",
-                                                    it["title"])}
+                                                    year_text)}
                 if years and not years & accepted_years:
                     dropped += 1
                     continue
@@ -867,6 +891,7 @@ async def search(media: str, media_id: str) -> list[dict]:
                            "titles": list(expected_titles),
                            "year": expected_year,
                            "years": sorted(accepted_years),
+                           "air_date": air_date,
                        }}
             if is_pack:
                 release["_nzb_pack"] = True
@@ -882,8 +907,10 @@ async def search(media: str, media_id: str) -> list[dict]:
         _ingest(lst)
     if not _any_fetchable(releases):
         before = len(releases)
+        queries = (_text_queries(media, parts, expected_titles, expected_year)
+                   + _episode_date_queries(expected_titles, air_date))
         for lst in await _text_search(media, parts, expected_titles,
-                                      expected_year):
+                                      expected_year, queries):
             _ingest(lst)
         if len(releases) > before:
             logger.info(f"nzb search {media_id}: id query yielded nothing "
@@ -1619,8 +1646,11 @@ def _basename_identity(href: str, release: dict,
     stem = re.sub(r"^(?:\[[^\]\r\n]{1,40}\][\s._-]*){1,2}", "", stem)
     titles = [str(t) for t in expected.get("titles") or [] if str(t).strip()]
     title_exact = any(_release_title_match(stem, title) for title in titles)
+    air_date = expected.get("air_date") if episode else None
+    dates, year_text = (content_identity.split_air_dates(stem)
+                        if air_date else (set(), stem))
     years = {int(y) for y in re.findall(
-        r"(?<!\d)((?:19|20)\d{2})(?!\d)", stem)}
+        r"(?<!\d)((?:19|20)\d{2})(?!\d)", year_text)}
     year = expected.get("year")
     try:
         year = int(year) if year else None
@@ -1646,6 +1676,10 @@ def _basename_identity(href: str, release: dict,
         return "contradiction", ["basename-title-mismatch"], "wrong-title"
 
     requested = episode
+    if dates and not title_exact:
+        return "contradiction", evidence + ["basename-title-mismatch"], "wrong-title"
+    if dates and not _episode_match(stem, *requested, air_date):
+        return "contradiction", evidence + ["basename-air-date-mismatch"], "wrong-episode"
     tokens = _episode_tokens(stem)
     # A range spanning the request ("S13E07-E08" asked for E08) is this
     # episode: two-segment shows publish the broadcast half-hour as one file,
@@ -1654,7 +1688,7 @@ def _basename_identity(href: str, release: dict,
     if requested and tokens and requested not in tokens and not range_hit:
         return "contradiction", evidence + ["basename-episode-mismatch"], "wrong-episode"
     episode_exact = bool(requested and (range_hit
-                                        or _episode_match(stem, *requested)))
+                                        or _episode_match(stem, *requested, air_date)))
     if requested and tokens and not episode_exact:
         # The requested token began a range/multi-episode bundle.
         return "contradiction", evidence + ["basename-episode-bundle"], "wrong-episode"

@@ -1,10 +1,47 @@
 import unittest
+from datetime import date
 from unittest.mock import AsyncMock, patch
 
 from app import picker, usenet
 
 
 class EpisodeSafetyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_air_date_fallback_checks_release_and_mounted_file(self):
+        media_id = "tt0159881:43:1"
+        release_name = "Jeopardy.2026.09.14.1080p.WEB-DL"
+        wrong_names = [
+            "Jeopardy.2026.09.15.1080p.WEB-DL",
+            "Jeopardy.S43E02.2026.09.14.1080p.WEB-DL",
+            "Jeopardy.UK.2026.09.14.1080p.WEB-DL",
+            "Jeopardy.2024.2026.09.14.1080p.WEB-DL",
+        ]
+
+        async def search_one(indexer, base, key, params):
+            if params.get("q") != "Jeopardy 2026 09 14":
+                return []
+            return [
+                {"title": name, "size": 4_000_000_000, "indexer": indexer,
+                 "link": f"https://indexer/{i}"}
+                for i, name in enumerate([release_name, *wrong_names])
+            ]
+
+        with (patch.object(usenet, "INDEXERS", [("one", "https://indexer", "k")]),
+              patch.object(usenet, "_search_one", side_effect=search_one),
+              patch.object(usenet, "_expected_info", return_value=(["Jeopardy!"], 1984)),
+              patch.object(usenet, "_accepted_years", return_value=frozenset({1984})),
+              patch("app.meta.request_air_date", return_value=date(2026, 9, 14)),
+              patch("app.usenet_health.should_skip", return_value=False),
+              patch("app.usenet_health.fetch_allowed", return_value=True)):
+            found = await usenet.search("series", media_id)
+
+        self.assertEqual([release_name], [r["title"] for r in found])
+        entries = [(f"/{release_name}/{name}.mkv", 5000) for name in wrong_names]
+        self.assertIsNone(usenet._pick_video_identity(entries, found[0], (43, 1))[0])
+        exact = (f"/job/{release_name}.mkv", 1000)
+        selected, confidence, _, _ = usenet._pick_video_identity(
+            [*entries, exact], found[0], (43, 1))
+        self.assertEqual((exact, "strong"), (selected, confidence))
+
     def test_episode_token_is_exact(self):
         self.assertTrue(usenet._episode_match(
             "Example.Show.S01E02.1080p.WEB-DL", 1, 2))

@@ -145,7 +145,7 @@ class StreamsTests(unittest.IsolatedAsyncioTestCase):
             seen.append(query)
             return [native] if query.startswith("外来媳妇本地郎") else []
 
-        async def fake_resolve(cand, store, token, se):
+        async def fake_resolve(cand, store, token, se, air_date=None):
             return {"name": "Prowlarr", "url": "http://cdn/native",
                     "behaviorHints": {}}
 
@@ -168,7 +168,7 @@ class StreamsTests(unittest.IsolatedAsyncioTestCase):
                    _rel("The Matrix 1999 2160p", "b" * 40)]
         resolved = []
 
-        async def fake_resolve(cand, store, token, se):
+        async def fake_resolve(cand, store, token, se, air_date=None):
             resolved.append(cand["hash"])
             return {"name": "Prowlarr", "url": f"http://cdn/{cand['hash']}",
                     "behaviorHints": {}}
@@ -192,7 +192,7 @@ class StreamsTests(unittest.IsolatedAsyncioTestCase):
         results = [_rel("The Matrix 1999 1080p", "a" * 40)]
         used = {}
 
-        async def fake_resolve(cand, store, token, se):
+        async def fake_resolve(cand, store, token, se, air_date=None):
             used["store"] = store
             return {"name": "P", "url": "u", "behaviorHints": {}}
 
@@ -217,7 +217,7 @@ class StreamsTests(unittest.IsolatedAsyncioTestCase):
         results = [_rel("The Matrix 1999 1080p", "a" * 40)]
         calls = []
 
-        async def fake_resolve(cand, store, token, se):
+        async def fake_resolve(cand, store, token, se, air_date=None):
             calls.append(store)
             return {"name": f"Prowlarr [{store}]", "url": f"u/{store}",
                     "behaviorHints": {}}

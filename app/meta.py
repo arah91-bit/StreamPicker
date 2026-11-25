@@ -179,28 +179,43 @@ async def digital_released(imdb_id: str) -> bool | None:
     return result
 
 
-async def episode_aired(imdb_id: str, season: int, episode: int) -> bool | None:
-    """True if the episode has aired, False if it's in the future, None if
-    unknown."""
+_episode_dates: dict[tuple[str, int, int], tuple[float, datetime.date | None]] = {}
+_episode_date_inflight: dict[tuple[str, int, int], asyncio.Task] = {}
+
+
+async def episode_air_date(imdb_id: str, season: int, episode: int) -> datetime.date | None:
+    """Broadcast date for the exact TMDB episode coordinates."""
     if not TMDB_KEY:
         return None
-    ck = f"tv:{imdb_id}:{season}:{episode}"
-    hit = _cache.get(ck)
-    if hit and time.monotonic() - hit[0] < (_TTL if hit[1] is not None else _NEG_TTL):
-        return hit[1]
-    result: bool | None = None
-    try:
-        tmdb_id = await _find(imdb_id, "tv_results")
-        if tmdb_id is not None:
-            data = await _get(f"/tv/{tmdb_id}/season/{season}/episode/{episode}")
-            air = _parse(data.get("air_date"))
-            if air is not None:
-                result = air <= _today()
-    except Exception as e:
-        logger.warning(f"tmdb episode_aired {imdb_id}: {type(e).__name__}")
-        result = None
-    _put_cache(ck, result)
-    return result
+
+    async def fetch():
+        try:
+            tmdb_id = await _find(imdb_id, "tv_results")
+            if tmdb_id is not None:
+                data = await _get(f"/tv/{tmdb_id}/season/{season}/episode/{episode}")
+                air = _parse(data.get("air_date"))
+                if air is not None:
+                    return air, _TTL
+        except Exception as e:
+            logger.debug("tmdb episode air date %s:%s:%s: %s",
+                         imdb_id, season, episode, type(e).__name__)
+        return None, _NEG_TTL
+
+    return await _memo(_episode_dates, _episode_date_inflight,
+                       (imdb_id, season, episode), fetch)
+
+
+async def episode_aired(imdb_id: str, season: int, episode: int) -> bool | None:
+    """True if the episode has aired, False if it's in the future."""
+    air = await episode_air_date(imdb_id, season, episode)
+    return air <= _today() if air is not None else None
+
+
+async def request_air_date(media: str, media_id: str) -> datetime.date | None:
+    imdb, *coords = media_id.split(":")
+    if media != "movie" and len(coords) == 2 and all(part.isdigit() for part in coords):
+        return await episode_air_date(imdb, int(coords[0]), int(coords[1]))
+    return None
 
 
 async def has_release(media: str, media_id: str) -> bool | None:
@@ -545,12 +560,17 @@ async def identity_profile(media: str, media_id: str
             tmdb_result = (None, None, None, None)
             omdb_result = None
             episode_result = None
+            air_date = None
             regional: tuple[str, ...] = ()
             this_season_year = None
             jobs: list[tuple[str, asyncio.Future | asyncio.Task | object]] = []
             if TMDB_KEY:
                 jobs.append(("tmdb", _title_details(media, base)))
                 jobs.append(("aliases", title_aliases(media, base)))
+                if (media != "movie" and len(parts) == 3
+                        and parts[1].isdigit() and parts[2].isdigit()):
+                    jobs.append(("air_date", episode_air_date(
+                        base, int(parts[1]), int(parts[2]))))
                 if (media != "movie" and len(parts) == 3
                         and parts[1].isdigit() and int(parts[1]) > 1):
                     jobs.append(("season_year",
@@ -575,6 +595,8 @@ async def identity_profile(media: str, media_id: str
                         regional = value
                     elif name == "season_year":
                         this_season_year = value
+                    elif name == "air_date":
+                        air_date = value
                     else:
                         episode_result = value
 
@@ -611,7 +633,7 @@ async def identity_profile(media: str, media_id: str
                 media=media, imdb_id=base, aliases=aliases, years=years,
                 season=season, episode=episode,
                 region_tags=_region_tags(countries),
-                metadata_conflict=conflict, runtime_seconds=runtime)
+                metadata_conflict=conflict, runtime_seconds=runtime, air_date=air_date)
             _identity_cache[key] = (time.monotonic(), profile)
             if len(_identity_cache) > 2000:
                 _identity_cache.pop(next(iter(_identity_cache)))

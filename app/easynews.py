@@ -58,6 +58,7 @@ password. The direct-nzb lane embeds its WebDAV login the same way.
 from __future__ import annotations
 
 import asyncio
+from datetime import date
 import logging
 import os
 import re
@@ -279,7 +280,8 @@ def _height_of(row: dict) -> int:
 def _candidates(rows: list[dict], titles: list[str],
                 season_episode: tuple[int, int] | None,
                 year: int | frozenset[int] | None,
-                expect_runtime: float | None) -> list[dict]:
+                expect_runtime: float | None,
+                air_date: date | None = None) -> list[dict]:
     """Rows that are actually this title, best-first.
 
     The title/year/episode gate is :mod:`app.usenet`'s — the same one that keeps
@@ -301,9 +303,9 @@ def _candidates(rows: list[dict], titles: list[str],
             continue
         if not any(usenet._release_title_match(name, t) for t in titles if t):
             continue
-        if not usenet._release_year_match(name, titles, year):
+        if not usenet._release_year_match(name, titles, year, air_date):
             continue
-        if season_episode and not usenet._episode_match(name, *season_episode):
+        if season_episode and not usenet._episode_match(name, *season_episode, air_date):
             continue
         if _is_sample(row, name, expect_runtime):
             continue
@@ -394,11 +396,14 @@ async def streams(media: str, media_id: str) -> list[dict]:
         except ValueError:
             season_episode = None
     try:
-        titles, year = await usenet._expected_info(media, media_id)
+        (titles, year), air_date = await asyncio.gather(
+            usenet._expected_info(media, media_id),
+            meta.request_air_date(media, media_id))
         if not titles:
             _record(media, media_id, "failed", "no title metadata")
             return []
-        queries = _queries(media, media_id, titles, year)
+        queries = (_queries(media, media_id, titles, year)
+                   + usenet._episode_date_queries(titles, air_date))
         if not queries:
             _record(media, media_id, "failed", "no usable query")
             return []
@@ -433,7 +438,7 @@ async def streams(media: str, media_id: str) -> list[dict]:
             rows = payload.get("data")
             cands = _candidates(rows if isinstance(rows, list) else [],
                                 titles, season_episode, accepted_years,
-                                expect_runtime)
+                                expect_runtime, air_date)
             matched += len(cands)
             for cand in cands:
                 key = f"{_name_of(cand).lower()}{_ext_of(cand)}"

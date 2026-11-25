@@ -1,6 +1,7 @@
 """Semantic title identity independent of transport/playability checks."""
 
 import dataclasses
+from datetime import date
 import unittest
 
 from app import content_identity as identity
@@ -104,6 +105,23 @@ class MovieIdentityTests(unittest.TestCase):
 
 
 class SeriesIdentityTests(unittest.TestCase):
+    def test_broadcast_date_can_confirm_an_episode(self):
+        profile = identity.IdentityProfile(
+            "series", "tt0068120", ("The Price Is Right",),
+            years=frozenset({1972, 2026}), season=55, episode=45,
+            region_tags=frozenset({"us"}), air_date=date(2026, 11, 20))
+        for text in ("The.Price.Is.Right.2026.11.20.1080p.mkv",
+                     "The Price Is Right S55E45 2026-11-20 WEB-DL"):
+            with self.subTest(text=text):
+                self.assertEqual(identity.STRONG, identity.classify(profile, text))
+        for text in ("The Price Is Right S55E45 2026-11-21 WEB-DL",
+                     "The Price Is Right S55E46 2026-11-20 WEB-DL",
+                     "The Price Is Right UK 2026-11-20 WEB-DL",
+                     "The Price Is Right 2005 2026-11-20 WEB-DL"):
+            with self.subTest(text=text):
+                self.assertEqual(identity.CONTRADICTION,
+                                 identity.classify(profile, text))
+
     def setUp(self):
         self.office_uk = identity.IdentityProfile(
             media="series", imdb_id="tt0290978", aliases=("The Office",),

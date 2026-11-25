@@ -92,6 +92,12 @@ def interpret(query: str, raw: str | dict | None = None, today: dt.date | None =
         if not m:
             continue
         excluded = bool(re.search(r"\b(without|no|exclude|excluding)\s+(?:\w+\s+){0,2}$", low[:m.start()]))
+        # "Family" can be part of a title, as in "Family Feud". Treat it as
+        # a genre when the phrase independently reads like a browse request.
+        if (slug == "family" and not excluded and low != "family"
+                and not re.search(r"\b(movies|films|shows|classics|friendly|for kids)\b",
+                                  low)):
+            continue
         target = excluded_genres if excluded else genres
         if slug not in target:
             target.append(slug)

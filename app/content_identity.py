@@ -27,6 +27,7 @@ the wrong content:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 import math
 import re
 from urllib.parse import unquote
@@ -86,6 +87,8 @@ _RES_RE = re.compile(r"^(?:4320|2160|1440|1080|720|576|540|480|360)p$")
 _EPISODE_RE = re.compile(
     r"(?<![A-Za-z0-9])(?:S0*(\d{1,3})[^A-Za-z0-9]*E0*(\d{1,4})|"
     r"0*(\d{1,3})x0*(\d{1,4}))(?!\d)", re.I)
+_AIR_DATE_RE = re.compile(
+    r"(?<![A-Za-z0-9])((?:19|20)\d{2})([. _-])(\d{2})\2(\d{2})(?![A-Za-z0-9])")
 _SEASON_RE = re.compile(r"(?<![A-Za-z0-9])S0*(\d{1,3})(?!\d)", re.I)
 _SEASON_WORD_RE = re.compile(
     r"(?<![A-Za-z0-9])Seasons?[\s._-]*0*(\d{1,3})(?!\d)", re.I)
@@ -172,6 +175,7 @@ class IdentityProfile:
     region_tags: frozenset[str] = frozenset()
     metadata_conflict: bool = False
     runtime_seconds: float | None = None
+    air_date: date | None = None
 
     def __post_init__(self) -> None:
         media = (self.media or "").strip().lower()
@@ -345,7 +349,22 @@ def _episode_evidence(text: str) -> tuple[set[tuple[int, int]], set[int], bool]:
     return set(mentions), seasons, bool(ranges or len(mentions) > 1)
 
 
-def _episode_relation(text: str, wanted: tuple[int, int]) -> str:
+def split_air_dates(text: str) -> tuple[set[date], str]:
+    """Extract complete calendar dates and leave standalone edition years."""
+    dates: set[date] = set()
+
+    def extract(match: re.Match) -> str:
+        try:
+            dates.add(date(int(match[1]), int(match[3]), int(match[4])))
+        except ValueError:
+            return match[0]
+        return " "
+
+    return dates, _AIR_DATE_RE.sub(extract, text)
+
+
+def episode_relation(text: str, wanted: tuple[int, int],
+                     air_date: date | None = None) -> str:
     """Relationship of release text to one requested episode.
 
     ``exact`` and ``starts`` are safe for automatic playback. ``contains`` and
@@ -353,6 +372,12 @@ def _episode_relation(text: str, wanted: tuple[int, int]) -> str:
     before they can lead. ``contradiction`` explicitly excludes the request;
     ``missing`` has no episode information at all.
     """
+    if air_date is not None:
+        dates, text = split_air_dates(text)
+        if dates and dates != {air_date}:
+            return "contradiction"
+    else:
+        dates = set()
     mentions, seasons, ranges, season_ranges = _episode_details(text)
     contained = set(mentions)
     for start, end in ranges:
@@ -375,7 +400,7 @@ def _episode_relation(text: str, wanted: tuple[int, int]) -> str:
         return "contradiction"
     if seasons:
         return "pack" if seasons == {wanted[0]} else "contradiction"
-    return "missing"
+    return "exact" if dates else "missing"
 
 
 def _prefix_regions(remainder: tuple[str, ...]) -> set[str]:
@@ -433,7 +458,9 @@ def classify(profile: IdentityProfile, text: str, *,
     if remainder is None:
         return CONTRADICTION
 
-    candidate_years = {int(token) for token in remainder
+    # Date components belong to the episode. Other years still identify an edition.
+    year_tokens = _tokens(split_air_dates(" ".join(remainder))[1]) if profile.air_date else remainder
+    candidate_years = {int(token) for token in year_tokens
                        if _YEAR_RE.fullmatch(token)}
     year_match = bool(profile.years and candidate_years)
     if candidate_years and profile.years:
@@ -451,16 +478,15 @@ def classify(profile: IdentityProfile, text: str, *,
 
     pairs, seasons, _multi_episode = _episode_evidence(evidence)
     exact_episode = False
-    episode_relation = "missing"
     if profile.media == "movie":
         if pairs or seasons:
             return CONTRADICTION
     elif profile.season is not None:
         wanted = (profile.season, profile.episode)
-        episode_relation = _episode_relation(evidence, wanted)
-        if episode_relation == "contradiction":
+        relation = episode_relation(evidence, wanted, profile.air_date)
+        if relation == "contradiction":
             return CONTRADICTION
-        exact_episode = episode_relation in {"exact", "starts"}
+        exact_episode = relation in {"exact", "starts"}
 
     # Conflicting provider metadata cannot establish confidence from a parsed
     # year alone. Exact per-item IMDb evidence still binds the file to the
@@ -470,7 +496,7 @@ def classify(profile: IdentityProfile, text: str, *,
         if trusted_imdb and (profile.media == "movie"
                              or profile.season is None
                              or trusted_episode
-                             or episode_relation in {"exact", "starts"}):
+                             or exact_episode):
             return STRONG
         return COMPATIBLE
 
@@ -577,9 +603,9 @@ def assess(profile: IdentityProfile, text: str, *,
         if profile.season is None:
             runtime_ok = False
         else:
-            relation = _episode_relation(
+            relation = episode_relation(
                 _clean_evidence_text(text),
-                (profile.season, profile.episode))
+                (profile.season, profile.episode), profile.air_date)
             runtime_ok = relation in {"exact", "starts"} or trusted_episode
 
     if runtime_ok:
